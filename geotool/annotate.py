@@ -6,11 +6,12 @@ will read characteristics columns to build a cross-cohort schema).
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pandas as pd
 
-from geotool import config
+from geotool import config, platform_classify
 
 
 def _first(metadata: dict, key: str, default: str = "") -> str:
@@ -51,6 +52,12 @@ def _series_organism(gse) -> str:
     return ""
 
 
+def platform_details(gse) -> list[dict]:
+    """classify_platform() result for every GPL in the series (Tier 0, no LLM)."""
+    gpls = getattr(gse, "gpls", None) or {}
+    return [platform_classify.classify_platform(gpl_id, gpl.metadata) for gpl_id, gpl in gpls.items()]
+
+
 def series_row(gse) -> dict:
     md = gse.metadata
     return {
@@ -60,6 +67,7 @@ def series_row(gse) -> dict:
         "overall_design": _first(md, "overall_design"),
         "organism": _series_organism(gse),
         "platforms": ";".join(sorted(gse.gpls.keys())) if getattr(gse, "gpls", None) else "",
+        "platform_details": json.dumps(platform_details(gse)),
         "n_samples": len(gse.gsms) if getattr(gse, "gsms", None) else 0,
         "submission_date": _first(md, "submission_date"),
         "pubmed_ids": ";".join(md.get("pubmed_id", [])),
@@ -78,6 +86,10 @@ def samples_table(gse) -> pd.DataFrame:
             "molecule_ch1": _first(md, "molecule_ch1"),
             "platform_id": _first(md, "platform_id"),
             "description": " ".join(md.get("description", [])),
+            "library_selection": _first(md, "library_selection"),
+            "library_strategy": _first(md, "library_strategy"),
+            "data_row_count": _first(md, "data_row_count"),
+            "rnaseq_library_type": platform_classify.classify_rnaseq_library(md),
         }
         row.update(parse_characteristics(md.get("characteristics_ch1", [])))
         rows.append(row)

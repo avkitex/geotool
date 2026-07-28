@@ -10,6 +10,8 @@ dependencies = [
     "click>=8.1",
     "openpyxl>=3.1",
     "tabulate>=0.9",
+    "anthropic>=0.69",
+    "pydantic>=2.0",
 ]
 
 [project.optional-dependencies]

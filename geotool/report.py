@@ -20,24 +20,66 @@ COLUMNS = [
     "url",
 ]
 
+# Only added to the report if a row actually has them (e.g. --llm-annotate).
+OPTIONAL_COLUMNS = ["llm_diagnosis_breakdown", "llm_assay_type"]
+
+QUERY_COLUMNS = [
+    "gse_id",
+    "title",
+    "matches_diagnosis",
+    "diagnosis_detail",
+    "species",
+    "sample_type",
+    "tissue_class",
+    "assay_type",
+    "selection_method",
+    "n_samples",
+    "meets_min_samples",
+    "organism",
+    "platforms",
+    "submission_date",
+    "pubmed_ids",
+    "notes",
+    "url",
+]
+
+
+def _normalize_record(row: dict) -> dict:
+    record = dict(row)
+    if isinstance(record.get("platforms"), list):
+        record["platforms"] = ";".join(record["platforms"])
+    if isinstance(record.get("pubmed_ids"), list):
+        record["pubmed_ids"] = ";".join(str(p) for p in record["pubmed_ids"])
+    if isinstance(record.get("diagnosis_breakdown"), dict):
+        record["diagnosis_breakdown"] = "; ".join(f"{k}={v}" for k, v in record["diagnosis_breakdown"].items())
+    gse_id = record.get("gse_id", "")
+    record["url"] = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={gse_id}" if gse_id else ""
+    return record
+
 
 def build(rows: list[dict]) -> pd.DataFrame:
-    records = []
-    for row in rows:
-        record = dict(row)
-        if isinstance(record.get("platforms"), list):
-            record["platforms"] = ";".join(record["platforms"])
-        if isinstance(record.get("pubmed_ids"), list):
-            record["pubmed_ids"] = ";".join(str(p) for p in record["pubmed_ids"])
+    records = [_normalize_record(row) for row in rows]
+    for record in records:
         record.setdefault("sample_property_matches", "")
-        gse_id = record.get("gse_id", "")
-        record["url"] = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={gse_id}" if gse_id else ""
-        records.append(record)
     df = pd.DataFrame(records)
-    for col in COLUMNS:
+    columns = list(COLUMNS)
+    for col in OPTIONAL_COLUMNS:
+        if any(col in record for record in records):
+            columns.append(col)
+    for col in columns:
         if col not in df.columns:
             df[col] = ""
-    return df[COLUMNS]
+    return df[columns]
+
+
+def build_query_report(rows: list[dict]) -> pd.DataFrame:
+    """Report shape for `geotool query`: receipt columns instead of sample_property_matches."""
+    records = [_normalize_record(row) for row in rows]
+    df = pd.DataFrame(records)
+    for col in QUERY_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    return df[QUERY_COLUMNS]
 
 
 def write(df: pd.DataFrame, out_name: str) -> tuple[Path, Path]:
