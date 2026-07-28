@@ -17,6 +17,14 @@ NCBI_API_KEY = os.environ.get("GEOTOOL_NCBI_API_KEY")  # None -> 3 req/s throttl
 # NCBI E-utilities rate limit: 3 req/s without an API key, 10 req/s with one.
 NCBI_REQUESTS_PER_SECOND = 10 if NCBI_API_KEY else 3
 
+# LLM annotation (ANTHROPIC_API_KEY is read by the SDK itself, no handling needed here).
+LLM_MODEL = os.environ.get("GEOTOOL_LLM_MODEL", "claude-haiku-4-5")
+LLM_ESCALATION_MODEL = os.environ.get("GEOTOOL_LLM_ESCALATION_MODEL", "claude-sonnet-5")
+
+# Microarray probes/genes at or above this count are considered "full transcriptome"
+# coverage rather than an older, lower-density platform.
+COVERAGE_THRESHOLD = int(os.environ.get("GEOTOOL_COVERAGE_THRESHOLD", "12000"))
+
 
 def ensure_dirs() -> None:
     for d in (GEO_CACHE_DIR, REPORTS_DIR, SERIES_DIR):

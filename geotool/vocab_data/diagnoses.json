@@ -1,0 +1,16 @@
+[
+  "DLBCL",
+  "follicular_lymphoma",
+  "mantle_cell_lymphoma",
+  "CLL_SLL",
+  "marginal_zone_lymphoma",
+  "hodgkin_lymphoma",
+  "multiple_myeloma",
+  "ALL",
+  "AML",
+  "MDS",
+  "other_lymphoma",
+  "other_leukemia",
+  "solid_tumor",
+  "normal_control"
+]
