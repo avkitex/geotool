@@ -6,6 +6,11 @@ class FakeGSM:
         self.metadata = metadata
 
 
+class FakeGPL:
+    def __init__(self, metadata):
+        self.metadata = metadata
+
+
 class FakeGSE:
     def __init__(self, metadata, gsms, gpls):
         self.metadata = metadata
@@ -46,7 +51,11 @@ def make_gse():
         "submission_date": ["Jul 22 2026"],
         "pubmed_id": [],
     }
-    return FakeGSE(metadata, gsms, gpls={"GPL34284": object()})
+    gpl_metadata = {
+        "title": ["Illumina NovaSeq X Plus (Homo sapiens)"],
+        "technology": ["high-throughput sequencing"],
+    }
+    return FakeGSE(metadata, gsms, gpls={"GPL34284": FakeGPL(gpl_metadata)})
 
 
 def test_parse_characteristics_splits_key_value():
