@@ -73,6 +73,16 @@ platform's own annotation table (`probe_matrix.tsv.gz` / `expression.tsv.gz`
 Every cohort also gets a cleaned, semantically-unified `annotation.tsv`.
 Writes into `data/series/<GSE_ID>/`.
 
+Two-channel Agilent samples (Cy3/Cy5 reference-design arrays) whose own data
+table publishes per-channel intensity columns -- not all do; most only carry
+the precomputed ratio -- also get each channel's own probe/gene matrix as an
+*additional* output: `channel1_probe_matrix.tsv.gz` / `channel1_expression.tsv.gz`
+and the `channel2_*` equivalents, alongside the unchanged, ratio-based
+`expression.tsv.gz`. Neither channel is assumed to be "the real sample" or
+"the reference" -- that's a per-study convention this tool has no reliable
+way to infer, so both are simply named by channel number (channel 1 is
+always the green/Cy3 scanner channel, channel 2 always red/Cy5).
+
 Add `--rma` to also RMA-renormalize Affymetrix microarray series from their
 raw CEL files (`probe_matrix_rma_<GPL>.tsv.gz` / `expression_rma.tsv.gz`,
 written alongside the submitter-value files above, never replacing them).

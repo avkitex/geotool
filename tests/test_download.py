@@ -154,6 +154,132 @@ def test_build_and_map_expression_matrix_writes_both_files(monkeypatch, tmp_path
     assert set(genes["gene_symbol"]) == {"DDR1", "RFC2"}
 
 
+def make_agilent_two_channel_gse():
+    metadata = {"geo_accession": ["GSE_AGILENT"], "title": ["A two-channel Agilent series"], "summary": ["s"]}
+    gsms = {
+        "GSM1": FakeGSM(
+            {
+                "title": ["s1"], "geo_accession": ["GSM1"], "platform_id": ["GPL2011"],
+                "organism_ch1": ["Homo sapiens"], "characteristics_ch1": [], "channel_count": ["2"],
+            },
+            table=pd.DataFrame({
+                "ID_REF": ["1007_s_at", "1053_at"],
+                "ch1 Intensity": [10.0, 20.0],
+                "ch2 Intensity": [100.0, 200.0],
+                "VALUE": [1.0, 1.0],
+            }),
+        ),
+        "GSM2": FakeGSM(
+            {
+                "title": ["s2"], "geo_accession": ["GSM2"], "platform_id": ["GPL2011"],
+                "organism_ch1": ["Homo sapiens"], "characteristics_ch1": [], "channel_count": ["2"],
+            },
+            table=pd.DataFrame({
+                "ID_REF": ["1007_s_at", "1053_at"],
+                "ch1 Intensity": [11.0, 21.0],
+                "ch2 Intensity": [101.0, 201.0],
+                "VALUE": [1.0, 1.0],
+            }),
+        ),
+    }
+    gpls = {"GPL2011": FakeGPL({"title": ["Agilent two-color array"], "technology": ["in situ oligonucleotide"], "manufacturer": ["Agilent Technologies"]})}
+    return FakeGSE(metadata, gsms, gpls)
+
+
+_AGILENT_PLATFORM_DETAILS = [{"gpl_id": "GPL2011", "assay_type": "microarray", "vendor": "agilent", "coverage": "full_transcriptome"}]
+
+
+def test_build_and_map_channel_expression_matrices_writes_both_channels(monkeypatch, tmp_path):
+    gse = make_agilent_two_channel_gse()
+    fake_map = pd.DataFrame([
+        {"probe_id": "1007_s_at", "gene_symbol": "DDR1", "entrez_id": "780", "source": "direct_columns"},
+        {"probe_id": "1053_at", "gene_symbol": "RFC2", "entrez_id": "5982", "source": "direct_columns"},
+    ])
+    monkeypatch.setattr(download.probe_mapping, "get_or_build_probe_gene_map", lambda gpl_id: fake_map)
+
+    result = download.build_and_map_channel_expression_matrices(gse, tmp_path, _AGILENT_PLATFORM_DETAILS)
+
+    assert set(result.keys()) == {1, 2}
+    assert result[1] == tmp_path / "channel1_expression.tsv.gz"
+    assert result[2] == tmp_path / "channel2_expression.tsv.gz"
+    assert (tmp_path / "channel1_probe_matrix.tsv.gz").exists()
+    assert (tmp_path / "channel2_probe_matrix.tsv.gz").exists()
+
+    channel1 = pd.read_csv(result[1], sep="\t")
+    channel2 = pd.read_csv(result[2], sep="\t")
+    assert set(channel1["gene_symbol"]) == {"DDR1", "RFC2"}
+    ddr1 = channel1[channel1["gene_symbol"] == "DDR1"].iloc[0]
+    assert ddr1["GSM1"] == 10.0
+    ddr1_ch2 = channel2[channel2["gene_symbol"] == "DDR1"].iloc[0]
+    assert ddr1_ch2["GSM1"] == 100.0
+
+
+def test_build_and_map_channel_expression_matrices_does_not_touch_ratio_expression(monkeypatch, tmp_path):
+    """Splitting must be purely additive -- the existing ratio-based
+    expression.tsv.gz (built separately by build_and_map_expression_matrix)
+    is untouched by this function."""
+    gse = make_agilent_two_channel_gse()
+    fake_map = pd.DataFrame([
+        {"probe_id": "1007_s_at", "gene_symbol": "DDR1", "entrez_id": "780", "source": "direct_columns"},
+        {"probe_id": "1053_at", "gene_symbol": "RFC2", "entrez_id": "5982", "source": "direct_columns"},
+    ])
+    monkeypatch.setattr(download.probe_mapping, "get_or_build_probe_gene_map", lambda gpl_id: fake_map)
+
+    download.build_and_map_expression_matrix(gse, tmp_path)
+    download.build_and_map_channel_expression_matrices(gse, tmp_path, _AGILENT_PLATFORM_DETAILS)
+
+    ratio = pd.read_csv(tmp_path / "expression.tsv.gz", sep="\t")
+    ddr1 = ratio[ratio["gene_symbol"] == "DDR1"].iloc[0]
+    assert ddr1["GSM1"] == 1.0  # the VALUE column, unaffected by channel splitting
+
+
+def test_build_and_map_channel_expression_matrices_returns_empty_without_agilent_platform():
+    gse = make_microarray_gse()  # Affymetrix, per make_microarray_gse()
+    result = download.build_and_map_channel_expression_matrices(
+        gse, None, [{"gpl_id": "GPL96", "assay_type": "microarray", "vendor": "affymetrix"}]
+    )
+    assert result == {}
+
+
+def test_build_and_map_channel_expression_matrices_returns_empty_when_no_channel_columns():
+    """The common case: a 2-channel Agilent series that only publishes the
+    VALUE ratio, with no per-channel columns to split."""
+    gse = FakeGSE(
+        {"geo_accession": ["GSE_X"]},
+        {
+            "GSM1": FakeGSM(
+                {"platform_id": ["GPL887"], "channel_count": ["2"]},
+                table=pd.DataFrame({"ID_REF": ["p1"], "VALUE": [0.5]}),
+            ),
+        },
+    )
+    result = download.build_and_map_channel_expression_matrices(
+        gse, None, [{"gpl_id": "GPL887", "assay_type": "microarray", "vendor": "agilent"}]
+    )
+    assert result == {}
+
+
+def test_download_cohort_includes_channel_expression_paths_for_agilent(monkeypatch, tmp_path):
+    gse = make_agilent_two_channel_gse()
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)
+    monkeypatch.setattr(
+        download.clinical_annotate, "plan_column_mapping", lambda samples, model=None: clinical_annotate.ColumnMappingPlan()
+    )
+    fake_map = pd.DataFrame([
+        {"probe_id": "1007_s_at", "gene_symbol": "DDR1", "entrez_id": "780", "source": "direct_columns"},
+        {"probe_id": "1053_at", "gene_symbol": "RFC2", "entrez_id": "5982", "source": "direct_columns"},
+    ])
+    monkeypatch.setattr(download.probe_mapping, "get_or_build_probe_gene_map", lambda gpl_id: fake_map)
+
+    result = download.download_cohort("GSE_AGILENT", series_dir=tmp_path)
+
+    assert "channel_expression_paths" in result
+    assert set(result["channel_expression_paths"].keys()) == {"1", "2"}
+    assert (tmp_path / "GSE_AGILENT" / "channel1_expression.tsv.gz").exists()
+    assert (tmp_path / "GSE_AGILENT" / "channel2_expression.tsv.gz").exists()
+    assert (tmp_path / "GSE_AGILENT" / "expression.tsv.gz").exists()  # ratio path still runs
+
+
 def test_download_cohort_routes_rnaseq_and_writes_annotation(monkeypatch, tmp_path):
     gse = make_rnaseq_gse()
     monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)

@@ -29,6 +29,13 @@ Every probe gets at most one gene (source="unmapped" if none of the above
 found anything) -- that, plus caching the result once per platform in
 get_or_build_probe_gene_map, is what makes "only one correspondence
 probe->gene per platform" true.
+
+Also handles two-channel (e.g. Agilent Cy3/Cy5) samples: build_probe_matrix
+always reads the precomputed VALUE ratio, unchanged; build_channel_probe_matrices
+separately builds each channel's own raw-intensity matrix for samples that
+publish per-channel columns (see detect_channel_columns), as an *additional*
+signal alongside the ratio -- neither channel is assumed to be "the real
+sample" or "the reference", so both are just named by channel number.
 """
 from __future__ import annotations
 
@@ -37,7 +44,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from geotool import config, geo_fetch
+from geotool import config, geo_fetch, platform_classify
 
 PROBE_ID_COL = "ID"
 
@@ -46,6 +53,29 @@ _ENTREZ_ID_COLUMNS = ["ENTREZ_GENE_ID", "Entrez_Gene_ID", "GENE_ID", "entrez_gen
 
 _FIELD_SEP_RE = re.compile(r"\s*//\s*")
 _ENSEMBL_GENE_ID_RE = re.compile(r"^ENSG\d+$")
+
+# Two-channel samples (e.g. Agilent Cy3/Cy5 reference-design arrays) publish
+# their raw per-channel intensities under wildly inconsistent column names
+# across submitters -- each tuple here is a (channel1_column, channel2_column)
+# pair seen live on real GEO platforms, tried in order and required together
+# (a submitter who uses one naming convention uses it for both channels).
+# Channel *number*, not dye, is what's paired -- channel 1 is always the
+# green/Cy3 scanner channel and channel 2 always red/Cy5 (a scanner hardware
+# fact); what actually varies per dye-swap replicate is which *biological
+# sample* was labeled with which dye (recorded in characteristics_ch1/ch2),
+# never which channel number corresponds to which dye. Most two-channel
+# series don't expose per-channel columns at all (only a precomputed ratio
+# in VALUE) -- there's nothing to split for those, by far the common case.
+_CHANNEL_COLUMN_PAIRS = [
+    ("ch1 Intensity", "ch2 Intensity"),
+    ("CH1_SIGNAL", "CH2_SIGNAL"),
+    ("CH1_SIGNAL_MEAN", "CH2_SIGNAL_MEAN"),
+    ("CH1_MEAN_SIGNAL", "CH2_MEAN_SIGNAL"),
+    ("Intensity_Cy3", "Intensity_Cy5"),
+    ("gMedianSignal", "rMedianSignal"),
+    ("gMeanSignal", "rMeanSignal"),
+    ("gProcessedSignal", "rProcessedSignal"),
+]
 
 
 def _probe_id_column(annotation_df: pd.DataFrame) -> str:
@@ -185,6 +215,50 @@ def build_probe_matrix(gse) -> pd.DataFrame:
     if not columns:
         return pd.DataFrame()
     return pd.DataFrame(columns)
+
+
+def detect_channel_columns(table: pd.DataFrame) -> tuple[str, str] | None:
+    """Return (channel1_column, channel2_column) if this sample's own data
+    table exposes recognizable per-channel intensity columns (see
+    _CHANNEL_COLUMN_PAIRS), else None -- callers should treat None as "this
+    sample can't be split" rather than guessing at unfamiliar column names.
+    """
+    for ch1_col, ch2_col in _CHANNEL_COLUMN_PAIRS:
+        if ch1_col in table.columns and ch2_col in table.columns:
+            return ch1_col, ch2_col
+    return None
+
+
+def build_channel_probe_matrices(gse) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Probes x samples matrices for each channel of every two-channel sample
+    whose own data table has detectable per-channel columns.
+
+    Only those samples contribute a column here (channel_count must be "2"
+    and detect_channel_columns must find a match) -- every other sample
+    (single-channel, or two-channel but only publishing the VALUE ratio) is
+    untouched and keeps going through the existing build_probe_matrix path
+    unaffected. Both returned matrices share the same sample columns.
+    """
+    channel1_cols: dict[str, pd.Series] = {}
+    channel2_cols: dict[str, pd.Series] = {}
+    for gsm_id, gsm in gse.gsms.items():
+        channel_count = platform_classify.as_str(gsm.metadata.get("channel_count")).strip()
+        if channel_count != "2":
+            continue
+        table = getattr(gsm, "table", None)
+        if table is None or table.empty or "ID_REF" not in table.columns:
+            continue
+        columns = detect_channel_columns(table)
+        if columns is None:
+            continue
+        ch1_col, ch2_col = columns
+        indexed = table.set_index("ID_REF")
+        channel1_cols[gsm_id] = pd.to_numeric(indexed[ch1_col], errors="coerce")
+        channel2_cols[gsm_id] = pd.to_numeric(indexed[ch2_col], errors="coerce")
+
+    channel1_matrix = pd.DataFrame(channel1_cols) if channel1_cols else pd.DataFrame()
+    channel2_matrix = pd.DataFrame(channel2_cols) if channel2_cols else pd.DataFrame()
+    return channel1_matrix, channel2_matrix
 
 
 def aggregate_probes_to_genes(probe_matrix: pd.DataFrame, probe_gene_map: pd.DataFrame, agg: str = "mean") -> pd.DataFrame:

@@ -148,11 +148,14 @@ def download(gse_ids, from_report, rma_flag):
     RNA-seq series get their supplementary expression file(s) downloaded as-is.
     Microarray series get reshaped from each sample's probe values into a
     probes x samples matrix, then mapped to a genes x samples matrix via each
-    platform's own annotation table. Add --rma to also RMA-renormalize
-    Affymetrix series from raw CEL files. Every cohort also gets a cleaned,
-    semantically-unified annotation.tsv (redundant columns dropped;
-    treatment/response/RECIST/survival unified where possible). Needs
-    ANTHROPIC_API_KEY. Writes into data/series/<GSE_ID>/.
+    platform's own annotation table. Two-channel Agilent samples that publish
+    per-channel intensity columns also get channel1_expression.tsv.gz /
+    channel2_expression.tsv.gz alongside the ratio-based expression.tsv.gz
+    (unchanged). Add --rma to also RMA-renormalize Affymetrix series from raw
+    CEL files. Every cohort also gets a cleaned, semantically-unified
+    annotation.tsv (redundant columns dropped; treatment/response/RECIST/
+    survival unified where possible). Needs ANTHROPIC_API_KEY. Writes into
+    data/series/<GSE_ID>/.
     """
     ids = list(gse_ids)
     if from_report:
@@ -172,6 +175,9 @@ def download(gse_ids, from_report, rma_flag):
         click.echo(f"  assay type(s): {', '.join(result['assay_types']) or 'unknown'}")
         if result.get("expression_path"):
             click.echo(f"  expression matrix: {result['expression_path']}")
+        if result.get("channel_expression_paths"):
+            for channel_num, path in sorted(result["channel_expression_paths"].items()):
+                click.echo(f"  channel {channel_num} expression matrix: {path}")
         if result.get("expression_rma_path"):
             click.echo(f"  RMA expression matrix: {result['expression_rma_path']}")
         if result.get("expression_files"):

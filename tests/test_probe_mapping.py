@@ -136,9 +136,9 @@ def test_aggregate_probes_to_genes_works_with_ensembl_orf_mapping():
 
 
 class FakeGSM:
-    def __init__(self, table):
+    def __init__(self, table, metadata=None):
         self.table = table
-        self.metadata = {"platform_id": ["GPL96"]}
+        self.metadata = metadata if metadata is not None else {"platform_id": ["GPL96"]}
 
 
 class FakeGSE:
@@ -224,3 +224,69 @@ def test_get_or_build_probe_gene_map_caches_to_disk(monkeypatch, tmp_path):
     second = probe_mapping.get_or_build_probe_gene_map("GPL96", platforms_dir=tmp_path)
     assert len(calls) == 1  # cache hit, no second fetch
     assert second.iloc[0]["gene_symbol"] == "DDR1"
+
+
+def test_detect_channel_columns_finds_known_naming_variants():
+    # ch1/ch2-style, seen live on GPL2011
+    df = pd.DataFrame({"ID_REF": ["p1"], "ch1 Intensity": [1.0], "ch2 Intensity": [2.0]})
+    assert probe_mapping.detect_channel_columns(df) == ("ch1 Intensity", "ch2 Intensity")
+
+    # Cy3/Cy5-named, seen live on GPL7091
+    df2 = pd.DataFrame({"ID_REF": ["p1"], "Intensity_Cy3": [1.0], "Intensity_Cy5": [2.0]})
+    assert probe_mapping.detect_channel_columns(df2) == ("Intensity_Cy3", "Intensity_Cy5")
+
+
+def test_detect_channel_columns_none_when_only_ratio_value_present():
+    """The common case: most two-channel series only publish the precomputed
+    VALUE ratio, with no per-channel columns at all -- must not guess."""
+    df = pd.DataFrame({"ID_REF": ["p1"], "VALUE": [0.5]})
+    assert probe_mapping.detect_channel_columns(df) is None
+
+
+def test_detect_channel_columns_requires_both_columns_of_a_pair():
+    df = pd.DataFrame({"ID_REF": ["p1"], "ch1 Intensity": [1.0]})  # ch2 Intensity missing
+    assert probe_mapping.detect_channel_columns(df) is None
+
+
+def test_build_channel_probe_matrices_splits_two_channel_samples():
+    gse = FakeGSE({
+        "GSM1": FakeGSM(
+            pd.DataFrame({"ID_REF": ["p1", "p2"], "ch1 Intensity": [10.0, 20.0], "ch2 Intensity": [100.0, 200.0]}),
+            metadata={"platform_id": ["GPL2011"], "channel_count": ["2"]},
+        ),
+        "GSM2": FakeGSM(
+            pd.DataFrame({"ID_REF": ["p1", "p2"], "ch1 Intensity": [11.0, 21.0], "ch2 Intensity": [101.0, 201.0]}),
+            metadata={"platform_id": ["GPL2011"], "channel_count": ["2"]},
+        ),
+    })
+
+    channel1, channel2 = probe_mapping.build_channel_probe_matrices(gse)
+
+    assert list(channel1.columns) == ["GSM1", "GSM2"]
+    assert channel1.loc["p1", "GSM1"] == 10.0
+    assert channel2.loc["p2", "GSM2"] == 201.0
+
+
+def test_build_channel_probe_matrices_skips_single_channel_samples():
+    gse = FakeGSE({
+        "GSM1": FakeGSM(
+            pd.DataFrame({"ID_REF": ["p1"], "VALUE": [5.0]}),
+            metadata={"platform_id": ["GPL96"], "channel_count": ["1"]},
+        ),
+    })
+    channel1, channel2 = probe_mapping.build_channel_probe_matrices(gse)
+    assert channel1.empty
+    assert channel2.empty
+
+
+def test_build_channel_probe_matrices_skips_two_channel_samples_without_detectable_columns():
+    """Most two-channel series only ever publish the ratio -- nothing to split."""
+    gse = FakeGSE({
+        "GSM1": FakeGSM(
+            pd.DataFrame({"ID_REF": ["p1"], "VALUE": [0.5]}),
+            metadata={"platform_id": ["GPL887"], "channel_count": ["2"]},
+        ),
+    })
+    channel1, channel2 = probe_mapping.build_channel_probe_matrices(gse)
+    assert channel1.empty
+    assert channel2.empty
