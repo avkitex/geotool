@@ -83,6 +83,23 @@ def test_download_file_gives_up_after_max_retries_and_leaves_no_partial_file(req
     assert requests_mock.call_count == 2
 
 
+def test_write_matrix_gzips_and_rounds_numeric_columns_only(tmp_path):
+    df = pd.DataFrame(
+        {"gene_symbol": ["DDR1"], "entrez_id": ["780"], "GSM1": [1.234567891]}
+    )
+    path = tmp_path / "expression.tsv.gz"
+
+    download._write_matrix(df, path, index=False)
+
+    assert path.exists()
+    with open(path, "rb") as f:
+        assert f.read(2) == b"\x1f\x8b"  # gzip magic bytes
+    result = pd.read_csv(path, sep="\t")
+    assert result.loc[0, "GSM1"] == 1.235
+    assert result.loc[0, "gene_symbol"] == "DDR1"
+    assert str(result.loc[0, "entrez_id"]) == "780"
+
+
 def test_download_rnaseq_files_downloads_series_level_file_and_skips_none(requests_mock, tmp_path):
     gse = make_rnaseq_gse()
     # supplementary_file is ftp://, but the actual request must go out over https
@@ -131,8 +148,8 @@ def test_build_and_map_expression_matrix_writes_both_files(monkeypatch, tmp_path
 
     expr_path = download.build_and_map_expression_matrix(gse, tmp_path)
 
-    assert (tmp_path / "probe_matrix.tsv").exists()
-    assert expr_path == tmp_path / "expression.tsv"
+    assert (tmp_path / "probe_matrix.tsv.gz").exists()
+    assert expr_path == tmp_path / "expression.tsv.gz"
     genes = pd.read_csv(expr_path, sep="\t")
     assert set(genes["gene_symbol"]) == {"DDR1", "RFC2"}
 
@@ -218,10 +235,65 @@ def test_build_and_renormalize_expression_matrix_writes_expression_rma(monkeypat
     platform_details = [{"gpl_id": "GPL96", "assay_type": "microarray", "vendor": "affymetrix", "coverage": "full_transcriptome"}]
     expr_path = download.build_and_renormalize_expression_matrix(gse, tmp_path, platform_details)
 
-    assert expr_path == tmp_path / "expression_rma.tsv"
-    assert (tmp_path / "probe_matrix_rma_GPL96.tsv").exists()
+    assert expr_path == tmp_path / "expression_rma.tsv.gz"
+    assert (tmp_path / "probe_matrix_rma_GPL96.tsv.gz").exists()
     genes = pd.read_csv(expr_path, sep="\t")
     assert set(genes["gene_symbol"]) == {"DDR1", "RFC2"}
+
+
+def test_build_and_renormalize_expression_matrix_deletes_cel_files_after_success(monkeypatch, tmp_path):
+    cel_a, cel_b = tmp_path / "a.CEL", tmp_path / "b.CEL"
+    cel_a.write_bytes(b"fake")
+    cel_b.write_bytes(b"fake")
+    gse = make_microarray_gse()
+    monkeypatch.setattr(download, "download_cel_files", lambda gse, out_dir: {"GSM1": cel_a, "GSM2": cel_b})
+    fake_probe_matrix = pd.DataFrame({"GSM1": [1.0, 2.0], "GSM2": [3.0, 4.0]}, index=["1007_s_at", "1053_at"])
+    monkeypatch.setattr(download.renormalize, "run_rma", lambda cel_files, gpl_id: fake_probe_matrix)
+    fake_map = pd.DataFrame([
+        {"probe_id": "1007_s_at", "gene_symbol": "DDR1", "entrez_id": "780", "source": "direct_columns"},
+        {"probe_id": "1053_at", "gene_symbol": "RFC2", "entrez_id": "5982", "source": "direct_columns"},
+    ])
+    monkeypatch.setattr(download.probe_mapping, "get_or_build_probe_gene_map", lambda gpl_id: fake_map)
+
+    platform_details = [{"gpl_id": "GPL96", "assay_type": "microarray", "vendor": "affymetrix"}]
+    download.build_and_renormalize_expression_matrix(gse, tmp_path, platform_details)
+
+    assert not cel_a.exists()
+    assert not cel_b.exists()
+
+
+def test_build_and_renormalize_expression_matrix_keeps_cel_files_when_rma_unavailable(monkeypatch, tmp_path):
+    cel_a = tmp_path / "a.CEL"
+    cel_a.write_bytes(b"fake")
+    gse = make_microarray_gse()
+    monkeypatch.setattr(download, "download_cel_files", lambda gse, out_dir: {"GSM1": cel_a})
+
+    def raise_unavailable(cel_files, gpl_id):
+        raise download.renormalize.RmaUnavailable("no known Bioconductor CDF/pd package")
+
+    monkeypatch.setattr(download.renormalize, "run_rma", raise_unavailable)
+
+    platform_details = [{"gpl_id": "GPL96", "assay_type": "microarray", "vendor": "affymetrix"}]
+    download.build_and_renormalize_expression_matrix(gse, tmp_path, platform_details)
+
+    assert cel_a.exists()  # not deleted -- RMA never succeeded, so raw data is still needed
+
+
+def test_build_and_renormalize_expression_matrix_rounds_values_to_3_decimals(monkeypatch, tmp_path):
+    gse = make_microarray_gse()
+    monkeypatch.setattr(download, "download_cel_files", lambda gse, out_dir: {"GSM1": tmp_path / "a.CEL"})
+    fake_probe_matrix = pd.DataFrame({"GSM1": [1.234567891]}, index=["1007_s_at"])
+    monkeypatch.setattr(download.renormalize, "run_rma", lambda cel_files, gpl_id: fake_probe_matrix)
+    fake_map = pd.DataFrame([
+        {"probe_id": "1007_s_at", "gene_symbol": "DDR1", "entrez_id": "780", "source": "direct_columns"},
+    ])
+    monkeypatch.setattr(download.probe_mapping, "get_or_build_probe_gene_map", lambda gpl_id: fake_map)
+
+    platform_details = [{"gpl_id": "GPL96", "assay_type": "microarray", "vendor": "affymetrix"}]
+    download.build_and_renormalize_expression_matrix(gse, tmp_path, platform_details)
+
+    probes = pd.read_csv(tmp_path / "probe_matrix_rma_GPL96.tsv.gz", sep="\t", index_col=0)
+    assert probes.loc["1007_s_at", "GSM1"] == 1.235
 
 
 def test_build_and_renormalize_expression_matrix_skips_platform_when_rma_unavailable(monkeypatch, tmp_path):
@@ -237,7 +309,7 @@ def test_build_and_renormalize_expression_matrix_skips_platform_when_rma_unavail
     result = download.build_and_renormalize_expression_matrix(gse, tmp_path, platform_details)
 
     assert result is None
-    assert not (tmp_path / "expression_rma.tsv").exists()
+    assert not (tmp_path / "expression_rma.tsv.gz").exists()
 
 
 def test_download_cohort_with_rma_flag_adds_rma_expression(monkeypatch, tmp_path):
@@ -260,8 +332,8 @@ def test_download_cohort_with_rma_flag_adds_rma_expression(monkeypatch, tmp_path
     result = download.download_cohort("GSE_ARRAY", series_dir=tmp_path, rma=True)
 
     assert result["expression_rma_path"] is not None
-    assert (tmp_path / "GSE_ARRAY" / "expression_rma.tsv").exists()
-    assert (tmp_path / "GSE_ARRAY" / "expression.tsv").exists()  # submitter-value path still runs
+    assert (tmp_path / "GSE_ARRAY" / "expression_rma.tsv.gz").exists()
+    assert (tmp_path / "GSE_ARRAY" / "expression.tsv.gz").exists()  # submitter-value path still runs
 
 
 def test_download_cohort_routes_microarray(monkeypatch, tmp_path):
@@ -279,6 +351,6 @@ def test_download_cohort_routes_microarray(monkeypatch, tmp_path):
     result = download.download_cohort("GSE_ARRAY", series_dir=tmp_path)
 
     assert result["assay_types"] == ["microarray"]
-    assert (tmp_path / "GSE_ARRAY" / "probe_matrix.tsv").exists()
-    assert (tmp_path / "GSE_ARRAY" / "expression.tsv").exists()
+    assert (tmp_path / "GSE_ARRAY" / "probe_matrix.tsv.gz").exists()
+    assert (tmp_path / "GSE_ARRAY" / "expression.tsv.gz").exists()
     assert (tmp_path / "GSE_ARRAY" / "annotation.tsv").exists()
