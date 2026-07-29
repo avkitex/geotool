@@ -1,10 +1,30 @@
 """geotool command-line interface."""
 from __future__ import annotations
 
+import sys
+
 import click
 import pandas as pd
 
 from geotool import download as download_mod, report, search as search_mod
+
+
+def _ensure_utf8_streams() -> None:
+    """Windows terminals often leave stdout/stderr on a legacy codepage (e.g.
+    cp1252) that can't encode characters GEO metadata frequently contains
+    (accented names, Greek letters as in "IFN-γ", em dashes, ...).
+    Reconfiguring here -- once, at the entrypoint -- covers every later
+    print()/click.echo() call in the app, rather than every call site having
+    to guard against it: without this, a print() near the very end of an
+    otherwise fully successful `download` run raises UnicodeEncodeError and
+    the CLI reports the whole cohort as FAILED.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+_ensure_utf8_streams()
 
 
 @click.group()
@@ -115,8 +135,10 @@ def query(text, llm_escalate, max_results, out_name, quiet):
     is_flag=True,
     help="For Affymetrix microarray series, also download raw CEL files and RMA-renormalize "
     "them (in addition to the submitter-value expression matrix, which is always produced). "
-    "Requires R + Bioconductor (affy/oligo, plus a chip-specific CDF or pd.* package) "
-    "installed and Rscript on PATH; skips gracefully per-platform otherwise.",
+    "Requires R installed with Rscript on PATH; Bioconductor and every R package RMA needs "
+    "(affy/oligo, plus a chip-specific CDF or pd.* package) are installed automatically on "
+    "first use. Skips gracefully per-platform when Rscript is missing, the platform is "
+    "unknown, or an install/run fails.",
 )
 def download(gse_ids, from_report, rma_flag):
     """Download expression data + a cleaned annotation table for one or more cohorts, e.g.

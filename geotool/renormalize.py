@@ -1,13 +1,16 @@
 """Phase 2b: RMA renormalization of Affymetrix microarray series from raw CEL
 files, via R/Bioconductor.
 
-Opt-in (see --rma on `geotool download`) because it needs R plus Bioconductor's
-`affy`/`oligo` packages and a chip-specific CDF or pd.* platform-design
-package installed on the machine running geotool -- on top of everything
-Phase 2 (download.py) already does from the submitter's own, possibly
-inconsistent, already-summarized values. Any missing prerequisite raises
-RmaUnavailable, which callers catch and treat as "skip RMA for this series",
-never as a reason to fail the whole cohort download.
+Opt-in (see --rma on `geotool download`) because it needs R installed and
+`Rscript` on PATH, on top of everything Phase 2 (download.py) already does
+from the submitter's own, possibly inconsistent, already-summarized values.
+Bioconductor itself and every R package RMA needs (BiocManager, affy/oligo,
+and the chip-specific CDF/pd.* package) are installed lazily, on first use,
+into a user-writable library (R_LIBS_USER) -- no manual R setup is required
+beyond having R itself. Any missing prerequisite (no Rscript, no package
+mapping for the platform, or an install/run failure) raises RmaUnavailable,
+which callers catch and treat as "skip RMA for this series", never as a
+reason to fail the whole cohort download.
 
 RMA itself (background correction, quantile normalization, median-polish
 summarization) is shelled out to R rather than reimplemented in Python: the
@@ -20,6 +23,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from string import Template
 
 import pandas as pd
 
@@ -45,27 +49,55 @@ _CHIP_PACKAGES: dict[str, tuple[str, str]] = {
     "GPL16686": ("gene_st", "pd.hta.2.0"),
 }
 
-_RMA_3PRIME_TEMPLATE = """\
-suppressMessages({{
-  library(affy)
-  library({package}cdf)
-}})
-cel_files <- c({cel_files})
-raw <- ReadAffy(filenames = cel_files, cdfname = "{package}")
-eset <- rma(raw)
-write.csv(exprs(eset), file = {out_csv})
+# Shared by both templates below. Uses R_LIBS_USER (a per-user library R
+# already knows about) rather than the system library, since the latter is
+# frequently not writable without admin rights -- discovered the hard way
+# when a first real install attempt failed with exactly that error. ensure_pkg
+# only calls BiocManager::install when the package isn't already loadable, so
+# repeat runs on an already-provisioned machine pay no install cost at all.
+_R_PREAMBLE = """\
+lib <- Sys.getenv("R_LIBS_USER")
+if (nzchar(lib)) {
+  dir.create(lib, recursive = TRUE, showWarnings = FALSE)
+  .libPaths(c(lib, .libPaths()))
+}
+ensure_pkg <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (!requireNamespace("BiocManager", quietly = TRUE)) {
+      install.packages("BiocManager", repos = "https://cloud.r-project.org")
+    }
+    BiocManager::install(pkg, update = FALSE, ask = FALSE)
+  }
+}
 """
 
-_RMA_GENE_ST_TEMPLATE = """\
-suppressMessages({{
-  library(oligo)
-  library({package})
-}})
-cel_files <- c({cel_files})
-raw <- read.celfiles(cel_files, pkgname = "{package}")
+# string.Template ($identifier) rather than str.format(), so the many literal
+# R braces below don't need doubling-up escaping.
+_RMA_3PRIME_TEMPLATE = Template(_R_PREAMBLE + """\
+ensure_pkg("affy")
+ensure_pkg("${package}cdf")
+suppressMessages({
+  library(affy)
+  library(${package}cdf)
+})
+cel_files <- c($cel_files)
+raw <- ReadAffy(filenames = cel_files, cdfname = "$package")
 eset <- rma(raw)
-write.csv(exprs(eset), file = {out_csv})
-"""
+write.csv(exprs(eset), file = $out_csv)
+""")
+
+_RMA_GENE_ST_TEMPLATE = Template(_R_PREAMBLE + """\
+ensure_pkg("oligo")
+ensure_pkg("$package")
+suppressMessages({
+  library(oligo)
+  library($package)
+})
+cel_files <- c($cel_files)
+raw <- read.celfiles(cel_files, pkgname = "$package")
+eset <- rma(raw)
+write.csv(exprs(eset), file = $out_csv)
+""")
 
 
 class RmaUnavailable(Exception):
@@ -85,7 +117,7 @@ def _r_quote(path: Path) -> str:
     return '"' + str(path).replace("\\", "/") + '"'
 
 
-def run_rma(cel_files: dict[str, Path], gpl_id: str) -> pd.DataFrame:
+def run_rma(cel_files: dict[str, Path], gpl_id: str, timeout: int = 3600) -> pd.DataFrame:
     """Run RMA on one platform's CEL files via Rscript.
 
     cel_files maps gsm_id -> CEL path; the returned probes x samples
@@ -93,9 +125,15 @@ def run_rma(cel_files: dict[str, Path], gpl_id: str) -> pd.DataFrame:
     the order passed to R, not parsed back from R's own, often-mangled,
     column names).
 
+    The generated R script installs any missing prerequisite (BiocManager,
+    affy/oligo, the chip's CDF/pd package) before running RMA, so the default
+    timeout is generous enough to cover a first-time install (mostly network
+    time) on top of the RMA computation itself; repeat calls for an
+    already-provisioned platform are fast.
+
     Raises RmaUnavailable if Rscript isn't on PATH, the platform has no known
-    chip package, or the R run fails -- callers should catch this and fall
-    back to the submitter-value expression matrix.
+    chip package, or the R run (install or RMA) fails -- callers should catch
+    this and fall back to the submitter-value expression matrix.
     """
     if not cel_files:
         raise RmaUnavailable("no CEL files to normalize")
@@ -112,11 +150,11 @@ def run_rma(cel_files: dict[str, Path], gpl_id: str) -> pd.DataFrame:
         script_path = tmp_dir / "rma.R"
         cel_list = ", ".join(_r_quote(cel_files[gsm_id]) for gsm_id in gsm_ids)
         script_path.write_text(
-            template.format(package=package, cel_files=cel_list, out_csv=_r_quote(out_csv)),
+            template.substitute(package=package, cel_files=cel_list, out_csv=_r_quote(out_csv)),
             encoding="utf-8",
         )
         proc = subprocess.run(
-            ["Rscript", str(script_path)], capture_output=True, text=True, timeout=1800
+            ["Rscript", str(script_path)], capture_output=True, text=True, timeout=timeout
         )
         if proc.returncode != 0:
             raise RmaUnavailable(f"Rscript failed for {gpl_id} ({package}): {proc.stderr.strip()[-500:]}")

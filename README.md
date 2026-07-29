@@ -78,18 +78,16 @@ raw CEL files (`probe_matrix_rma_<GPL>.tsv.gz` / `expression_rma.tsv.gz`,
 written alongside the submitter-value files above, never replacing them).
 CEL files are deleted once a platform's RMA run succeeds, to avoid keeping
 both the raw data and its derived matrix on disk. This is opt-in and needs
-R + Bioconductor installed, with `Rscript` on `PATH`:
-
-```r
-install.packages("BiocManager")
-BiocManager::install(c("affy", "oligo"))
-# plus the CDF/pd.* package for whichever chip(s) you're downloading, e.g.
-BiocManager::install("hgu133plus2cdf")    # GPL570 (HG-U133 Plus 2, 3' IVT) -- note the "cdf" suffix
-BiocManager::install("pd.hta.2.0")        # GPL16686 (HTA 2.0, Gene/Exon ST) -- already the full package name
-```
+R installed with `Rscript` on `PATH` -- Bioconductor itself and every R
+package RMA needs (BiocManager, `affy`/`oligo`, and the chip-specific
+CDF/pd.* package) are installed automatically on first use, into a
+user-writable library, so no manual R package setup is required. The
+tradeoff is that the very first `--rma` run for a given chip can take a
+while (network install time on top of the RMA computation); every run after
+that is fast since the packages persist.
 
 Only platforms listed in `geotool/renormalize.py`'s `_CHIP_PACKAGES` table are
-supported; an unlisted platform, or a missing Bioconductor package, just skips
+supported; an unlisted platform, or a failed install/run, just skips
 RMA for that series (logged) rather than failing the download.
 
 ## Status
