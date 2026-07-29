@@ -23,7 +23,7 @@ from geotool.llm_schema import SeriesLevelAnnotation, SeriesLLMResult
 PROMPT_VERSION = "1"
 
 FIXED_SAMPLE_COLUMNS = {
-    "gsm_id", "title", "source_name_ch1", "organism_ch1", "molecule_ch1",
+    "gsm_id", "gse_id", "title", "source_name_ch1", "organism_ch1", "molecule_ch1",
     "platform_id", "description", "library_selection", "library_strategy",
     "data_row_count", "rnaseq_library_type",
 }

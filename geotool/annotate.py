@@ -75,11 +75,13 @@ def series_row(gse) -> dict:
 
 
 def samples_table(gse) -> pd.DataFrame:
+    gse_id = _first(gse.metadata, "geo_accession")
     rows = []
     for gsm_id, gsm in gse.gsms.items():
         md = gsm.metadata
         row = {
             "gsm_id": gsm_id,
+            "gse_id": gse_id,
             "title": _first(md, "title"),
             "source_name_ch1": _first(md, "source_name_ch1"),
             "organism_ch1": _first(md, "organism_ch1"),

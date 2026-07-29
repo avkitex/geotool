@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import click
+import pandas as pd
 
-from geotool import report, search as search_mod
+from geotool import download as download_mod, report, search as search_mod
 
 
 @click.group()
@@ -97,6 +98,52 @@ def query(text, llm_escalate, max_results, out_name, quiet):
     tsv_path, xlsx_path = report.write(df, out_name)
     report.print_table(df)
     click.echo(f"\n{len(df)} series written to {tsv_path} and {xlsx_path}")
+
+
+@main.command()
+@click.argument("gse_ids", nargs=-1)
+@click.option(
+    "--from-report",
+    "from_report",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Read gse_id values from a saved search/query report (.tsv) instead of passing them as arguments.",
+)
+def download(gse_ids, from_report):
+    """Download expression data + a cleaned annotation table for one or more cohorts, e.g.
+
+    geotool download GSE10846 GSE339488
+
+    RNA-seq series get their supplementary expression file(s) downloaded as-is.
+    Microarray series get reshaped from each sample's probe values into a
+    probes x samples matrix, then mapped to a genes x samples matrix via each
+    platform's own annotation table. CEL files and renormalization are out of
+    scope. Every cohort also gets a cleaned, semantically-unified
+    annotation.tsv (redundant columns dropped; treatment/response/RECIST/
+    survival unified where possible). Needs ANTHROPIC_API_KEY. Writes into
+    data/series/<GSE_ID>/.
+    """
+    ids = list(gse_ids)
+    if from_report:
+        ids.extend(pd.read_csv(from_report, sep="\t")["gse_id"].dropna().astype(str).tolist())
+    ids = list(dict.fromkeys(ids))  # de-dupe, keep order
+
+    if not ids:
+        raise click.UsageError("Provide one or more GSE IDs, or --from-report <path>")
+
+    for gse_id in ids:
+        click.echo(f"{gse_id}:")
+        try:
+            result = download_mod.download_cohort(gse_id)
+        except Exception as exc:
+            click.echo(f"  FAILED: {exc}")
+            continue
+        click.echo(f"  assay type(s): {', '.join(result['assay_types']) or 'unknown'}")
+        if result.get("expression_path"):
+            click.echo(f"  expression matrix: {result['expression_path']}")
+        if result.get("expression_files"):
+            click.echo(f"  expression files: {len(result['expression_files'])} downloaded")
+        click.echo(f"  annotation: {result['annotation_path']}")
 
 
 if __name__ == "__main__":
