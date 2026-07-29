@@ -28,6 +28,29 @@ def test_esearch_gds_parses_idlist_and_count(requests_mock):
     assert total == 2
 
 
+def test_esearch_gds_retries_on_429_then_succeeds(requests_mock, monkeypatch):
+    monkeypatch.setattr(entrez.time, "sleep", lambda seconds: None)
+    requests_mock.get(
+        entrez.ESEARCH_URL,
+        [
+            {"status_code": 429},
+            {"json": {"esearchresult": {"idlist": ["1"], "count": "1"}}, "status_code": 200},
+        ],
+    )
+    ids, total = entrez.esearch_gds("liver[Title]")
+    assert ids == ["1"]
+    assert total == 1
+    assert requests_mock.call_count == 2
+
+
+def test_esearch_gds_gives_up_after_max_retries(requests_mock, monkeypatch):
+    monkeypatch.setattr(entrez.time, "sleep", lambda seconds: None)
+    requests_mock.get(entrez.ESEARCH_URL, status_code=429)
+    with pytest.raises(Exception):
+        entrez.esearch_gds("liver[Title]")
+    assert requests_mock.call_count == entrez.MAX_RETRIES
+
+
 def test_esearch_gds_raises_on_entrez_error(requests_mock):
     requests_mock.get(
         entrez.ESEARCH_URL,

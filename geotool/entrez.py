@@ -16,6 +16,9 @@ from geotool import config
 ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 ESUMMARY_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 
+MAX_RETRIES = 5
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
 _last_request_time = 0.0
 
 
@@ -35,6 +38,28 @@ def _params(extra: dict[str, Any]) -> dict[str, Any]:
         params["api_key"] = config.NCBI_API_KEY
     params.update(extra)
     return params
+
+
+def _get(url: str, params: dict[str, Any]) -> requests.Response:
+    """GET with throttling plus retry-with-backoff on 429/5xx.
+
+    NCBI rate limits are a normal occurrence under real usage (shared IP,
+    transient load), not just test bursts -- a bare raise_for_status() would
+    kill an entire search over one transient block.
+    """
+    delay = 2.0
+    resp = None
+    for attempt in range(MAX_RETRIES):
+        _throttle()
+        resp = requests.get(url, params=params, timeout=30)
+        if resp.status_code in _RETRYABLE_STATUS and attempt < MAX_RETRIES - 1:
+            retry_after = resp.headers.get("retry-after")
+            time.sleep(float(retry_after) if retry_after else delay)
+            delay *= 2
+            continue
+        break
+    resp.raise_for_status()
+    return resp
 
 
 def build_query(
@@ -61,13 +86,7 @@ def build_query(
 
 def esearch_gds(term: str, retmax: int = 100, retstart: int = 0) -> tuple[list[str], int]:
     """Return (uid_list, total_count) for a gds search term."""
-    _throttle()
-    resp = requests.get(
-        ESEARCH_URL,
-        params=_params({"term": term, "retmax": retmax, "retstart": retstart, "retmode": "json"}),
-        timeout=30,
-    )
-    resp.raise_for_status()
+    resp = _get(ESEARCH_URL, _params({"term": term, "retmax": retmax, "retstart": retstart, "retmode": "json"}))
     result = resp.json()["esearchresult"]
     if "ERROR" in result:
         raise RuntimeError(f"Entrez esearch error: {result['ERROR']}")
@@ -78,13 +97,7 @@ def esummary_gds(uids: list[str]) -> list[dict[str, Any]]:
     """Return raw docsum dicts for a list of gds UIDs."""
     if not uids:
         return []
-    _throttle()
-    resp = requests.get(
-        ESUMMARY_URL,
-        params=_params({"id": ",".join(uids), "retmode": "json"}),
-        timeout=30,
-    )
-    resp.raise_for_status()
+    resp = _get(ESUMMARY_URL, _params({"id": ",".join(uids), "retmode": "json"}))
     result = resp.json()["result"]
     return [result[uid] for uid in result.get("uids", [])]
 
@@ -102,6 +115,23 @@ def normalize_docsum(docsum: dict[str, Any]) -> dict[str, Any]:
         "submission_date": docsum.get("pdat", ""),
         "pubmed_ids": docsum.get("pubmedids", []),
     }
+
+
+def esummary_gpl(gpl_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """Batched platform lookup: one esearch + one esummary for every GPL accession.
+
+    NCBI has no separate 'gpl' database -- platform records live in db=gds
+    like everything else, disambiguated by entry type. Returns
+    {gpl_id: docsum} for whichever accessions were found; docsum has
+    title/ptechtype fields compatible with platform_classify.classify_platform.
+    """
+    unique_ids = sorted(set(gpl_ids))
+    if not unique_ids:
+        return {}
+    term = "(" + " OR ".join(f"{gid}[Accession]" for gid in unique_ids) + ") AND GPL[ETYP]"
+    uids, _total = esearch_gds(term, retmax=len(unique_ids) * 2)
+    docsums = esummary_gds(uids)
+    return {ds["accession"]: ds for ds in docsums if ds.get("accession") in unique_ids}
 
 
 def search_series(
