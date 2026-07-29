@@ -18,3 +18,13 @@ def fetch_series(gse_id: str):
     """
     config.ensure_dirs()
     return GEOparse.get_GEO(geo=gse_id, destdir=str(config.GEO_CACHE_DIR), silent=True)
+
+
+def fetch_platform(gpl_id: str):
+    """Download (or load from cache) a GEO Platform's own record.
+
+    Returns a GEOparse.GPL object; `.table` is the platform's annotation
+    table (probe ID -> gene symbol/Entrez ID/etc, layout varies per platform).
+    """
+    config.ensure_dirs()
+    return GEOparse.get_GEO(geo=gpl_id, destdir=str(config.GEO_CACHE_DIR), silent=True)
