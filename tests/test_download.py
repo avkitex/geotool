@@ -161,6 +161,109 @@ def test_download_cohort_routes_rnaseq_and_writes_annotation(monkeypatch, tmp_pa
     assert (tmp_path / "GSE_RNASEQ" / "expression").exists()
 
 
+def test_download_cel_files_downloads_only_cel_urls_keyed_by_gsm(requests_mock, tmp_path):
+    gsms = {
+        "GSM1": FakeGSM({
+            "platform_id": ["GPL570"],
+            "supplementary_file_1": ["ftp://example.com/GSM1.CEL.gz"],
+        }),
+        "GSM2": FakeGSM({
+            "platform_id": ["GPL570"],
+            "supplementary_file_1": ["ftp://example.com/GSM2_processed.txt.gz"],
+        }),
+    }
+    gse = FakeGSE({}, gsms)
+    requests_mock.get("https://example.com/GSM1.CEL.gz", content=b"celdata")
+
+    downloaded = download.download_cel_files(gse, tmp_path)
+
+    assert list(downloaded.keys()) == ["GSM1"]
+    assert downloaded["GSM1"].read_bytes() == b"celdata"
+    assert not (tmp_path / "cel" / "GSM2_processed.txt.gz").exists()
+
+
+def test_download_cel_files_skips_none_and_missing_supplementary(requests_mock, tmp_path):
+    gsms = {"GSM1": FakeGSM({"platform_id": ["GPL570"], "supplementary_file_1": ["NONE"]})}
+    gse = FakeGSE({}, gsms)
+
+    downloaded = download.download_cel_files(gse, tmp_path)
+
+    assert downloaded == {}
+    assert not (tmp_path / "cel").exists()
+
+
+def test_build_and_renormalize_expression_matrix_returns_none_without_affymetrix_platform(tmp_path):
+    gse = make_microarray_gse()
+    result = download.build_and_renormalize_expression_matrix(
+        gse, tmp_path, [{"gpl_id": "GPL96", "assay_type": "microarray", "vendor": "illumina"}]
+    )
+    assert result is None
+
+
+def test_build_and_renormalize_expression_matrix_writes_expression_rma(monkeypatch, tmp_path):
+    gse = make_microarray_gse()
+    monkeypatch.setattr(
+        download, "download_cel_files", lambda gse, out_dir: {"GSM1": tmp_path / "a.CEL", "GSM2": tmp_path / "b.CEL"}
+    )
+    fake_probe_matrix = pd.DataFrame(
+        {"GSM1": [1.0, 2.0], "GSM2": [3.0, 4.0]}, index=["1007_s_at", "1053_at"]
+    )
+    monkeypatch.setattr(download.renormalize, "run_rma", lambda cel_files, gpl_id: fake_probe_matrix)
+    fake_map = pd.DataFrame([
+        {"probe_id": "1007_s_at", "gene_symbol": "DDR1", "entrez_id": "780", "source": "direct_columns"},
+        {"probe_id": "1053_at", "gene_symbol": "RFC2", "entrez_id": "5982", "source": "direct_columns"},
+    ])
+    monkeypatch.setattr(download.probe_mapping, "get_or_build_probe_gene_map", lambda gpl_id: fake_map)
+
+    platform_details = [{"gpl_id": "GPL96", "assay_type": "microarray", "vendor": "affymetrix", "coverage": "full_transcriptome"}]
+    expr_path = download.build_and_renormalize_expression_matrix(gse, tmp_path, platform_details)
+
+    assert expr_path == tmp_path / "expression_rma.tsv"
+    assert (tmp_path / "probe_matrix_rma_GPL96.tsv").exists()
+    genes = pd.read_csv(expr_path, sep="\t")
+    assert set(genes["gene_symbol"]) == {"DDR1", "RFC2"}
+
+
+def test_build_and_renormalize_expression_matrix_skips_platform_when_rma_unavailable(monkeypatch, tmp_path):
+    gse = make_microarray_gse()
+    monkeypatch.setattr(download, "download_cel_files", lambda gse, out_dir: {"GSM1": tmp_path / "a.CEL"})
+
+    def raise_unavailable(cel_files, gpl_id):
+        raise download.renormalize.RmaUnavailable("Rscript not found on PATH -- install R to use --rma")
+
+    monkeypatch.setattr(download.renormalize, "run_rma", raise_unavailable)
+
+    platform_details = [{"gpl_id": "GPL96", "assay_type": "microarray", "vendor": "affymetrix"}]
+    result = download.build_and_renormalize_expression_matrix(gse, tmp_path, platform_details)
+
+    assert result is None
+    assert not (tmp_path / "expression_rma.tsv").exists()
+
+
+def test_download_cohort_with_rma_flag_adds_rma_expression(monkeypatch, tmp_path):
+    gse = make_microarray_gse()
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)
+    monkeypatch.setattr(
+        download.clinical_annotate, "plan_column_mapping", lambda samples, model=None: clinical_annotate.ColumnMappingPlan()
+    )
+    fake_map = pd.DataFrame([
+        {"probe_id": "1007_s_at", "gene_symbol": "DDR1", "entrez_id": "780", "source": "direct_columns"},
+        {"probe_id": "1053_at", "gene_symbol": "RFC2", "entrez_id": "5982", "source": "direct_columns"},
+    ])
+    monkeypatch.setattr(download.probe_mapping, "get_or_build_probe_gene_map", lambda gpl_id: fake_map)
+    monkeypatch.setattr(
+        download, "download_cel_files", lambda gse, out_dir: {"GSM1": tmp_path / "a.CEL", "GSM2": tmp_path / "b.CEL"}
+    )
+    fake_rma_matrix = pd.DataFrame({"GSM1": [1.0, 2.0], "GSM2": [3.0, 4.0]}, index=["1007_s_at", "1053_at"])
+    monkeypatch.setattr(download.renormalize, "run_rma", lambda cel_files, gpl_id: fake_rma_matrix)
+
+    result = download.download_cohort("GSE_ARRAY", series_dir=tmp_path, rma=True)
+
+    assert result["expression_rma_path"] is not None
+    assert (tmp_path / "GSE_ARRAY" / "expression_rma.tsv").exists()
+    assert (tmp_path / "GSE_ARRAY" / "expression.tsv").exists()  # submitter-value path still runs
+
+
 def test_download_cohort_routes_microarray(monkeypatch, tmp_path):
     gse = make_microarray_gse()
     monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)

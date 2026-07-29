@@ -109,7 +109,16 @@ def query(text, llm_escalate, max_results, out_name, quiet):
     default=None,
     help="Read gse_id values from a saved search/query report (.tsv) instead of passing them as arguments.",
 )
-def download(gse_ids, from_report):
+@click.option(
+    "--rma",
+    "rma_flag",
+    is_flag=True,
+    help="For Affymetrix microarray series, also download raw CEL files and RMA-renormalize "
+    "them (in addition to the submitter-value expression matrix, which is always produced). "
+    "Requires R + Bioconductor (affy/oligo, plus a chip-specific CDF or pd.* package) "
+    "installed and Rscript on PATH; skips gracefully per-platform otherwise.",
+)
+def download(gse_ids, from_report, rma_flag):
     """Download expression data + a cleaned annotation table for one or more cohorts, e.g.
 
     geotool download GSE10846 GSE339488
@@ -117,11 +126,11 @@ def download(gse_ids, from_report):
     RNA-seq series get their supplementary expression file(s) downloaded as-is.
     Microarray series get reshaped from each sample's probe values into a
     probes x samples matrix, then mapped to a genes x samples matrix via each
-    platform's own annotation table. CEL files and renormalization are out of
-    scope. Every cohort also gets a cleaned, semantically-unified
-    annotation.tsv (redundant columns dropped; treatment/response/RECIST/
-    survival unified where possible). Needs ANTHROPIC_API_KEY. Writes into
-    data/series/<GSE_ID>/.
+    platform's own annotation table. Add --rma to also RMA-renormalize
+    Affymetrix series from raw CEL files. Every cohort also gets a cleaned,
+    semantically-unified annotation.tsv (redundant columns dropped;
+    treatment/response/RECIST/survival unified where possible). Needs
+    ANTHROPIC_API_KEY. Writes into data/series/<GSE_ID>/.
     """
     ids = list(gse_ids)
     if from_report:
@@ -134,13 +143,15 @@ def download(gse_ids, from_report):
     for gse_id in ids:
         click.echo(f"{gse_id}:")
         try:
-            result = download_mod.download_cohort(gse_id)
+            result = download_mod.download_cohort(gse_id, rma=rma_flag)
         except Exception as exc:
             click.echo(f"  FAILED: {exc}")
             continue
         click.echo(f"  assay type(s): {', '.join(result['assay_types']) or 'unknown'}")
         if result.get("expression_path"):
             click.echo(f"  expression matrix: {result['expression_path']}")
+        if result.get("expression_rma_path"):
+            click.echo(f"  RMA expression matrix: {result['expression_rma_path']}")
         if result.get("expression_files"):
             click.echo(f"  expression files: {len(result['expression_files'])} downloaded")
         click.echo(f"  annotation: {result['annotation_path']}")
