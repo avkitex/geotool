@@ -100,3 +100,64 @@ def test_run_rma_raises_when_output_column_count_mismatches(monkeypatch, tmp_pat
 
     with pytest.raises(renormalize.RmaUnavailable, match="expected 2"):
         renormalize.run_rma(cel_files, "GPL570")
+
+
+def _capture_script(monkeypatch, csv_text: str) -> dict:
+    """Monkeypatch subprocess.run to record the generated R script (and the
+    timeout it was called with) instead of actually invoking Rscript."""
+    captured: dict = {}
+
+    def fake_run(cmd, capture_output, text, timeout):
+        captured["script"] = Path(cmd[1]).read_text()
+        captured["timeout"] = timeout
+        out_csv = re.search(r'file = "([^"]+)"', captured["script"]).group(1)
+        Path(out_csv).write_text(csv_text)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(renormalize.shutil, "which", lambda name: "/usr/bin/Rscript")
+    monkeypatch.setattr(renormalize.subprocess, "run", fake_run)
+    return captured
+
+
+def test_run_rma_script_lazily_installs_prerequisites_for_3prime_chip(monkeypatch, tmp_path):
+    """No package should need to be pre-installed by hand -- the generated
+    script must check for and install BiocManager/affy/the CDF package itself,
+    into a user-writable library (R_LIBS_USER), rather than assuming a
+    pre-provisioned R environment."""
+    cel = tmp_path / "a.CEL"
+    cel.write_bytes(b"fake")
+    captured = _capture_script(monkeypatch, "probe_id,GSM1\n1007_s_at,5.1\n")
+
+    renormalize.run_rma({"GSM1": cel}, "GPL570")
+
+    script = captured["script"]
+    assert "R_LIBS_USER" in script
+    assert 'ensure_pkg("affy")' in script
+    assert 'ensure_pkg("hgu133plus2cdf")' in script
+    assert "BiocManager::install" in script
+
+
+def test_run_rma_script_lazily_installs_prerequisites_for_gene_st_chip(monkeypatch, tmp_path):
+    cel = tmp_path / "a.CEL"
+    cel.write_bytes(b"fake")
+    captured = _capture_script(monkeypatch, "probe_id,GSM1\nTC01000001.hg.1,5.1\n")
+
+    renormalize.run_rma({"GSM1": cel}, "GPL16686")
+
+    script = captured["script"]
+    assert "R_LIBS_USER" in script
+    assert 'ensure_pkg("oligo")' in script
+    assert 'ensure_pkg("pd.hta.2.0")' in script
+    assert "BiocManager::install" in script
+
+
+def test_run_rma_default_timeout_is_generous_for_a_first_time_install(monkeypatch, tmp_path):
+    cel = tmp_path / "a.CEL"
+    cel.write_bytes(b"fake")
+    captured = _capture_script(monkeypatch, "probe_id,GSM1\n1007_s_at,5.1\n")
+
+    renormalize.run_rma({"GSM1": cel}, "GPL570")
+    assert captured["timeout"] == 3600
+
+    renormalize.run_rma({"GSM1": cel}, "GPL570", timeout=60)
+    assert captured["timeout"] == 60
