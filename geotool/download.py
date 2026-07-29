@@ -9,9 +9,15 @@ semantically-unified per-sample annotation table via clinical_annotate.py.
 
 Phase 2b (opt-in via download_cohort(..., rma=True)): for Affymetrix
 microarray series, also download raw CEL files and RMA-renormalize them via
-renormalize.py, producing expression_rma.tsv alongside the submitter-value
-expression.tsv above. See renormalize.py for why this needs R/Bioconductor
-and is not the default.
+renormalize.py, producing expression_rma.tsv.gz alongside the
+submitter-value expression.tsv.gz above. See renormalize.py for why this
+needs R/Bioconductor and is not the default. CEL files are deleted once a
+platform's RMA run succeeds -- they're fully captured by the resulting
+probe matrix and otherwise just sit on disk as raw, mostly-redundant data.
+
+All expression/probe matrices are written gzip-compressed with values
+rounded to 3 decimal places (see _write_matrix) to keep them from ballooning
+into hundreds of MB for large series.
 """
 from __future__ import annotations
 
@@ -40,6 +46,22 @@ def _series_dir(gse_id: str, series_dir: Path | None = None) -> Path:
 def _persist_series_annotation(out_dir: Path, series_row: dict, samples: pd.DataFrame) -> None:
     pd.DataFrame([series_row]).to_csv(out_dir / "series.tsv", sep="\t", index=False)
     samples.to_csv(out_dir / "samples.tsv", sep="\t", index=False)
+
+
+def _write_matrix(df: pd.DataFrame, path: Path, index: bool = True) -> None:
+    """Write a probe/gene x sample matrix as gzip-compressed TSV.
+
+    Numeric columns are rounded to 3 decimal places first -- expression
+    values don't carry meaningful precision beyond that, and it also lets
+    gzip compress the repeated short decimals much better, so both the
+    rounding and the compression are there to control on-disk size for
+    matrices that can otherwise run into the hundreds of MB.
+    """
+    numeric_cols = df.select_dtypes(include="number").columns
+    if len(numeric_cols):
+        df = df.copy()
+        df[numeric_cols] = df[numeric_cols].round(3)
+    df.to_csv(path, sep="\t", index=index, compression="gzip")
 
 
 def _should_skip_url(url: str) -> bool:
@@ -123,7 +145,7 @@ def build_and_map_expression_matrix(gse, out_dir: Path) -> Path | None:
     if probe_matrix.empty:
         print("    no per-sample data tables found; skipping expression matrix")
         return None
-    probe_matrix.to_csv(out_dir / "probe_matrix.tsv", sep="\t")
+    _write_matrix(probe_matrix, out_dir / "probe_matrix.tsv.gz")
 
     # Usually one platform per series; handle the rare multi-platform case by
     # mapping+aggregating each platform's samples separately, then combining.
@@ -140,15 +162,15 @@ def build_and_map_expression_matrix(gse, out_dir: Path) -> Path | None:
         gene_frames.append(probe_mapping.aggregate_probes_to_genes(probe_matrix[cols], probe_gene_map))
 
     if not gene_frames:
-        print("    no probe->gene mapping available for this platform; wrote probe_matrix.tsv only")
+        print("    no probe->gene mapping available for this platform; wrote probe_matrix.tsv.gz only")
         return None
 
     expression = gene_frames[0]
     for other in gene_frames[1:]:
         expression = expression.merge(other, on=["gene_symbol", "entrez_id"], how="outer")
 
-    expression_path = out_dir / "expression.tsv"
-    expression.to_csv(expression_path, sep="\t", index=False)
+    expression_path = out_dir / "expression.tsv.gz"
+    _write_matrix(expression, expression_path, index=False)
     return expression_path
 
 
@@ -186,7 +208,7 @@ def build_and_renormalize_expression_matrix(
     """RMA-renormalize each Affymetrix platform's raw CEL files (--rma only),
     then map probes -> genes the same way as the submitter-value path in
     build_and_map_expression_matrix. Writes nothing (and the submitter-value
-    expression.tsv stands alone) when there are no Affymetrix platforms, no
+    expression.tsv.gz stands alone) when there are no Affymetrix platforms, no
     CEL files to download, or RMA can't run for every platform present -- see
     renormalize.RmaUnavailable for why a given platform might be skipped.
     """
@@ -213,9 +235,20 @@ def build_and_renormalize_expression_matrix(
         except renormalize.RmaUnavailable as exc:
             print(f"    RMA skipped for {gpl_id}: {exc}")
             continue
-        probe_matrix.to_csv(out_dir / f"probe_matrix_rma_{gpl_id}.tsv", sep="\t")
+        _write_matrix(probe_matrix, out_dir / f"probe_matrix_rma_{gpl_id}.tsv.gz")
         probe_gene_map = probe_mapping.get_or_build_probe_gene_map(gpl_id)
         gene_frames.append(probe_mapping.aggregate_probes_to_genes(probe_matrix, probe_gene_map))
+
+        # CEL files are only useful up to a successful RMA run -- they're raw
+        # data (hundreds of MB to GBs across a series) that's fully captured
+        # by the probe matrix above, so keeping them around afterward is pure
+        # disk waste.
+        for cel_path in platform_cel_files.values():
+            cel_path.unlink(missing_ok=True)
+
+    cel_dir = out_dir / "cel"
+    if cel_dir.is_dir() and not any(cel_dir.iterdir()):
+        cel_dir.rmdir()
 
     if not gene_frames:
         return None
@@ -224,8 +257,8 @@ def build_and_renormalize_expression_matrix(
     for other in gene_frames[1:]:
         expression = expression.merge(other, on=["gene_symbol", "entrez_id"], how="outer")
 
-    expression_path = out_dir / "expression_rma.tsv"
-    expression.to_csv(expression_path, sep="\t", index=False)
+    expression_path = out_dir / "expression_rma.tsv.gz"
+    _write_matrix(expression, expression_path, index=False)
     return expression_path
 
 

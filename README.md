@@ -68,14 +68,17 @@ geotool download GSE10846 GSE339488
 RNA-seq series get their supplementary expression file(s) downloaded as-is.
 Microarray series get reshaped from each sample's own probe values into a
 probes x samples matrix, then mapped to a genes x samples matrix via each
-platform's own annotation table (`probe_matrix.tsv` / `expression.tsv`).
+platform's own annotation table (`probe_matrix.tsv.gz` / `expression.tsv.gz`
+-- gzip-compressed, values rounded to 3 decimal places).
 Every cohort also gets a cleaned, semantically-unified `annotation.tsv`.
 Writes into `data/series/<GSE_ID>/`.
 
 Add `--rma` to also RMA-renormalize Affymetrix microarray series from their
-raw CEL files (`probe_matrix_rma_<GPL>.tsv` / `expression_rma.tsv`, written
-alongside the submitter-value files above, never replacing them). This is
-opt-in and needs R + Bioconductor installed, with `Rscript` on `PATH`:
+raw CEL files (`probe_matrix_rma_<GPL>.tsv.gz` / `expression_rma.tsv.gz`,
+written alongside the submitter-value files above, never replacing them).
+CEL files are deleted once a platform's RMA run succeeds, to avoid keeping
+both the raw data and its derived matrix on disk. This is opt-in and needs
+R + Bioconductor installed, with `Rscript` on `PATH`:
 
 ```r
 install.packages("BiocManager")
