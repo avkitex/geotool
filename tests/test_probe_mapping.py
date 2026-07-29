@@ -73,6 +73,68 @@ def test_extract_probe_gene_table_unmapped_when_nothing_usable():
     assert list(result.columns) == ["probe_id", "gene_symbol", "entrez_id", "source"]
 
 
+# Real GPL23432 (Brainarray ENSG custom-CDF re-annotation of Affymetrix
+# HG-U133 Plus 2) annotation table shape, captured live during planning.
+GPL23432_ROWS = [
+    {
+        "ID": "ENSG00000000003_at",
+        "ORF": "ENSG00000000003",
+        "Description": "tetraspanin 6 [Source:HGNC Symbol;Acc:11858]",
+    },
+    {
+        "ID": "ENSG00000000005_at",
+        "ORF": "ENSG00000000005",
+        "Description": "tenomodulin [Source:HGNC Symbol;Acc:17757]",
+    },
+]
+
+
+def test_parse_orf_ensembl_column_maps_probe_to_ensembl_gene_id():
+    df = pd.DataFrame(GPL23432_ROWS)
+    result = probe_mapping.parse_orf_ensembl_column(df)
+    assert result is not None
+    row0 = result[result["probe_id"] == "ENSG00000000003_at"].iloc[0]
+    assert row0["gene_symbol"] == "ENSG00000000003"
+    assert row0["entrez_id"] is None
+    assert (result["source"] == "ensembl_orf").all()
+
+
+def test_parse_orf_ensembl_column_returns_none_without_orf_column():
+    df = pd.DataFrame([{"ID": "1007_s_at", "Gene Symbol": "DDR1"}])
+    assert probe_mapping.parse_orf_ensembl_column(df) is None
+
+
+def test_parse_orf_ensembl_column_returns_none_when_orf_is_not_ensembl_ids():
+    """Guards against older spotted-array platforms that also name a column
+    "ORF" but for an unrelated identifier scheme -- must not misinterpret
+    those values as Ensembl gene IDs just because the column name matches."""
+    df = pd.DataFrame([{"ID": "probe1", "ORF": "IMAGE:2450123"}])
+    assert probe_mapping.parse_orf_ensembl_column(df) is None
+
+
+def test_extract_probe_gene_table_falls_back_to_orf_ensembl_column():
+    df = pd.DataFrame(GPL23432_ROWS)
+    result = probe_mapping.extract_probe_gene_table(df)
+    assert len(result) == 2
+    assert set(result["gene_symbol"]) == {"ENSG00000000003", "ENSG00000000005"}
+    assert (result["source"] == "ensembl_orf").all()
+
+
+def test_aggregate_probes_to_genes_works_with_ensembl_orf_mapping():
+    """The empty-expression-matrix bug on GSE98588 (GPL23432): probes must
+    still aggregate into a non-empty gene-level matrix even when the only
+    available gene key is the Ensembl-ID-flavored gene_symbol, not entrez_id."""
+    probe_matrix = pd.DataFrame(
+        {"GSM1": [5.0], "GSM2": [7.0]}, index=["ENSG00000000003_at"]
+    )
+    probe_gene_map = pd.DataFrame([
+        {"probe_id": "ENSG00000000003_at", "gene_symbol": "ENSG00000000003", "entrez_id": None, "source": "ensembl_orf"},
+    ])
+    genes = probe_mapping.aggregate_probes_to_genes(probe_matrix, probe_gene_map)
+    assert not genes.empty
+    assert genes.iloc[0]["gene_symbol"] == "ENSG00000000003"
+
+
 class FakeGSM:
     def __init__(self, table):
         self.table = table

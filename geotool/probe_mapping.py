@@ -1,6 +1,6 @@
 """Probe -> gene mapping for microarray platforms.
 
-Two mapping strategies, tried in order, both parsed straight from the
+Three mapping strategies, tried in order, all parsed straight from the
 platform's own (always-current-when-fetched) annotation table -- no external
 lookups:
 
@@ -13,8 +13,19 @@ lookups:
    location // entrez_id" groups joined by " /// ". Parsed with a regex
    rather than an Ensembl REST lookup, since the gene symbol and Entrez ID
    are already embedded in the text.
+3. Brainarray-style custom-CDF platforms (e.g. GPL23432, a re-annotated
+   Affymetrix HG-U133 Plus 2 using Brainarray's ENSG CDF): each probeset is
+   already one gene, identified by an "ORF" column holding the Ensembl Gene
+   ID directly (e.g. "ENSG00000000003"), with no Gene Symbol/Entrez columns
+   and no gene_assignment text at all. There's no official gene symbol in the
+   platform's own table for these (its "Description" column is the gene's
+   full name, not a short symbol) -- the Ensembl Gene ID itself is stored as
+   gene_symbol so there's still a real, non-empty key to group/merge on.
+   Only recognized when ORF actually looks like an Ensembl gene ID, since
+   older spotted-array platforms also use a column literally named "ORF" for
+   unrelated identifier schemes.
 
-Every probe gets at most one gene (source="unmapped" if neither strategy
+Every probe gets at most one gene (source="unmapped" if none of the above
 found anything) -- that, plus caching the result once per platform in
 get_or_build_probe_gene_map, is what makes "only one correspondence
 probe->gene per platform" true.
@@ -34,6 +45,7 @@ _GENE_SYMBOL_COLUMNS = ["Gene Symbol", "GENE_SYMBOL", "Symbol", "gene_symbol"]
 _ENTREZ_ID_COLUMNS = ["ENTREZ_GENE_ID", "Entrez_Gene_ID", "GENE_ID", "entrez_gene_id"]
 
 _FIELD_SEP_RE = re.compile(r"\s*//\s*")
+_ENSEMBL_GENE_ID_RE = re.compile(r"^ENSG\d+$")
 
 
 def _probe_id_column(annotation_df: pd.DataFrame) -> str:
@@ -93,9 +105,33 @@ def parse_gene_assignment(text) -> tuple[str | None, str | None]:
     return None, None
 
 
+def parse_orf_ensembl_column(annotation_df: pd.DataFrame) -> pd.DataFrame | None:
+    """Brainarray-style custom-CDF platforms (e.g. GPL23432): an "ORF" column
+    holding the Ensembl Gene ID directly, one gene per probeset already.
+    None if there's no ORF column, or its values don't actually look like
+    Ensembl gene IDs (some older spotted-array platforms reuse the "ORF"
+    column name for a different identifier scheme).
+    """
+    if "ORF" not in annotation_df.columns:
+        return None
+    values = annotation_df["ORF"].dropna().astype(str)
+    if values.empty or not values.str.match(_ENSEMBL_GENE_ID_RE).all():
+        return None
+
+    probe_col = _probe_id_column(annotation_df)
+    rows = []
+    for _, row in annotation_df.iterrows():
+        orf = _first_value(row.get("ORF"))
+        if orf is None:
+            continue
+        rows.append({"probe_id": row[probe_col], "gene_symbol": orf, "entrez_id": None, "source": "ensembl_orf"})
+    return pd.DataFrame(rows, columns=["probe_id", "gene_symbol", "entrez_id", "source"])
+
+
 def extract_probe_gene_table(annotation_df: pd.DataFrame) -> pd.DataFrame:
     """Per-platform probe->gene parser. Tries direct columns, then packed
-    gene_assignment text, else leaves every probe unmapped (never guessed).
+    gene_assignment text, then a Brainarray-style ORF/Ensembl column, else
+    leaves every probe unmapped (never guessed).
     """
     direct = parse_direct_columns(annotation_df)
     if direct is not None and not direct.empty:
@@ -111,6 +147,10 @@ def extract_probe_gene_table(annotation_df: pd.DataFrame) -> pd.DataFrame:
             rows.append({"probe_id": row[probe_col], "gene_symbol": symbol, "entrez_id": entrez, "source": "gene_assignment"})
         if rows:
             return pd.DataFrame(rows, columns=["probe_id", "gene_symbol", "entrez_id", "source"])
+
+    orf = parse_orf_ensembl_column(annotation_df)
+    if orf is not None and not orf.empty:
+        return orf
 
     return pd.DataFrame(columns=["probe_id", "gene_symbol", "entrez_id", "source"])
 
