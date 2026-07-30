@@ -33,13 +33,21 @@ scope here -- a substantially harder, separate problem.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pandas as pd
 
-from geotool import config, llm_annotate
+from geotool import config, harmonize_columns, llm_annotate
 
 _DEFAULT_ALIASES_PATH = config.PROJECT_ROOT / "geotool" / "vocab_data" / "annotation_aliases.json"
+
+# Columns clinical_annotate.py / llm_annotate.py / apply_column_aliases already gave a
+# stable cross-cohort name -- the cross-cohort concept matcher (harmonize_columns.py)
+# must leave these alone rather than re-clustering e.g. two cohorts' already-identical
+# "response" columns, or accidentally merging OS_time into PFS_time.
+_ALWAYS_PROTECTED_COLUMNS = {"gsm_id", "gse_id", "platform_id", "treatment", "treatment_detail", "response", "recist"}
+_SURVIVAL_SUFFIX_RE = re.compile(r".+_(time|event)$")
 
 
 def load_annotation_aliases(path: Path | None = None) -> dict[str, str]:
@@ -146,12 +154,31 @@ def harmonize_cohort(
     return apply_column_aliases(annotation)
 
 
+def _protected_columns(df: pd.DataFrame) -> set[str]:
+    aliases = load_annotation_aliases()
+    protected = set(_ALWAYS_PROTECTED_COLUMNS) | set(aliases.values())
+    protected |= {c for c in df.columns if c.startswith("llm_")}
+    protected |= {c for c in df.columns if _SURVIVAL_SUFFIX_RE.match(c)}
+    return protected
+
+
+def _load_master(master_path: Path | str | None) -> pd.DataFrame | None:
+    if not master_path:
+        return None
+    path = Path(master_path)
+    if not path.exists():
+        return None
+    return pd.read_csv(path, sep="\t")
+
+
 def harmonize_cohorts(
     gse_ids: list[str],
     series_dir: Path | None = None,
     llm_annotate_flag: bool = False,
     model: str | None = None,
     escalate_ambiguous: bool = False,
+    master_path: Path | str | None = None,
+    match_columns: bool = True,
 ) -> pd.DataFrame:
     """Master annotation table across every requested cohort -- one row per
     gsm_id, columns unioned across cohorts (an outer concat, so e.g. one
@@ -159,9 +186,26 @@ def harmonize_cohorts(
     NaN where a given cohort doesn't report that column). Cohorts that
     haven't been downloaded yet are skipped with a printed warning rather
     than failing the whole run.
+
+    With match_columns=True (the default), a cross-cohort LLM pass
+    (harmonize_columns.py) then finds raw characteristic columns from
+    different cohorts that describe the same concept (e.g. a DLBCL
+    cell-of-origin call spelled three different ways) and merges them under
+    one canonical name with unified values. If master_path points at an
+    existing harmonized annotation.tsv, its cohorts are skipped (not
+    reprocessed), its already-canonical columns are given priority in the
+    matching prompt, and its rows are concatenated onto the result unchanged.
     """
+    master_df = _load_master(master_path)
+    already_in_master = (
+        set(master_df["gse_id"].astype(str)) if master_df is not None and "gse_id" in master_df.columns else set()
+    )
+
     frames = []
     for gse_id in gse_ids:
+        if gse_id in already_in_master:
+            print(f"  {gse_id}: already in master -- skipped")
+            continue
         df = harmonize_cohort(
             gse_id, series_dir=series_dir, llm_annotate_flag=llm_annotate_flag,
             model=model, escalate_ambiguous=escalate_ambiguous,
@@ -172,5 +216,24 @@ def harmonize_cohorts(
         frames.append(df)
 
     if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True, sort=False)
+        return master_df if master_df is not None else pd.DataFrame()
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+
+    if match_columns:
+        protected = _protected_columns(combined)
+        clusterable = harmonize_columns.clusterable_columns(combined, protected)
+        if clusterable:
+            diagnosis_ctx = harmonize_columns.diagnosis_context(combined)
+            seed_hints = harmonize_columns.seed_hint_text(diagnosis_ctx)
+            master_summary = (
+                harmonize_columns.master_columns_summary(master_df, protected) if master_df is not None else ""
+            )
+            plan = harmonize_columns.get_column_mapping_plan(
+                combined, clusterable, diagnosis_ctx, seed_hints, master_summary, model=model,
+            )
+            combined = harmonize_columns.apply_column_clusters(combined, plan)
+
+    if master_df is not None:
+        return pd.concat([master_df, combined], ignore_index=True, sort=False)
+    return combined

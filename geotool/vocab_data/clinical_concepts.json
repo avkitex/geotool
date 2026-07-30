@@ -1,0 +1,14 @@
+{
+    "DLBCL": {
+        "COO": ["GCB", "ABC", "Unclassified"]
+    },
+    "CLL_SLL": {
+        "IGHV_status": ["mutated", "unmutated"]
+    },
+    "mantle_cell_lymphoma": {
+        "IGHV_status": ["mutated", "unmutated"]
+    },
+    "breast_cancer": {
+        "PAM50": ["Luminal A", "Luminal B", "HER2-enriched", "Basal-like", "Normal-like"]
+    }
+}
