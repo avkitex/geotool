@@ -230,17 +230,23 @@ def apply_column_mapping(samples_df: pd.DataFrame, plan: ColumnMappingPlan) -> p
 
     # 2. treatment / treatment_detail -- coalesce what cleanly folds, keep the
     #    rest as free text rather than forcing a bad fit or losing it.
+    #    Checking pd.notna() on the *original* values (rather than relying on
+    #    .astype(str) turning a missing value into the literal string "nan",
+    #    then filtering that out) matters because pandas' nullable string
+    #    dtype leaves an actual missing value as a real float NaN even after
+    #    .astype(str) -- and float('nan') is truthy, so an `if v` guard alone
+    #    doesn't catch it, only to crash moments later on v.lower().
     treatment_cols = [c for c in plan.treatment_columns if c in df.columns]
     if treatment_cols:
-        df["treatment"] = df[treatment_cols].astype(str).apply(
-            lambda row: "; ".join(v for v in row if v and v.lower() != "nan"), axis=1
+        df["treatment"] = df[treatment_cols].apply(
+            lambda row: "; ".join(str(v) for v in row if pd.notna(v)), axis=1
         )
         df = df.drop(columns=[c for c in treatment_cols if c != "treatment"])
 
     detail_cols = [c for c in plan.treatment_detail_columns if c in df.columns]
     if detail_cols:
-        df["treatment_detail"] = df[detail_cols].astype(str).apply(
-            lambda row: "; ".join(v for v in row if v and v.lower() != "nan"), axis=1
+        df["treatment_detail"] = df[detail_cols].apply(
+            lambda row: "; ".join(str(v) for v in row if pd.notna(v)), axis=1
         )
         df = df.drop(columns=[c for c in detail_cols if c != "treatment_detail"])
 
