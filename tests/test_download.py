@@ -165,7 +165,10 @@ def make_agilent_two_channel_gse():
             table=pd.DataFrame({
                 "ID_REF": ["1007_s_at", "1053_at"],
                 "ch1 Intensity": [10.0, 20.0],
-                "ch2 Intensity": [100.0, 200.0],
+                # Kept under the log2-transform threshold so these channel
+                # tests aren't entangled with that separate concern -- see
+                # test_probe_mapping.py's dedicated log2-transform tests.
+                "ch2 Intensity": [15.0, 25.0],
                 "VALUE": [1.0, 1.0],
             }),
         ),
@@ -177,7 +180,7 @@ def make_agilent_two_channel_gse():
             table=pd.DataFrame({
                 "ID_REF": ["1007_s_at", "1053_at"],
                 "ch1 Intensity": [11.0, 21.0],
-                "ch2 Intensity": [101.0, 201.0],
+                "ch2 Intensity": [16.0, 26.0],
                 "VALUE": [1.0, 1.0],
             }),
         ),
@@ -211,7 +214,7 @@ def test_build_and_map_channel_expression_matrices_writes_both_channels(monkeypa
     ddr1 = channel1[channel1["gene_symbol"] == "DDR1"].iloc[0]
     assert ddr1["GSM1"] == 10.0
     ddr1_ch2 = channel2[channel2["gene_symbol"] == "DDR1"].iloc[0]
-    assert ddr1_ch2["GSM1"] == 100.0
+    assert ddr1_ch2["GSM1"] == 15.0
 
 
 def test_build_and_map_channel_expression_matrices_does_not_touch_ratio_expression(monkeypatch, tmp_path):

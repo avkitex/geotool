@@ -73,6 +73,19 @@ platform's own annotation table (`probe_matrix.tsv.gz` / `expression.tsv.gz`
 Every cohort also gets a cleaned, semantically-unified `annotation.tsv`.
 Writes into `data/series/<GSE_ID>/`.
 
+Gene-level expression values (`expression.tsv.gz` and, for two-channel
+Agilent samples, `channel1_expression.tsv.gz` / `channel2_expression.tsv.gz`
+below) are log2(x + 1)-transformed unless they already look log2 scale --
+checked with a simple heuristic (any value over 50 means "not yet log2",
+since real log2 expression values rarely reach the low teens while raw
+linear-scale intensities routinely run into the hundreds or thousands). This
+happens at the gene-expression level only -- `probe_matrix.tsv.gz` and the
+`channelN_probe_matrix.tsv.gz` files stay exactly as submitted -- and keeps
+gene-level values comparable across platforms/submitters regardless of
+whether they submitted raw or already-log-transformed values, while
+correctly leaving already-log2 data (like a two-channel ratio, which can be
+negative) untouched.
+
 Two-channel Agilent samples (Cy3/Cy5 reference-design arrays) whose own data
 table publishes per-channel intensity columns -- not all do; most only carry
 the precomputed ratio -- also get each channel's own probe/gene matrix as an

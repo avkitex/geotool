@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 
 from geotool import probe_mapping
@@ -135,6 +136,46 @@ def test_aggregate_probes_to_genes_works_with_ensembl_orf_mapping():
     assert genes.iloc[0]["gene_symbol"] == "ENSG00000000003"
 
 
+# Real GPL7091 (older Agilent spotted oligo array) annotation table shape,
+# captured live during planning: annotated probes carry a real gene symbol
+# in PrimarySequenceName, unannotated ones a bare internal clone ID instead.
+GPL7091_ROWS = [
+    {"ID": "1", "PrimarySequenceName": "LOC51235", "ORF": "LOC51235"},
+    {"ID": "2", "PrimarySequenceName": "I_959282", "ORF": "I_959282"},
+    {"ID": "4", "PrimarySequenceName": "NIT2", "ORF": "NIT2"},
+]
+
+
+def test_parse_primary_sequence_name_column_maps_annotated_probes_only():
+    df = pd.DataFrame(GPL7091_ROWS)
+    result = probe_mapping.parse_primary_sequence_name_column(df)
+    assert result is not None
+    assert set(result["probe_id"]) == {"1", "4"}  # probe 2's I_959282 clone id excluded
+    assert set(result["gene_symbol"]) == {"LOC51235", "NIT2"}
+    assert (result["source"] == "primary_sequence_name").all()
+
+
+def test_parse_primary_sequence_name_column_returns_none_without_column():
+    df = pd.DataFrame([{"ID": "1007_s_at", "Gene Symbol": "DDR1"}])
+    assert probe_mapping.parse_primary_sequence_name_column(df) is None
+
+
+def test_extract_probe_gene_table_falls_back_to_primary_sequence_name():
+    df = pd.DataFrame(GPL7091_ROWS)
+    result = probe_mapping.extract_probe_gene_table(df)
+    assert len(result) == 2
+    assert set(result["gene_symbol"]) == {"LOC51235", "NIT2"}
+    assert (result["source"] == "primary_sequence_name").all()
+
+
+def test_extract_probe_gene_table_prefers_orf_ensembl_over_primary_sequence_name():
+    df = pd.DataFrame([{
+        "ID": "ENSG00000000003_at", "ORF": "ENSG00000000003", "PrimarySequenceName": "TSPAN6",
+    }])
+    result = probe_mapping.extract_probe_gene_table(df)
+    assert (result["source"] == "ensembl_orf").all()
+
+
 class FakeGSM:
     def __init__(self, table, metadata=None):
         self.table = table
@@ -172,8 +213,12 @@ def test_build_probe_matrix_all_empty_returns_empty_dataframe():
 
 
 def test_aggregate_probes_to_genes_averages_multiple_probes_for_same_gene():
+    # Values kept under the log2-transform threshold (see
+    # _LOG2_ALREADY_TRANSFORMED_MAX) so this test's averaging arithmetic
+    # isn't entangled with that separate concern -- see the dedicated
+    # test_aggregate_probes_to_genes_log2_transforms_* tests for that.
     probe_matrix = pd.DataFrame(
-        {"GSM1": [656.6, 320.8, 361.3], "GSM2": [700.1, 310.2, 400.0]},
+        {"GSM1": [6.566, 3.208, 3.613], "GSM2": [7.001, 3.102, 4.0]},
         index=["1007_s_at", "1053_at", "117_at"],
     )
     probe_gene_map = pd.DataFrame([
@@ -183,9 +228,63 @@ def test_aggregate_probes_to_genes_averages_multiple_probes_for_same_gene():
     ])
     genes = probe_mapping.aggregate_probes_to_genes(probe_matrix, probe_gene_map)
     ddr1 = genes[genes["gene_symbol"] == "DDR1"].iloc[0]
-    assert ddr1["GSM1"] == (656.6 + 361.3) / 2
-    assert ddr1["GSM2"] == (700.1 + 400.0) / 2
+    assert ddr1["GSM1"] == (6.566 + 3.613) / 2
+    assert ddr1["GSM2"] == (7.001 + 4.0) / 2
     assert len(genes) == 2  # DDR1 + RFC2, not 3 rows
+
+
+def test_needs_log2_transform_true_when_any_value_over_threshold():
+    assert probe_mapping.needs_log2_transform(pd.DataFrame({"GSM1": [1.0, 656.6]}))
+    assert not probe_mapping.needs_log2_transform(pd.DataFrame({"GSM1": [1.0, 49.9]}))
+
+
+def test_needs_log2_transform_false_for_negative_log_ratio_values():
+    """A two-channel log-ratio (or any already-log2 data) can be negative --
+    must never be mistaken for "needs transforming"."""
+    assert not probe_mapping.needs_log2_transform(pd.DataFrame({"GSM1": [-4.68, 6.29, -0.02]}))
+
+
+def test_needs_log2_transform_false_for_empty_matrix():
+    assert not probe_mapping.needs_log2_transform(pd.DataFrame())
+
+
+def test_maybe_log2_transform_applies_when_needed():
+    matrix = pd.DataFrame({"GSM1": [0.0, 99.0]})
+    result = probe_mapping.maybe_log2_transform(matrix)
+    assert result["GSM1"].tolist() == [np.log2(1.0), np.log2(100.0)]
+
+
+def test_maybe_log2_transform_leaves_already_log2_data_untouched():
+    matrix = pd.DataFrame({"GSM1": [-4.68, 6.29]})
+    result = probe_mapping.maybe_log2_transform(matrix)
+    assert result["GSM1"].tolist() == [-4.68, 6.29]
+
+
+def test_aggregate_probes_to_genes_log2_transforms_raw_linear_scale_values():
+    """Raw, untransformed microarray values (e.g. Affymetrix MAS5-style
+    intensities in the hundreds) must come out log2(x + 1)-transformed at
+    the gene-expression level."""
+    probe_matrix = pd.DataFrame({"GSM1": [656.6], "GSM2": [700.1]}, index=["1007_s_at"])
+    probe_gene_map = pd.DataFrame([
+        {"probe_id": "1007_s_at", "gene_symbol": "DDR1", "entrez_id": "780", "source": "direct_columns"},
+    ])
+    genes = probe_mapping.aggregate_probes_to_genes(probe_matrix, probe_gene_map)
+    ddr1 = genes.iloc[0]
+    assert ddr1["GSM1"] == np.log2(656.6 + 1)
+    assert ddr1["GSM2"] == np.log2(700.1 + 1)
+
+
+def test_aggregate_probes_to_genes_leaves_already_log2_ratio_untouched():
+    """A VALUE ratio (or any already-log2 data) can be negative and must
+    never be re-transformed, even at the gene-expression level."""
+    probe_matrix = pd.DataFrame({"GSM1": [-4.68], "GSM2": [6.29]}, index=["1007_s_at"])
+    probe_gene_map = pd.DataFrame([
+        {"probe_id": "1007_s_at", "gene_symbol": "DDR1", "entrez_id": "780", "source": "direct_columns"},
+    ])
+    genes = probe_mapping.aggregate_probes_to_genes(probe_matrix, probe_gene_map)
+    ddr1 = genes.iloc[0]
+    assert ddr1["GSM1"] == -4.68
+    assert ddr1["GSM2"] == 6.29
 
 
 def test_aggregate_probes_to_genes_drops_unmapped_probes():
@@ -224,6 +323,48 @@ def test_get_or_build_probe_gene_map_caches_to_disk(monkeypatch, tmp_path):
     second = probe_mapping.get_or_build_probe_gene_map("GPL96", platforms_dir=tmp_path)
     assert len(calls) == 1  # cache hit, no second fetch
     assert second.iloc[0]["gene_symbol"] == "DDR1"
+
+
+def test_get_or_build_probe_gene_map_probe_id_dtype_matches_on_cache_miss_and_hit(monkeypatch, tmp_path):
+    """Regression test: platforms with purely-numeric probe IDs (e.g.
+    GPL7091's "1", "2", ...) inherit the platform table's own int64 "ID"
+    dtype on a cache miss, but the cache-hit path forces str -- this
+    mismatch silently broke aggregate_probes_to_genes's index join
+    depending on which one happened to run first in a given process (found
+    live on GSE12234: the ratio-based expression.tsv.gz worked because it
+    ran on a cache miss, but channel1/channel2_expression.tsv.gz came back
+    empty because they ran right after, on a cache hit)."""
+    class FakeGPL:
+        table = pd.DataFrame([{"ID": 1, "Gene Symbol": "DDR1", "ENTREZ_GENE_ID": "780"}])
+
+    monkeypatch.setattr(probe_mapping.geo_fetch, "fetch_platform", lambda gpl_id: FakeGPL())
+
+    cache_miss = probe_mapping.get_or_build_probe_gene_map("GPL7091", platforms_dir=tmp_path)
+    cache_hit = probe_mapping.get_or_build_probe_gene_map("GPL7091", platforms_dir=tmp_path)
+
+    # Both must join a numeric-indexed probe_matrix identically -- that's
+    # what actually broke, not the exact dtype name (pandas has more than one
+    # string-flavored dtype depending on version/config).
+    probe_matrix = pd.DataFrame({"GSM1": [5.0]}, index=pd.Index([1], dtype="int64"))
+    genes_from_miss = probe_mapping.aggregate_probes_to_genes(probe_matrix, cache_miss)
+    genes_from_hit = probe_mapping.aggregate_probes_to_genes(probe_matrix, cache_hit)
+    assert not genes_from_miss.empty
+    assert not genes_from_hit.empty
+    assert genes_from_miss.iloc[0]["gene_symbol"] == genes_from_hit.iloc[0]["gene_symbol"] == "DDR1"
+
+
+def test_aggregate_probes_to_genes_matches_despite_numeric_probe_matrix_index():
+    """Regression test companion: even if a caller passes a probe_matrix
+    with an int64 index (as GEOparse produces for numeric-ID platforms),
+    the join against probe_gene_map's str probe_id must still succeed."""
+    probe_matrix = pd.DataFrame({"GSM1": [5.0]}, index=pd.Index([1], dtype="int64"))
+    probe_gene_map = pd.DataFrame([
+        {"probe_id": "1", "gene_symbol": "DDR1", "entrez_id": None, "source": "direct_columns"},
+    ])
+    genes = probe_mapping.aggregate_probes_to_genes(probe_matrix, probe_gene_map)
+    assert not genes.empty
+    assert genes.iloc[0]["gene_symbol"] == "DDR1"
+    assert genes.iloc[0]["GSM1"] == 5.0
 
 
 def test_detect_channel_columns_finds_known_naming_variants():
