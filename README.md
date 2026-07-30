@@ -113,10 +113,41 @@ Only platforms listed in `geotool/renormalize.py`'s `_CHIP_PACKAGES` table are
 supported; an unlisted platform, or a failed install/run, just skips
 RMA for that series (logged) rather than failing the download.
 
+### Harmonize
+
+```bash
+geotool harmonize GSE10846 GSE98588
+```
+
+Unifies already-downloaded cohorts' annotation tables into one master table,
+one row per sample across every requested cohort. Reuses each cohort's own
+`annotation.tsv` (from `download`, above) plus, if present, its cached
+`llm_annotations.json` (from `search --llm-annotate`) at zero extra cost --
+tissue/diagnosis/sample-source classification is joined in directly from
+that cache, no LLM call needed. Whatever raw characteristic columns aren't
+already covered (sex, age, cell_type, ...) get renamed onto a canonical name
+via a small alias file (`geotool/vocab_data/annotation_aliases.json`);
+anything with no alias match is kept as-is rather than dropped. Survival
+columns are unioned across cohorts (one cohort's `OS_time`/`OS_event` and
+another's `PFS_time`/`PFS_event` both survive, NaN where a cohort doesn't
+report that type).
+
+Add `--llm-annotate` to backfill tissue/diagnosis classification for
+cohorts that don't have a cached `llm_annotations.json` yet (costs a real
+LLM call per such cohort, needs `ANTHROPIC_API_KEY`; off by default). A
+cohort that hasn't been downloaded yet (no `annotation.tsv`) is skipped with
+a warning rather than failing the whole run. Writes
+`data/harmonized/<name>/annotation.tsv`.
+
+Cross-cohort *expression matrix* harmonization (different platforms,
+different gene coverage, batch effects) is a separate, harder problem and
+out of scope here.
+
 ## Status
 
-Phase 1 (search + report) and LLM-assisted annotation/query are implemented.
-Phase 2 (download, plus opt-in CEL/RMA renormalization) is implemented — see
-`geotool/download.py`, `geotool/probe_mapping.py`, `geotool/renormalize.py`.
-Cross-cohort harmonization is planned but not yet implemented — see the stub
-module `geotool/harmonize.py`.
+Phase 1 (search + report), LLM-assisted annotation/query, Phase 2 (download,
+plus opt-in CEL/RMA renormalization and two-channel Agilent splitting), and
+Phase 3 (cross-cohort annotation harmonization) are all implemented — see
+`geotool/download.py`, `geotool/probe_mapping.py`, `geotool/renormalize.py`,
+and `geotool/harmonize.py`. Cross-cohort *expression matrix* harmonization
+remains unimplemented (see the Harmonize section above).

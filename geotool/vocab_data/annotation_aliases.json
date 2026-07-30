@@ -1,0 +1,20 @@
+{
+    "Sex": "sex",
+    "sex": "sex",
+    "gender": "sex",
+    "Gender": "sex",
+    "Age": "age",
+    "age": "age",
+    "age_yrs": "age",
+    "age (yrs)": "age",
+    "age_years": "age",
+    "Tissue": "tissue",
+    "tissue": "tissue",
+    "organ": "tissue",
+    "Organ": "tissue",
+    "cell type": "cell_type",
+    "Cell Type": "cell_type",
+    "cell_type": "cell_type",
+    "celltype": "cell_type",
+    "Cell_Type": "cell_type"
+}

@@ -180,6 +180,25 @@ def test_apply_column_mapping_full_pipeline():
     assert "vital_status" not in out.columns
 
 
+def test_apply_column_mapping_treatment_column_with_missing_values():
+    """Regression test: a real GSE181063 live run crashed with
+    'float' object has no attribute 'lower' -- some pandas versions leave a
+    missing value as an actual float NaN even after .astype(str) (rather
+    than the literal string "nan"), and float('nan') is truthy so the old
+    `if v` guard didn't filter it out before calling v.lower()."""
+    df = pd.DataFrame({
+        "gsm_id": ["GSM1", "GSM2", "GSM3"],
+        "gse_id": ["GSE1", "GSE1", "GSE1"],
+        "platform_id": ["GPL1", "GPL1", "GPL1"],
+        "firstline_regimen": ["CHOP-R", None, "CVP-R"],
+    })
+    plan = ca.ColumnMappingPlan(treatment_columns=["firstline_regimen"])
+
+    out = ca.apply_column_mapping(df, plan)
+
+    assert list(out["treatment"]) == ["CHOP-R", "", "CVP-R"]
+
+
 def test_apply_column_mapping_handles_repeated_label_values_end_to_end():
     """Regression test for the GSE10846 live smoke test: GEO characteristics
     like 'clinical info_5: Chemotherapy: CHOP-Like Regimen' parse (via

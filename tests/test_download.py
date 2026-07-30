@@ -465,6 +465,95 @@ def test_download_cohort_with_rma_flag_adds_rma_expression(monkeypatch, tmp_path
     assert (tmp_path / "GSE_ARRAY" / "expression.tsv.gz").exists()  # submitter-value path still runs
 
 
+def test_cached_result_returns_none_when_not_downloaded(tmp_path):
+    assert download._cached_result("GSE_NOPE", tmp_path / "GSE_NOPE") is None
+
+
+def _raise(*args, **kwargs):
+    raise AssertionError("should not be called on a reuse path")
+
+
+def test_download_cohort_reuses_existing_download_without_refetching(monkeypatch, tmp_path):
+    gse = make_microarray_gse()
+    fetch_calls = []
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: (fetch_calls.append(gse_id), gse)[1])
+    monkeypatch.setattr(
+        download.clinical_annotate, "plan_column_mapping", lambda samples, model=None: clinical_annotate.ColumnMappingPlan()
+    )
+    fake_map = pd.DataFrame([
+        {"probe_id": "1007_s_at", "gene_symbol": "DDR1", "entrez_id": "780", "source": "direct_columns"},
+        {"probe_id": "1053_at", "gene_symbol": "RFC2", "entrez_id": "5982", "source": "direct_columns"},
+    ])
+    monkeypatch.setattr(download.probe_mapping, "get_or_build_probe_gene_map", lambda gpl_id: fake_map)
+
+    first = download.download_cohort("GSE_ARRAY", series_dir=tmp_path)
+    assert len(fetch_calls) == 1
+
+    # Any of these being called on the reuse path would fail the test.
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", _raise)
+    monkeypatch.setattr(download.clinical_annotate, "plan_column_mapping", _raise)
+    monkeypatch.setattr(download.probe_mapping, "get_or_build_probe_gene_map", _raise)
+
+    second = download.download_cohort("GSE_ARRAY", series_dir=tmp_path)
+
+    assert second["expression_path"] == first["expression_path"]
+    assert second["annotation_path"] == first["annotation_path"]
+    assert second["assay_types"] == first["assay_types"]
+
+
+def test_download_cohort_force_redoes_even_when_already_downloaded(monkeypatch, tmp_path):
+    gse = make_microarray_gse()
+    fetch_calls = []
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: (fetch_calls.append(gse_id), gse)[1])
+    monkeypatch.setattr(
+        download.clinical_annotate, "plan_column_mapping", lambda samples, model=None: clinical_annotate.ColumnMappingPlan()
+    )
+    fake_map = pd.DataFrame([
+        {"probe_id": "1007_s_at", "gene_symbol": "DDR1", "entrez_id": "780", "source": "direct_columns"},
+        {"probe_id": "1053_at", "gene_symbol": "RFC2", "entrez_id": "5982", "source": "direct_columns"},
+    ])
+    monkeypatch.setattr(download.probe_mapping, "get_or_build_probe_gene_map", lambda gpl_id: fake_map)
+
+    download.download_cohort("GSE_ARRAY", series_dir=tmp_path)
+    assert len(fetch_calls) == 1
+
+    download.download_cohort("GSE_ARRAY", series_dir=tmp_path, force=True)
+    assert len(fetch_calls) == 2
+
+
+def test_download_cohort_backfills_only_missing_rma_without_redoing_annotation(monkeypatch, tmp_path):
+    gse = make_microarray_gse()
+    fetch_calls = []
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: (fetch_calls.append(gse_id), gse)[1])
+    monkeypatch.setattr(
+        download.clinical_annotate, "plan_column_mapping", lambda samples, model=None: clinical_annotate.ColumnMappingPlan()
+    )
+    fake_map = pd.DataFrame([
+        {"probe_id": "1007_s_at", "gene_symbol": "DDR1", "entrez_id": "780", "source": "direct_columns"},
+        {"probe_id": "1053_at", "gene_symbol": "RFC2", "entrez_id": "5982", "source": "direct_columns"},
+    ])
+    monkeypatch.setattr(download.probe_mapping, "get_or_build_probe_gene_map", lambda gpl_id: fake_map)
+
+    download.download_cohort("GSE_ARRAY", series_dir=tmp_path)  # no --rma yet
+    assert len(fetch_calls) == 1
+    assert not (tmp_path / "GSE_ARRAY" / "expression_rma.tsv.gz").exists()
+
+    # Would fail the test if the reuse+rma-backfill path redid the submitter-
+    # value matrix or the clinical_annotate LLM call.
+    monkeypatch.setattr(download.clinical_annotate, "plan_column_mapping", _raise)
+    monkeypatch.setattr(
+        download, "download_cel_files", lambda gse, out_dir: {"GSM1": tmp_path / "a.CEL", "GSM2": tmp_path / "b.CEL"}
+    )
+    fake_rma_matrix = pd.DataFrame({"GSM1": [1.0, 2.0], "GSM2": [3.0, 4.0]}, index=["1007_s_at", "1053_at"])
+    monkeypatch.setattr(download.renormalize, "run_rma", lambda cel_files, gpl_id: fake_rma_matrix)
+
+    result = download.download_cohort("GSE_ARRAY", series_dir=tmp_path, rma=True)
+
+    assert len(fetch_calls) == 2  # re-fetched, just for CEL download/RMA
+    assert result["expression_rma_path"] is not None
+    assert (tmp_path / "GSE_ARRAY" / "expression_rma.tsv.gz").exists()
+
+
 def test_download_cohort_routes_microarray(monkeypatch, tmp_path):
     gse = make_microarray_gse()
     monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)
