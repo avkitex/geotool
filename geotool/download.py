@@ -4,8 +4,12 @@ Routes by platform assay_type (from platform_classify, already computed in
 series_row()'s platform_details): RNA-seq/scRNA-seq -> download the
 supplementary expression file(s) verbatim, no parsing or reshaping.
 Microarray -> reshape each sample's own data table into a probe matrix, map
-probes to genes via probe_mapping.py. Always also produce a cleaned,
-semantically-unified per-sample annotation table via clinical_annotate.py.
+probes to genes via probe_mapping.py -- including, for two-channel Agilent
+samples that publish per-channel columns, each channel's own matrix as an
+*additional* output alongside the always-produced ratio-based one (see
+build_and_map_channel_expression_matrices / probe_mapping.py's
+detect_channel_columns). Always also produce a cleaned, semantically-unified
+per-sample annotation table via clinical_annotate.py.
 
 Phase 2b (opt-in via download_cohort(..., rma=True)): for Affymetrix
 microarray series, also download raw CEL files and RMA-renormalize them via
@@ -174,6 +178,76 @@ def build_and_map_expression_matrix(gse, out_dir: Path) -> Path | None:
     return expression_path
 
 
+def build_and_map_channel_expression_matrices(
+    gse, out_dir: Path, platform_details: list[dict]
+) -> dict[int, Path]:
+    """For two-channel Agilent samples whose own data table exposes
+    recognizable per-channel columns (probe_mapping.detect_channel_columns),
+    write each channel's own probe/gene matrix as an *additional* output --
+    channel1_expression.tsv.gz / channel2_expression.tsv.gz -- alongside the
+    ratio-based expression.tsv.gz that build_and_map_expression_matrix always
+    produces unchanged. Neither channel is assumed to be "the real sample" or
+    "the reference" (that's a per-study convention, not something derivable
+    from the data alone) -- both are just named by channel number.
+
+    Most two-channel series don't publish per-channel columns at all (only
+    the precomputed ratio), so this silently writes nothing when there's
+    nothing to split -- never an error, and never touches expression.tsv.gz.
+    """
+    agilent_gpl_ids = {p["gpl_id"] for p in platform_details if p.get("vendor") == "agilent"}
+    if not agilent_gpl_ids:
+        return {}
+
+    channel1_matrix, channel2_matrix = probe_mapping.build_channel_probe_matrices(gse)
+    if channel1_matrix.empty:
+        return {}
+
+    # Only samples on an Agilent platform qualify, even though the channel
+    # matrices themselves are built vendor-agnostically -- restrict both
+    # matrices to those columns up front so probe- and gene-level outputs
+    # stay consistent with each other.
+    eligible_cols = [
+        gsm_id
+        for gsm_id in channel1_matrix.columns
+        if agilent_gpl_ids & set(gse.gsms[gsm_id].metadata.get("platform_id", []))
+    ]
+    if not eligible_cols:
+        return {}
+    channel1_matrix = channel1_matrix[eligible_cols]
+    channel2_matrix = channel2_matrix[eligible_cols]
+
+    result: dict[int, Path] = {}
+    for channel_num, probe_matrix in ((1, channel1_matrix), (2, channel2_matrix)):
+        platform_ids = sorted({
+            gpl_id
+            for gsm_id in probe_matrix.columns
+            for gpl_id in gse.gsms[gsm_id].metadata.get("platform_id", [])
+            if gpl_id in agilent_gpl_ids
+        })
+        gene_frames = []
+        for gpl_id in platform_ids:
+            cols = [
+                gsm_id for gsm_id in probe_matrix.columns
+                if gpl_id in gse.gsms[gsm_id].metadata.get("platform_id", [])
+            ]
+            probe_gene_map = probe_mapping.get_or_build_probe_gene_map(gpl_id)
+            gene_frames.append(probe_mapping.aggregate_probes_to_genes(probe_matrix[cols], probe_gene_map))
+
+        _write_matrix(probe_matrix, out_dir / f"channel{channel_num}_probe_matrix.tsv.gz")
+        if not gene_frames:
+            continue
+
+        expression = gene_frames[0]
+        for other in gene_frames[1:]:
+            expression = expression.merge(other, on=["gene_symbol", "entrez_id"], how="outer")
+
+        expression_path = out_dir / f"channel{channel_num}_expression.tsv.gz"
+        _write_matrix(expression, expression_path, index=False)
+        result[channel_num] = expression_path
+
+    return result
+
+
 def download_cel_files(gse, out_dir: Path) -> dict[str, Path]:
     """Download each sample's raw CEL supplementary file, keyed by gsm_id --
     used by renormalize.py to run RMA. Samples with no CEL supplementary file
@@ -284,6 +358,9 @@ def download_cohort(
     elif "microarray" in assay_types:
         expr_path = build_and_map_expression_matrix(gse, out_dir)
         result["expression_path"] = str(expr_path) if expr_path else None
+        channel_paths = build_and_map_channel_expression_matrices(gse, out_dir, platform_details)
+        if channel_paths:
+            result["channel_expression_paths"] = {str(k): str(v) for k, v in channel_paths.items()}
         if rma:
             rma_path = build_and_renormalize_expression_matrix(gse, out_dir, platform_details)
             result["expression_rma_path"] = str(rma_path) if rma_path else None
