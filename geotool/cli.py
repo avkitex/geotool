@@ -6,7 +6,7 @@ import sys
 import click
 import pandas as pd
 
-from geotool import download as download_mod, report, search as search_mod
+from geotool import config, download as download_mod, harmonize as harmonize_mod, report, search as search_mod
 
 
 def _ensure_utf8_streams() -> None:
@@ -140,7 +140,17 @@ def query(text, llm_escalate, max_results, out_name, quiet):
     "first use. Skips gracefully per-platform when Rscript is missing, the platform is "
     "unknown, or an install/run fails.",
 )
-def download(gse_ids, from_report, rma_flag):
+@click.option(
+    "--force",
+    "force_flag",
+    is_flag=True,
+    help="Redo a cohort even if it's already been downloaded (by default, an already-downloaded "
+    "cohort -- annotation.tsv already on disk -- is reused as-is rather than re-fetched and "
+    "re-processed, which would otherwise repeat the clinical_annotate LLM call and any RMA run "
+    "for no reason). Adding --rma to a cohort previously downloaded without it still computes "
+    "just the missing RMA output, without needing --force.",
+)
+def download(gse_ids, from_report, rma_flag, force_flag):
     """Download expression data + a cleaned annotation table for one or more cohorts, e.g.
 
     geotool download GSE10846 GSE339488
@@ -154,8 +164,9 @@ def download(gse_ids, from_report, rma_flag):
     (unchanged). Add --rma to also RMA-renormalize Affymetrix series from raw
     CEL files. Every cohort also gets a cleaned, semantically-unified
     annotation.tsv (redundant columns dropped; treatment/response/RECIST/
-    survival unified where possible). Needs ANTHROPIC_API_KEY. Writes into
-    data/series/<GSE_ID>/.
+    survival unified where possible). A cohort that's already been downloaded
+    is reused rather than redone -- pass --force to redo it anyway. Needs
+    ANTHROPIC_API_KEY. Writes into data/series/<GSE_ID>/.
     """
     ids = list(gse_ids)
     if from_report:
@@ -168,7 +179,7 @@ def download(gse_ids, from_report, rma_flag):
     for gse_id in ids:
         click.echo(f"{gse_id}:")
         try:
-            result = download_mod.download_cohort(gse_id, rma=rma_flag)
+            result = download_mod.download_cohort(gse_id, rma=rma_flag, force=force_flag)
         except Exception as exc:
             click.echo(f"  FAILED: {exc}")
             continue
@@ -183,6 +194,58 @@ def download(gse_ids, from_report, rma_flag):
         if result.get("expression_files"):
             click.echo(f"  expression files: {len(result['expression_files'])} downloaded")
         click.echo(f"  annotation: {result['annotation_path']}")
+
+
+@main.command()
+@click.argument("gse_ids", nargs=-1)
+@click.option(
+    "--from-report",
+    "from_report",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Read gse_id values from a saved search/query report (.tsv) instead of passing them as arguments.",
+)
+@click.option(
+    "--llm-annotate",
+    "llm_annotate_flag",
+    is_flag=True,
+    help="Backfill tissue/diagnosis classification for cohorts with no cached llm_annotations.json "
+    "(from a prior `search --llm-annotate`) -- needs ANTHROPIC_API_KEY, and costs a real LLM call "
+    "per such cohort. Off by default: cohorts without a cache just get 'unknown' for those fields.",
+)
+@click.option("--out", "out_name", default="harmonized", show_default=True, help="Output basename under data/harmonized/")
+def harmonize(gse_ids, from_report, llm_annotate_flag, out_name):
+    """Unify already-downloaded cohorts' annotation tables into one master table, e.g.
+
+    geotool harmonize GSE10846 GSE98588
+
+    Reuses each cohort's annotation.tsv (from `geotool download`) plus, if
+    present, its cached llm_annotations.json (from `geotool search
+    --llm-annotate`) -- at zero additional cost. Add --llm-annotate to
+    backfill tissue/diagnosis classification for cohorts that don't have
+    that cache yet. Cohorts that haven't been downloaded yet (no
+    annotation.tsv) are skipped with a warning rather than failing the run.
+    Writes data/harmonized/<name>/annotation.tsv.
+    """
+    ids = list(gse_ids)
+    if from_report:
+        ids.extend(pd.read_csv(from_report, sep="\t")["gse_id"].dropna().astype(str).tolist())
+    ids = list(dict.fromkeys(ids))  # de-dupe, keep order
+
+    if not ids:
+        raise click.UsageError("Provide one or more GSE IDs, or --from-report <path>")
+
+    master = harmonize_mod.harmonize_cohorts(ids, llm_annotate_flag=llm_annotate_flag)
+    if master.empty:
+        click.echo("No cohorts could be harmonized -- none of the given GSE IDs have been downloaded yet.")
+        return
+
+    out_dir = config.DATA_DIR / "harmonized" / out_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "annotation.tsv"
+    master.to_csv(out_path, sep="\t", index=False)
+    n_cohorts = master["gse_id"].nunique() if "gse_id" in master.columns else len(ids)
+    click.echo(f"{len(master)} samples across {n_cohorts} cohort(s) written to {out_path}")
 
 
 if __name__ == "__main__":

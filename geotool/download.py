@@ -22,6 +22,15 @@ probe matrix and otherwise just sit on disk as raw, mostly-redundant data.
 All expression/probe matrices are written gzip-compressed with values
 rounded to 3 decimal places (see _write_matrix) to keep them from ballooning
 into hundreds of MB for large series.
+
+A cohort that's already been downloaded (annotation.tsv + series.tsv already
+on disk) is reused rather than re-fetched/re-processed -- see
+download_cohort(..., force=True) to force a full redo regardless, and
+_cached_result for what "already downloaded" checks. The one exception:
+if --rma is newly requested on a cohort previously downloaded without it,
+only the missing RMA output is computed (the series still needs
+re-fetching for its CEL files, but the already-done clinical_annotate LLM
+call and probe/gene matrix build are not repeated).
 """
 from __future__ import annotations
 
@@ -336,13 +345,79 @@ def build_and_renormalize_expression_matrix(
     return expression_path
 
 
+def _cached_result(gse_id: str, out_dir: Path) -> tuple[dict, list[dict]] | None:
+    """Build a download_cohort()-shaped result purely from files already on
+    disk from a previous run, without re-fetching or re-parsing the GEO
+    record. Returns (result, platform_details), or None if this cohort has
+    never been downloaded (no annotation.tsv/series.tsv yet).
+    """
+    annotation_path = out_dir / "annotation.tsv"
+    series_path = out_dir / "series.tsv"
+    if not annotation_path.exists() or not series_path.exists():
+        return None
+
+    srow = pd.read_csv(series_path, sep="\t").iloc[0].to_dict()
+    platform_details = json.loads(srow.get("platform_details") or "[]")
+    assay_types = sorted({p["assay_type"] for p in platform_details})
+
+    result: dict = {
+        "gse_id": gse_id, "assay_types": assay_types,
+        "expression_path": None, "annotation_path": str(annotation_path),
+    }
+
+    expr_path = out_dir / "expression.tsv.gz"
+    if expr_path.exists():
+        result["expression_path"] = str(expr_path)
+
+    channel_paths = {
+        str(n): str(out_dir / f"channel{n}_expression.tsv.gz")
+        for n in (1, 2) if (out_dir / f"channel{n}_expression.tsv.gz").exists()
+    }
+    if channel_paths:
+        result["channel_expression_paths"] = channel_paths
+
+    rma_path = out_dir / "expression_rma.tsv.gz"
+    if rma_path.exists():
+        result["expression_rma_path"] = str(rma_path)
+
+    expr_dir = out_dir / "expression"
+    if expr_dir.is_dir():
+        files = sorted(expr_dir.iterdir())
+        if files:
+            result["expression_files"] = [str(p) for p in files]
+
+    return result, platform_details
+
+
 def download_cohort(
-    gse_id: str, series_dir: Path | None = None, escalate_ambiguous: bool = False, rma: bool = False
+    gse_id: str, series_dir: Path | None = None, escalate_ambiguous: bool = False, rma: bool = False,
+    force: bool = False,
 ) -> dict:
+    out_dir = _series_dir(gse_id, series_dir)
+
+    if not force:
+        cached_pair = _cached_result(gse_id, out_dir)
+        if cached_pair is not None:
+            cached, platform_details = cached_pair
+            rma_missing = rma and "microarray" in cached["assay_types"] and "expression_rma_path" not in cached
+            if not rma_missing:
+                print(f"  {gse_id}: already downloaded -- reusing existing files (pass force=True / --force to redo)")
+                return cached
+
+            # Everything else about this cohort is already on disk and
+            # reusable -- only the newly-requested --rma output is actually
+            # missing, so fetch the series just for that (skipping the
+            # clinical_annotate LLM call and probe/gene matrix rebuild
+            # entirely, since annotation.tsv/expression.tsv.gz already exist).
+            print(f"  {gse_id}: already downloaded -- reusing existing files, computing the missing --rma output")
+            gse = geo_fetch.fetch_series(gse_id)
+            rma_path = build_and_renormalize_expression_matrix(gse, out_dir, platform_details)
+            cached["expression_rma_path"] = str(rma_path) if rma_path else None
+            return cached
+
     gse = geo_fetch.fetch_series(gse_id)
     srow = annotate.series_row(gse)
     samples = annotate.samples_table(gse)
-    out_dir = _series_dir(gse_id, series_dir)
     _persist_series_annotation(out_dir, srow, samples)
 
     platform_details = json.loads(srow.get("platform_details") or "[]")
