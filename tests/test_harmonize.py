@@ -261,3 +261,149 @@ def test_harmonize_cohorts_skips_missing_and_concatenates_present(tmp_path, caps
 def test_harmonize_cohorts_returns_empty_dataframe_when_nothing_downloaded(tmp_path):
     result = harmonize.harmonize_cohorts(["GSE_MISSING"], series_dir=tmp_path)
     assert result.empty
+
+
+# --- harmonize_cohorts cross-cohort column matching --------------------------
+
+class _FakeTextBlock:
+    def __init__(self, parsed_output):
+        self.type = "text"
+        self.parsed_output = parsed_output
+
+
+class _FakeResponse:
+    def __init__(self, parsed_output):
+        self.content = [_FakeTextBlock(parsed_output)]
+
+
+class _FakeMessages:
+    def __init__(self, plan):
+        self.plan = plan
+        self.calls = []
+
+    def parse(self, **kwargs):
+        self.calls.append(kwargs)
+        return _FakeResponse(self.plan)
+
+
+class _FakeClient:
+    def __init__(self, plan):
+        self.messages = _FakeMessages(plan)
+
+
+def test_harmonize_cohorts_merges_matching_columns_across_cohorts(tmp_path, monkeypatch):
+    from geotool import harmonize_columns
+    from geotool.harmonize_columns import ColumnCluster, CrossCohortMappingPlan
+
+    annotation_a = pd.DataFrame({
+        "gsm_id": ["GSM1"], "gse_id": ["GSE_A"], "coo_hans": ["GCB"],
+    })
+    annotation_b = pd.DataFrame({
+        "gsm_id": ["GSM2"], "gse_id": ["GSE_B"], "cell_of_origin": ["Germinal center B-cell-like"],
+    })
+    _write_cohort(tmp_path, "GSE_A", annotation_a)
+    _write_cohort(tmp_path, "GSE_B", annotation_b)
+
+    plan = CrossCohortMappingPlan(clusters=[
+        ColumnCluster(
+            canonical_name="coo",
+            source_columns=["coo_hans", "cell_of_origin"],
+            value_mapping={"GCB": "GCB", "Germinal center B-cell-like": "GCB"},
+        )
+    ])
+    fake_client = _FakeClient(plan)
+    monkeypatch.setattr(harmonize_columns.anthropic, "Anthropic", lambda: fake_client)
+    monkeypatch.setattr(harmonize.config, "DATA_DIR", tmp_path)
+
+    master = harmonize.harmonize_cohorts(["GSE_A", "GSE_B"], series_dir=tmp_path)
+
+    assert len(fake_client.messages.calls) == 1
+    assert "coo" in master.columns
+    assert "coo_hans" not in master.columns
+    assert "cell_of_origin" not in master.columns
+    assert set(master["coo"]) == {"GCB"}
+
+
+def test_harmonize_cohorts_skips_matching_when_only_protected_columns_present(tmp_path, monkeypatch):
+    """Regression guard: a batch with only already-canonical columns (survival
+    pairs, identity) must never trigger a live LLM call -- there's nothing to
+    cluster, so the matching step should short-circuit before calling out."""
+    from geotool import harmonize_columns
+
+    annotation = pd.DataFrame({"gsm_id": ["GSM1"], "gse_id": ["GSE_A"], "OS_time": [1.0], "OS_event": [1]})
+    _write_cohort(tmp_path, "GSE_A", annotation)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("should not call the LLM when there are no clusterable columns")
+
+    monkeypatch.setattr(harmonize_columns, "get_column_mapping_plan", _boom)
+
+    result = harmonize.harmonize_cohorts(["GSE_A"], series_dir=tmp_path)
+    assert set(result.columns) >= {"gsm_id", "gse_id", "OS_time", "OS_event"}
+
+
+def test_harmonize_cohorts_match_columns_false_skips_llm_call(tmp_path, monkeypatch):
+    from geotool import harmonize_columns
+
+    annotation = pd.DataFrame({"gsm_id": ["GSM1"], "gse_id": ["GSE_A"], "weird_col": ["x"]})
+    _write_cohort(tmp_path, "GSE_A", annotation)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("should not call the LLM when match_columns=False")
+
+    monkeypatch.setattr(harmonize_columns, "get_column_mapping_plan", _boom)
+
+    result = harmonize.harmonize_cohorts(["GSE_A"], series_dir=tmp_path, match_columns=False)
+    assert "weird_col" in result.columns
+
+
+# --- harmonize_cohorts master mode -------------------------------------------
+
+def test_harmonize_cohorts_master_path_skips_cohorts_already_in_master(tmp_path, capsys):
+    master_path = tmp_path / "master.tsv"
+    pd.DataFrame({"gsm_id": ["GSM_OLD"], "gse_id": ["GSE_A"], "coo": ["GCB"]}).to_csv(
+        master_path, sep="\t", index=False
+    )
+    annotation_a = pd.DataFrame({"gsm_id": ["GSM1"], "gse_id": ["GSE_A"], "coo": ["ABC"]})
+    _write_cohort(tmp_path, "GSE_A", annotation_a)
+
+    result = harmonize.harmonize_cohorts(["GSE_A"], series_dir=tmp_path, master_path=master_path)
+
+    assert len(result) == 1
+    assert set(result["gsm_id"]) == {"GSM_OLD"}
+    captured = capsys.readouterr()
+    assert "already in master" in captured.out
+
+
+def test_harmonize_cohorts_master_path_concatenates_new_cohorts(tmp_path):
+    master_path = tmp_path / "master.tsv"
+    pd.DataFrame({"gsm_id": ["GSM_OLD"], "gse_id": ["GSE_A"], "treatment": ["chemo"]}).to_csv(
+        master_path, sep="\t", index=False
+    )
+    annotation_b = pd.DataFrame({"gsm_id": ["GSM2"], "gse_id": ["GSE_B"], "treatment": ["radio"]})
+    _write_cohort(tmp_path, "GSE_B", annotation_b)
+
+    result = harmonize.harmonize_cohorts(["GSE_B"], series_dir=tmp_path, master_path=master_path)
+
+    assert set(result["gsm_id"]) == {"GSM_OLD", "GSM2"}
+    assert set(result["gse_id"]) == {"GSE_A", "GSE_B"}
+
+
+def test_harmonize_cohorts_master_path_nonexistent_file_is_ignored(tmp_path):
+    annotation_a = pd.DataFrame({"gsm_id": ["GSM1"], "gse_id": ["GSE_A"], "treatment": ["chemo"]})
+    _write_cohort(tmp_path, "GSE_A", annotation_a)
+
+    result = harmonize.harmonize_cohorts(
+        ["GSE_A"], series_dir=tmp_path, master_path=tmp_path / "does_not_exist.tsv",
+    )
+    assert set(result["gsm_id"]) == {"GSM1"}
+
+
+def test_harmonize_cohorts_returns_master_unchanged_when_all_cohorts_already_in_it(tmp_path):
+    master_path = tmp_path / "master.tsv"
+    pd.DataFrame({"gsm_id": ["GSM_OLD"], "gse_id": ["GSE_A"], "treatment": ["chemo"]}).to_csv(
+        master_path, sep="\t", index=False
+    )
+
+    result = harmonize.harmonize_cohorts(["GSE_A"], series_dir=tmp_path, master_path=master_path)
+    assert set(result["gsm_id"]) == {"GSM_OLD"}
