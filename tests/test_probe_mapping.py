@@ -176,6 +176,71 @@ def test_extract_probe_gene_table_prefers_orf_ensembl_over_primary_sequence_name
     assert (result["source"] == "ensembl_orf").all()
 
 
+# Real GPL20769 ("collapsed"/gene-level re-annotated two-channel Agilent
+# design used by GSE71729) annotation table shape, captured live during
+# planning: the platform's own ID column holds the gene symbol directly, with
+# no separate Gene Symbol/ORF-Ensembl/PrimarySequenceName column at all.
+GPL20769_ROWS = [
+    {"ID": "GAPDH", "ORF": "GAPDH", "GENE_NAME": "glyceraldehyde-3-phosphate dehydrogenase"},
+    {"ID": "ACTB", "ORF": "ACTB", "GENE_NAME": "actin beta"},
+    {"ID": "TP53", "ORF": "TP53", "GENE_NAME": "tumor protein p53"},
+    {"ID": "EGFR", "ORF": "EGFR", "GENE_NAME": "epidermal growth factor receptor"},
+    {"ID": "MYC", "ORF": "MYC", "GENE_NAME": "MYC proto-oncogene"},
+    {"ID": "A1BG", "ORF": "A1BG", "GENE_NAME": "alpha-1-B glycoprotein"},
+]
+
+
+def test_parse_probe_id_as_symbol_requires_several_canonical_symbols():
+    df = pd.DataFrame(GPL20769_ROWS)
+    result = probe_mapping.parse_probe_id_as_symbol(df)
+    assert result is not None
+    assert len(result) == 6
+    assert set(result["gene_symbol"]) == {"GAPDH", "ACTB", "TP53", "EGFR", "MYC", "A1BG"}
+    assert (result["probe_id"] == result["gene_symbol"]).all()
+    assert (result["source"] == "probe_id_is_symbol").all()
+
+
+def test_parse_probe_id_as_symbol_returns_none_for_opaque_probe_ids():
+    """A genuinely opaque vendor probe-ID scheme couldn't coincidentally
+    match several canonical gene symbols -- must not misfire on it."""
+    df = pd.DataFrame([{"ID": f"A_23_P{i:06d}"} for i in range(10)])
+    assert probe_mapping.parse_probe_id_as_symbol(df) is None
+
+
+def test_parse_probe_id_as_symbol_returns_none_below_match_threshold():
+    """A couple of coincidental hits aren't enough evidence on their own --
+    below _MIN_CANONICAL_SYMBOL_MATCHES."""
+    df = pd.DataFrame([{"ID": "GAPDH"}, {"ID": "ACTB"}, {"ID": "some_probe_1"}, {"ID": "some_probe_2"}])
+    assert probe_mapping.parse_probe_id_as_symbol(df) is None
+
+
+def test_extract_probe_gene_table_falls_back_to_probe_id_as_symbol():
+    df = pd.DataFrame(GPL20769_ROWS)
+    result = probe_mapping.extract_probe_gene_table(df)
+    assert len(result) == 6
+    assert (result["source"] == "probe_id_is_symbol").all()
+
+
+def test_extract_probe_gene_table_prefers_direct_columns_over_probe_id_as_symbol():
+    df = pd.DataFrame(GPL20769_ROWS)
+    df["Gene Symbol"] = df["ID"]
+    result = probe_mapping.extract_probe_gene_table(df)
+    assert (result["source"] == "direct_columns").all()
+
+
+def test_aggregate_probes_to_genes_works_with_probe_id_as_symbol_mapping():
+    """The empty-expression-matrix bug on GSE71729 (GPL20769): probes must
+    still aggregate into a non-empty gene-level matrix when the probe ID
+    itself is the only available gene key."""
+    probe_matrix = pd.DataFrame({"GSM1": [5.0], "GSM2": [7.0]}, index=["GAPDH"])
+    probe_gene_map = pd.DataFrame([
+        {"probe_id": "GAPDH", "gene_symbol": "GAPDH", "entrez_id": None, "source": "probe_id_is_symbol"},
+    ])
+    genes = probe_mapping.aggregate_probes_to_genes(probe_matrix, probe_gene_map)
+    assert not genes.empty
+    assert genes.iloc[0]["gene_symbol"] == "GAPDH"
+
+
 class FakeGSM:
     def __init__(self, table, metadata=None):
         self.table = table

@@ -1,6 +1,6 @@
 """Probe -> gene mapping for microarray platforms.
 
-Four mapping strategies, tried in order, all parsed straight from the
+Five mapping strategies, tried in order, all parsed straight from the
 platform's own (always-current-when-fetched) annotation table -- no external
 lookups:
 
@@ -30,6 +30,15 @@ lookups:
    ID instead (seen live: "I_959282", "I_1000440") rather than a real
    symbol -- these are excluded (not stored as a fake gene symbol) via a
    syntactic "I_<digits>" pattern check, not a guess about gene identity.
+5. Probe ID *is* the gene symbol (e.g. GPL20769, a "collapsed"/gene-level
+   re-annotated two-channel Agilent design used by GSE71729): the platform's
+   own "ID" column holds gene symbols directly ("A1BG", "TP53", ...) with no
+   separate symbol/Entrez/ORF/PrimarySequenceName column at all -- there's no
+   translation to do, the probe already *is* the gene. Recognized by checking
+   for several _CANONICAL_HUMAN_GENE_SYMBOLS literally present among the ID
+   column's own values, rather than guessing from ID shape/format alone (an
+   opaque vendor probe-ID scheme -- "A_23_P100001", "1007_s_at", a purely
+   numeric index -- could never coincidentally match several of these).
 
 Every probe gets at most one gene (source="unmapped" if none of the above
 found anything) -- that, plus caching the result once per platform in
@@ -78,6 +87,16 @@ _ENTREZ_ID_COLUMNS = ["ENTREZ_GENE_ID", "Entrez_Gene_ID", "GENE_ID", "entrez_gen
 _FIELD_SEP_RE = re.compile(r"\s*//\s*")
 _ENSEMBL_GENE_ID_RE = re.compile(r"^ENSG\d+$")
 _CLONE_ID_PLACEHOLDER_RE = re.compile(r"^I_\d+$")
+
+# A handful of near-universally-present human gene symbols -- common
+# housekeeping genes and famous oncogenes/tumor suppressors that appear on
+# essentially every human expression platform. Used only as a confidence
+# check in parse_probe_id_as_symbol, not as a real gene symbol reference.
+_CANONICAL_HUMAN_GENE_SYMBOLS = {
+    "GAPDH", "ACTB", "TP53", "EGFR", "MYC", "KRAS", "BRCA1", "BRCA2", "PTEN",
+    "VEGFA", "TNF", "IL6", "INS", "ALB", "HBB", "CDKN2A", "RB1", "APC", "PIK3CA",
+}
+_MIN_CANONICAL_SYMBOL_MATCHES = 5
 
 # Two-channel samples (e.g. Agilent Cy3/Cy5 reference-design arrays) publish
 # their raw per-channel intensities under wildly inconsistent column names
@@ -203,11 +222,27 @@ def parse_primary_sequence_name_column(annotation_df: pd.DataFrame) -> pd.DataFr
     return pd.DataFrame(rows, columns=["probe_id", "gene_symbol", "entrez_id", "source"])
 
 
+def parse_probe_id_as_symbol(annotation_df: pd.DataFrame) -> pd.DataFrame | None:
+    """Some platforms (e.g. GPL20769) use the gene symbol itself as the probe
+    ID -- there's no separate probe->gene translation to do at all. Recognized
+    by requiring several _CANONICAL_HUMAN_GENE_SYMBOLS literally present among
+    the ID column's own values (an opaque vendor probe-ID scheme could never
+    coincidentally match several of these), not a guess from ID shape alone.
+    """
+    probe_col = _probe_id_column(annotation_df)
+    ids = annotation_df[probe_col].dropna().astype(str)
+    if ids.isin(_CANONICAL_HUMAN_GENE_SYMBOLS).sum() < _MIN_CANONICAL_SYMBOL_MATCHES:
+        return None
+    return pd.DataFrame({
+        "probe_id": ids, "gene_symbol": ids, "entrez_id": None, "source": "probe_id_is_symbol",
+    })
+
+
 def extract_probe_gene_table(annotation_df: pd.DataFrame) -> pd.DataFrame:
     """Per-platform probe->gene parser. Tries direct columns, then packed
     gene_assignment text, then a Brainarray-style ORF/Ensembl column, then a
-    PrimarySequenceName column, else leaves every probe unmapped (never
-    guessed).
+    PrimarySequenceName column, then "the probe ID is already the gene
+    symbol", else leaves every probe unmapped (never guessed).
     """
     direct = parse_direct_columns(annotation_df)
     if direct is not None and not direct.empty:
@@ -231,6 +266,10 @@ def extract_probe_gene_table(annotation_df: pd.DataFrame) -> pd.DataFrame:
     primary_sequence_name = parse_primary_sequence_name_column(annotation_df)
     if primary_sequence_name is not None and not primary_sequence_name.empty:
         return primary_sequence_name
+
+    probe_id_as_symbol = parse_probe_id_as_symbol(annotation_df)
+    if probe_id_as_symbol is not None and not probe_id_as_symbol.empty:
+        return probe_id_as_symbol
 
     return pd.DataFrame(columns=["probe_id", "gene_symbol", "entrez_id", "source"])
 
