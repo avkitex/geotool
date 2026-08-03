@@ -212,6 +212,23 @@ def test_build_probe_matrix_all_empty_returns_empty_dataframe():
     assert probe_mapping.build_probe_matrix(gse).empty
 
 
+def test_build_probe_matrix_handles_mixed_int_and_str_id_ref_across_samples():
+    # Purely-numeric probe IDs (e.g. GPL6801/GPL7723-style) can come back as
+    # int64 for one sample's table and str for another's, depending on what
+    # else pandas saw while parsing each GSM's own table. Aligning those
+    # differently-typed indexes used to crash with
+    # "'<' not supported between instances of 'int' and 'str'" (GSE32688).
+    gse = FakeGSE({
+        "GSM1": FakeGSM(pd.DataFrame({"ID_REF": [1, 2], "VALUE": [1.0, 2.0]})),
+        "GSM2": FakeGSM(pd.DataFrame({"ID_REF": ["1", "2"], "VALUE": [3.0, 4.0]})),
+    })
+    matrix = probe_mapping.build_probe_matrix(gse)
+    assert list(matrix.columns) == ["GSM1", "GSM2"]
+    assert list(matrix.index) == ["1", "2"]
+    assert matrix.loc["1", "GSM1"] == 1.0
+    assert matrix.loc["2", "GSM2"] == 4.0
+
+
 def test_aggregate_probes_to_genes_averages_multiple_probes_for_same_gene():
     # Values kept under the log2-transform threshold (see
     # _LOG2_ALREADY_TRANSFORMED_MAX) so this test's averaging arithmetic
