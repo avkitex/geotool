@@ -119,6 +119,11 @@ def search(
         for c in candidates:
             c["sample_property_matches"] = ""
 
+    all_gpl_ids = sorted({gpl for c in candidates for gpl in c.get("platforms", [])})
+    gpl_docsums = entrez.esummary_gpl(all_gpl_ids) if all_gpl_ids else {}
+    for c in candidates:
+        c["array_content"] = platform_classify.summarize_array_content(gpl_docsums, c.get("platforms", []))
+
     if llm_annotate_flag:
         candidates = llm_annotate_candidates(candidates, escalate_ambiguous=llm_escalate)
 
@@ -183,6 +188,7 @@ def run_nl_query(
         row["meets_min_samples"] = (
             "" if filters.min_samples is None else candidate.get("n_samples", 0) >= filters.min_samples
         )
+        row["array_content"] = platform_classify.summarize_array_content(gpl_docsums, candidate.get("platforms", []))
         try:
             classification = nl_query.classify_series_with_escalation(
                 candidate, filters, platform_titles, escalate=escalate_ambiguous

@@ -1,6 +1,6 @@
 import pytest
 
-from geotool import search as search_mod
+from geotool import nl_query, search as search_mod
 
 
 class FakeGSM:
@@ -101,5 +101,60 @@ def test_search_without_sample_properties_skips_fetch(monkeypatch):
     )
 
     rows = search_mod.search(title="cancer")
-    assert rows == [{"gse_id": "GSE1", "title": "t", "sample_property_matches": ""}]
+    assert rows == [{"gse_id": "GSE1", "title": "t", "sample_property_matches": "", "array_content": ""}]
     assert called == []
+
+
+_GSE32688_PLATFORM_DOCSUMS = {
+    "GPL570": {"title": "[HG-U133_Plus_2] Affymetrix Human Genome U133 Plus 2.0 Array", "ptechtype": "in situ oligonucleotide"},
+    "GPL6801": {"title": "[GenomeWideSNP_6] Affymetrix Genome-Wide Human SNP 6.0 Array", "ptechtype": "in situ oligonucleotide"},
+}
+
+
+def test_search_adds_array_content_from_fetched_platform_titles(monkeypatch):
+    monkeypatch.setattr(
+        search_mod.entrez, "search_series",
+        lambda **kwargs: [{"gse_id": "GSE32688", "title": "t", "platforms": ["GPL570", "GPL6801"]}],
+    )
+    monkeypatch.setattr(search_mod.entrez, "esummary_gpl", lambda gpl_ids: _GSE32688_PLATFORM_DOCSUMS)
+
+    rows = search_mod.search(title="pancreatic cancer")
+
+    assert rows[0]["array_content"] == "cna;mrna"
+
+
+class _FakeClassification:
+    matches_diagnosis = True
+    diagnosis_detail = ""
+    species = "human"
+    sample_type = "unknown"
+    tissue_class = "unknown"
+    assay_type = "microarray"
+    selection_method = "unknown"
+    notes = ""
+
+
+def test_run_nl_query_populates_array_content_from_platform_titles(monkeypatch):
+    """Regression case: GSE32688 combines mRNA (GPL570) with a CNA array
+    (GPL6801) -- exactly the series that motivated this classification."""
+    filters = nl_query.QueryFilters(diagnosis="pancreatic cancer")
+    monkeypatch.setattr(search_mod.nl_query, "parse_query_filters", lambda text: filters)
+    monkeypatch.setattr(search_mod.entrez, "esearch_gds", lambda term, retmax=100: (["1"], 1))
+    monkeypatch.setattr(
+        search_mod.entrez, "esummary_gds",
+        lambda uids: [{
+            "accession": "GSE32688", "title": "t", "summary": "s", "taxon": "Homo sapiens",
+            "gpl": "570;6801", "n_samples": 96, "pdat": "2012", "pubmedids": [],
+        }],
+    )
+    monkeypatch.setattr(search_mod.entrez, "esummary_gpl", lambda gpl_ids: _GSE32688_PLATFORM_DOCSUMS)
+    monkeypatch.setattr(
+        search_mod.nl_query, "classify_series_with_escalation",
+        lambda candidate, filters, platform_titles, escalate=False: _FakeClassification(),
+    )
+
+    rows = search_mod.run_nl_query("pancreatic cancer", verbose=False)
+
+    assert len(rows) == 1
+    assert rows[0]["gse_id"] == "GSE32688"
+    assert rows[0]["array_content"] == "cna;mrna"

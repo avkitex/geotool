@@ -52,6 +52,10 @@ def _series_organism(gse) -> str:
     return ""
 
 
+def is_human_organism(organism: str) -> bool:
+    return organism.strip().lower() == "homo sapiens"
+
+
 def platform_details(gse) -> list[dict]:
     """classify_platform() result for every GPL in the series (Tier 0, no LLM)."""
     gpls = getattr(gse, "gpls", None) or {}

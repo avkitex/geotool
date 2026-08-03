@@ -34,6 +34,20 @@ _PROTOCOL_EXOME_RE = re.compile(r"exome", re.IGNORECASE)
 _TENX_RE = re.compile(r"10x|chromium|droplet", re.IGNORECASE)
 _SMARTSEQ_RE = re.compile(r"smart-?seq|fluidigm|plate-?based", re.IGNORECASE)
 
+# Array "content" -- what the probes actually measure, as opposed to assay_type's
+# seq-vs-array "shape". Vendor platform titles are short, structured product names
+# (e.g. "Agilent-019118 Human miRNA Microarray 2.0", "[GenomeWideSNP_6] Affymetrix
+# Genome-Wide Human SNP 6.0 Array") -- reliable enough for plain keyword matching,
+# no LLM needed. Checked in order: CNA first (never meaningfully combined with mRNA
+# content on one chip); then an explicit mRNA/gene-expression hint, so a chip that
+# combines mRNA with miRNA/lncRNA content resolves to "mrna" rather than being
+# rejected; then miRNA/lncRNA-only patterns; default "mrna" for a plain/unlabeled
+# expression array.
+_CNA_RE = re.compile(r"copy number|\bcgh\b|\bsnp\b|genotyping array|\bcnv\b", re.IGNORECASE)
+_MRNA_HINT_RE = re.compile(r"\bmrna\b|gene expression|whole transcriptome", re.IGNORECASE)
+_MIRNA_RE = re.compile(r"\bmirna\b|micro.?rna", re.IGNORECASE)
+_LNCRNA_RE = re.compile(r"\blncrna\b|long non.?coding", re.IGNORECASE)
+
 
 def as_str(value) -> str:
     """GEOparse/esummary fields are sometimes a list-of-one, sometimes a bare string."""
@@ -68,6 +82,19 @@ def classify_coverage(data_row_count) -> str:
     return "full_transcriptome" if count >= config.COVERAGE_THRESHOLD else "limited"
 
 
+def classify_array_content(title: str) -> str:
+    """"mrna" / "mirna" / "lncrna" / "cna", from a microarray platform's own title."""
+    if _CNA_RE.search(title):
+        return "cna"
+    if _MRNA_HINT_RE.search(title):
+        return "mrna"
+    if _MIRNA_RE.search(title):
+        return "mirna"
+    if _LNCRNA_RE.search(title):
+        return "lncrna"
+    return "mrna"
+
+
 def classify_platform(gpl_id: str, metadata: dict) -> dict:
     """Classify a platform from either a GEOparse gpl.metadata dict or a
     normalized `db=gpl` esummary docsum -- both carry title/technology under
@@ -80,11 +107,63 @@ def classify_platform(gpl_id: str, metadata: dict) -> dict:
     assay_type = classify_assay_type(technology, title)
     vendor = None
     coverage = None
+    content = None
+    data_row_count = None
     if assay_type == "microarray":
         vendor = classify_vendor(manufacturer, title)
-        coverage = classify_coverage(as_str(metadata.get("data_row_count")))
+        row_count_raw = as_str(metadata.get("data_row_count"))
+        coverage = classify_coverage(row_count_raw)
+        content = classify_array_content(title)
+        try:
+            data_row_count = int(row_count_raw)
+        except (TypeError, ValueError):
+            data_row_count = None
 
-    return {"gpl_id": gpl_id, "assay_type": assay_type, "vendor": vendor, "coverage": coverage}
+    return {
+        "gpl_id": gpl_id, "assay_type": assay_type, "vendor": vendor, "coverage": coverage,
+        "content": content, "data_row_count": data_row_count,
+    }
+
+
+def summarize_array_content(platform_docsums: dict, gpl_ids: list[str]) -> str:
+    """";"-joined, deduped, sorted array_content across a series' platforms, for
+    search reports -- lets a user see "what's inside" (mrna/mirna/lncrna/cna)
+    before ever calling download. Only microarray platforms contribute (content
+    is None for everything else, e.g. RNA-seq); empty string if nothing to
+    report. `platform_docsums` is {gpl_id: esummary docsum}, e.g. from
+    entrez.esummary_gpl -- missing/unfetched platforms are silently skipped.
+    """
+    contents = set()
+    for gpl_id in gpl_ids:
+        docsum = platform_docsums.get(gpl_id)
+        if not docsum:
+            continue
+        content = classify_platform(gpl_id, docsum).get("content")
+        if content:
+            contents.add(content)
+    return ";".join(sorted(contents))
+
+
+def platform_supported(detail: dict) -> tuple[bool, str | None]:
+    """Whether download.py should even attempt this platform -- (True, None) if so,
+    (False, reason) if it should be rejected outright (unsupported array content, or
+    too old/low-density to be a usable expression platform).
+
+    Only microarray platforms are gated here -- RNA-seq is inherently full
+    transcriptome mRNA, nothing to check.
+    """
+    if detail.get("assay_type") != "microarray":
+        return True, None
+
+    content = detail.get("content")
+    if content in ("mirna", "lncrna", "cna"):
+        return False, f"{content} array, not a supported mRNA-expression platform"
+
+    row_count = detail.get("data_row_count")
+    if row_count is not None and row_count < config.MIN_ARRAY_PROBE_COUNT:
+        return False, f"only {row_count} probes/genes (< {config.MIN_ARRAY_PROBE_COUNT}), too old/low-density"
+
+    return True, None
 
 
 def classify_rnaseq_library(sample_metadata: dict) -> str:

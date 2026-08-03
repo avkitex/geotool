@@ -31,6 +31,20 @@ if --rma is newly requested on a cohort previously downloaded without it,
 only the missing RMA output is computed (the series still needs
 re-fetching for its CEL files, but the already-done clinical_annotate LLM
 call and probe/gene matrix build are not repeated).
+
+Before doing any of the above, download_cohort() checks eligibility and fails
+fast (UnsupportedCohortError) rather than attempting a cohort it was never
+designed for: non-human organism, or a microarray platform whose content
+isn't mRNA expression (miRNA/lncRNA-only or CNA arrays -- a platform that
+combines mRNA with miRNA/lncRNA content on one chip is fine, see
+platform_classify.classify_array_content) or is too old/low-density
+(platform_classify.platform_supported). A series with a mix of supported and
+unsupported platforms proceeds using only the supported ones. A SuperSeries
+(see resolve_download_targets / geo_fetch.resolve_leaf_series_ids) is never
+downloaded as itself -- its own fetched record merges every subseries'
+samples together with no reliable way to separate them back out, so the CLI
+always expands it into its subseries first and calls download_cohort once
+per leaf, each getting its own independent eligibility check.
 """
 from __future__ import annotations
 
@@ -42,12 +56,20 @@ from urllib.parse import urlparse
 import pandas as pd
 import requests
 
-from geotool import annotate, clinical_annotate, config, geo_fetch, probe_mapping, renormalize
+from geotool import annotate, clinical_annotate, config, geo_fetch, platform_classify, probe_mapping, renormalize
 
 _SKIP_EXTENSIONS = (
     ".bam", ".bai", ".fastq", ".fastq.gz", ".fq", ".fq.gz",
     ".bw", ".bigwig", ".cel", ".cel.gz",
 )
+
+
+class UnsupportedCohortError(Exception):
+    """A (sub)series failed an eligibility check (organism / array content / platform
+    coverage) and shouldn't be attempted at all -- raised instead of letting it fail
+    deep inside matrix-building with a confusing error, or worse, silently blending
+    incompatible platforms (e.g. a CNA array) into an "expression" matrix.
+    """
 
 
 def _series_dir(gse_id: str, series_dir: Path | None = None) -> Path:
@@ -389,6 +411,50 @@ def _cached_result(gse_id: str, out_dir: Path) -> tuple[dict, list[dict]] | None
     return result, platform_details
 
 
+def _filter_supported_platforms(gse, platform_details: list[dict]) -> tuple[list[dict], list[str]]:
+    """Split platform_details into (supported, human-readable rejection reasons) via
+    platform_classify.platform_supported, and drop any gse.gsms/gse.gpls entries on a
+    rejected platform *in place*. Every function in this module already just reads
+    gse.gsms/gse.gpls, so this is the only place that needs to know about eligibility --
+    everything downstream automatically only ever sees the supported subset.
+    """
+    supported = []
+    rejected_reasons = []
+    rejected_gpl_ids = set()
+    for detail in platform_details:
+        ok, reason = platform_classify.platform_supported(detail)
+        if ok:
+            supported.append(detail)
+        else:
+            rejected_gpl_ids.add(detail["gpl_id"])
+            rejected_reasons.append(f"{detail['gpl_id']} ({reason})")
+
+    if rejected_gpl_ids:
+        gse.gsms = {
+            gsm_id: gsm for gsm_id, gsm in gse.gsms.items()
+            if not (rejected_gpl_ids & set(gsm.metadata.get("platform_id", [])))
+        }
+        gse.gpls = {gpl_id: gpl for gpl_id, gpl in gse.gpls.items() if gpl_id not in rejected_gpl_ids}
+
+    return supported, rejected_reasons
+
+
+def resolve_download_targets(gse_id: str, series_dir: Path | None = None, force: bool = False) -> list[str]:
+    """Expand gse_id into the leaf series id(s) download_cohort should actually be
+    called on, for the CLI's download loop.
+
+    A series already fully downloaded under gse_id itself is returned as-is with zero
+    network calls -- preserves download_cohort's own "already downloaded" cache reuse
+    for the common (non-SuperSeries) case. Otherwise defers to
+    geo_fetch.resolve_leaf_series_ids to detect and expand a SuperSeries into its
+    subseries, so each gets its own independent download and eligibility check rather
+    than being blended into one incoherent series.
+    """
+    if not force and _cached_result(gse_id, _series_dir(gse_id, series_dir)) is not None:
+        return [gse_id]
+    return geo_fetch.resolve_leaf_series_ids(gse_id)
+
+
 def download_cohort(
     gse_id: str, series_dir: Path | None = None, escalate_ambiguous: bool = False, rma: bool = False,
     force: bool = False,
@@ -416,11 +482,21 @@ def download_cohort(
             return cached
 
     gse = geo_fetch.fetch_series(gse_id)
+
+    organism = annotate._series_organism(gse)
+    if organism and not annotate.is_human_organism(organism):
+        raise UnsupportedCohortError(f"non-human organism ({organism}) -- only Homo sapiens is supported")
+
+    platform_details, rejected_reasons = _filter_supported_platforms(gse, annotate.platform_details(gse))
+    for reason in rejected_reasons:
+        print(f"  {gse_id}: skipping platform {reason}")
+    if not gse.gsms:
+        raise UnsupportedCohortError("; ".join(rejected_reasons) or "no supported platforms")
+
     srow = annotate.series_row(gse)
     samples = annotate.samples_table(gse)
     _persist_series_annotation(out_dir, srow, samples)
 
-    platform_details = json.loads(srow.get("platform_details") or "[]")
     assay_types = {p["assay_type"] for p in platform_details}
 
     result = {"gse_id": gse_id, "assay_types": sorted(assay_types), "expression_path": None}

@@ -167,6 +167,13 @@ def download(gse_ids, from_report, rma_flag, force_flag):
     survival unified where possible). A cohort that's already been downloaded
     is reused rather than redone -- pass --force to redo it anyway. Needs
     ANTHROPIC_API_KEY. Writes into data/series/<GSE_ID>/.
+
+    A SuperSeries is automatically expanded into its subseries (recursively),
+    each downloaded independently into its own data/series/<subseries_id>/.
+    Non-human cohorts and unsupported microarray content (miRNA/lncRNA-only or
+    CNA arrays, or platforms below ~8000 probes/genes) are reported as a clean
+    FAILED rather than attempted -- a platform that combines mRNA with
+    miRNA/lncRNA content on one chip is unaffected.
     """
     ids = list(gse_ids)
     if from_report:
@@ -177,23 +184,33 @@ def download(gse_ids, from_report, rma_flag, force_flag):
         raise click.UsageError("Provide one or more GSE IDs, or --from-report <path>")
 
     for gse_id in ids:
-        click.echo(f"{gse_id}:")
         try:
-            result = download_mod.download_cohort(gse_id, rma=rma_flag, force=force_flag)
+            target_ids = download_mod.resolve_download_targets(gse_id, force=force_flag)
         except Exception as exc:
+            click.echo(f"{gse_id}:")
             click.echo(f"  FAILED: {exc}")
             continue
-        click.echo(f"  assay type(s): {', '.join(result['assay_types']) or 'unknown'}")
-        if result.get("expression_path"):
-            click.echo(f"  expression matrix: {result['expression_path']}")
-        if result.get("channel_expression_paths"):
-            for channel_num, path in sorted(result["channel_expression_paths"].items()):
-                click.echo(f"  channel {channel_num} expression matrix: {path}")
-        if result.get("expression_rma_path"):
-            click.echo(f"  RMA expression matrix: {result['expression_rma_path']}")
-        if result.get("expression_files"):
-            click.echo(f"  expression files: {len(result['expression_files'])} downloaded")
-        click.echo(f"  annotation: {result['annotation_path']}")
+        if target_ids != [gse_id]:
+            click.echo(f"{gse_id}: SuperSeries with {len(target_ids)} sub-series -- downloading each: {', '.join(target_ids)}")
+
+        for target_id in target_ids:
+            click.echo(f"{target_id}:")
+            try:
+                result = download_mod.download_cohort(target_id, rma=rma_flag, force=force_flag)
+            except Exception as exc:
+                click.echo(f"  FAILED: {exc}")
+                continue
+            click.echo(f"  assay type(s): {', '.join(result['assay_types']) or 'unknown'}")
+            if result.get("expression_path"):
+                click.echo(f"  expression matrix: {result['expression_path']}")
+            if result.get("channel_expression_paths"):
+                for channel_num, path in sorted(result["channel_expression_paths"].items()):
+                    click.echo(f"  channel {channel_num} expression matrix: {path}")
+            if result.get("expression_rma_path"):
+                click.echo(f"  RMA expression matrix: {result['expression_rma_path']}")
+            if result.get("expression_files"):
+                click.echo(f"  expression files: {len(result['expression_files'])} downloaded")
+            click.echo(f"  annotation: {result['annotation_path']}")
 
 
 @main.command()
