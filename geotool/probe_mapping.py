@@ -49,8 +49,13 @@ Also handles two-channel (e.g. Agilent Cy3/Cy5) samples: build_probe_matrix
 reads the precomputed VALUE ratio; build_channel_probe_matrices separately
 builds each channel's own raw-intensity matrix for samples that publish
 per-channel columns (see detect_channel_columns), as an *additional* signal
-alongside the ratio -- neither channel is assumed to be "the real sample" or
-"the reference", so both are just named by channel number.
+alongside the ratio. Neither channel1_expression.tsv.gz/channel2_expression.
+tsv.gz is ever assumed to be "the real sample" or "the reference" -- both are
+always written, just named by channel number -- but detect_reference_channel
+makes a best-effort, confidence-gated guess (metadata text + cross-sample
+variance) at which one actually is which, used by download.py to
+*additionally* write channel_signal_expression.tsv.gz/channel_reference_
+expression.tsv.gz copies when confident.
 
 Every gene-level result aggregate_probes_to_genes produces is passed through
 maybe_log2_transform: values are log2(x + 1)-transformed unless
@@ -115,6 +120,7 @@ _CHANNEL_COLUMN_PAIRS = [
     ("CH1_SIGNAL", "CH2_SIGNAL"),
     ("CH1_SIGNAL_MEAN", "CH2_SIGNAL_MEAN"),
     ("CH1_MEAN_SIGNAL", "CH2_MEAN_SIGNAL"),
+    ("CH1_MEAN", "CH2_MEAN"),  # GenePix-style, seen live on GPL7504 (GSE50470/GSE21997/GSE22049)
     ("Intensity_Cy3", "Intensity_Cy5"),
     ("gMedianSignal", "rMedianSignal"),
     ("gMeanSignal", "rMeanSignal"),
@@ -382,6 +388,108 @@ def build_channel_probe_matrices(gse) -> tuple[pd.DataFrame, pd.DataFrame]:
     channel1_matrix = pd.DataFrame(channel1_cols) if channel1_cols else pd.DataFrame()
     channel2_matrix = pd.DataFrame(channel2_cols) if channel2_cols else pd.DataFrame()
     return channel1_matrix, channel2_matrix
+
+
+# Text hint for a common-reference-design channel: the same (or near-same)
+# reference material hybridized on every array, as opposed to the actual
+# per-sample biological material. Checked per sample against that sample's
+# own characteristics/source_name -- not assumed fixed across the whole
+# series -- so a dye-swap design (reference alternates channel per replicate)
+# is handled naturally rather than assumed away.
+_REFERENCE_HINT_RE = re.compile(r"\breference\b|\bpool(ed)?\b", re.IGNORECASE)
+
+# Metadata: a channel number is called "reference" only if this fraction of
+# samples with a *clear* per-sample hint (one channel matches, the other
+# doesn't) agree on it.
+_MIN_METADATA_AGREEMENT = 0.9
+
+# Variance: the reference channel should vary less across samples than the
+# actual biological sample does (median per-probe variance of log2 values).
+# A call is only made if the relative gap between channels clears this bar --
+# live-validated against 3 real two-channel Agilent series with a confirmed
+# (metadata-labeled) common reference design: relative gaps of 12%-66%, so
+# 10% is a conservative floor that comfortably covers all of them while still
+# discarding a noise-level (near-0%) gap as "ambiguous" rather than guessing.
+_MIN_VARIANCE_RELATIVE_GAP = 0.10
+
+
+def _channel_metadata_hint(gsm) -> int | None:
+    """1 or 2 if exactly one of this sample's own ch1/ch2 characteristics +
+    source_name mentions a reference/pool and the other doesn't; None if
+    neither or both do (no clear per-sample signal).
+    """
+    def _text(channel: str) -> str:
+        md = gsm.metadata
+        return " ".join(md.get(f"source_name_{channel}", []) + md.get(f"characteristics_{channel}", []))
+
+    ch1_hit = bool(_REFERENCE_HINT_RE.search(_text("ch1")))
+    ch2_hit = bool(_REFERENCE_HINT_RE.search(_text("ch2")))
+    if ch1_hit and not ch2_hit:
+        return 1
+    if ch2_hit and not ch1_hit:
+        return 2
+    return None
+
+
+def detect_reference_channel(gse, channel1_matrix: pd.DataFrame, channel2_matrix: pd.DataFrame) -> dict:
+    """Best-effort guess at which channel of a two-channel series is the
+    fixed reference (vs. the channel actually carrying the biological
+    sample) -- {"reference_channel", "signal_channel", "method", "notes"}.
+    reference_channel/signal_channel are None and method is "ambiguous" when
+    neither signal below is clear enough to call -- never guessed past that
+    point, same "unknown rather than guess" spirit as the rest of this
+    module (e.g. classify_scrna_platform).
+
+    Two independent signals, live-validated against 3 real two-channel
+    Agilent series with a metadata-confirmed common-reference design
+    (GSE50470, GSE21997, GSE22049 -- all agreed on both signals):
+    1. Metadata (_channel_metadata_hint, _MIN_METADATA_AGREEMENT): per-sample
+       characteristics/source_name text.
+    2. Cross-sample variance (_MIN_VARIANCE_RELATIVE_GAP): the reference
+       channel is by design the same or near-same material on every array,
+       so its values should vary less across samples than the actual
+       biological sample's do.
+
+    If both signals fire and agree, method is "metadata+variance" (highest
+    confidence); if only one fires, that call stands alone; if they fire and
+    disagree, the result is "ambiguous" (recorded in notes) rather than
+    picking one arbitrarily.
+    """
+    result = {"reference_channel": None, "signal_channel": None, "method": "ambiguous", "notes": ""}
+    if channel1_matrix.empty or channel2_matrix.empty:
+        return result
+
+    hints = [
+        _channel_metadata_hint(gse.gsms[gsm_id]) for gsm_id in channel1_matrix.columns if gsm_id in gse.gsms
+    ]
+    clear_hints = [h for h in hints if h is not None]
+    metadata_call = None
+    if clear_hints:
+        if clear_hints.count(1) / len(clear_hints) >= _MIN_METADATA_AGREEMENT:
+            metadata_call = 1
+        elif clear_hints.count(2) / len(clear_hints) >= _MIN_METADATA_AGREEMENT:
+            metadata_call = 2
+
+    ch1_var = np.log2(channel1_matrix.clip(lower=1)).var(axis=1, skipna=True).median()
+    ch2_var = np.log2(channel2_matrix.clip(lower=1)).var(axis=1, skipna=True).median()
+    variance_call = None
+    if pd.notna(ch1_var) and pd.notna(ch2_var):
+        lower_channel = 1 if ch1_var <= ch2_var else 2
+        lower_var, higher_var = min(ch1_var, ch2_var), max(ch1_var, ch2_var)
+        if higher_var > 0 and (higher_var - lower_var) / higher_var >= _MIN_VARIANCE_RELATIVE_GAP:
+            variance_call = lower_channel
+
+    if metadata_call and variance_call:
+        if metadata_call == variance_call:
+            result.update(reference_channel=metadata_call, signal_channel=3 - metadata_call, method="metadata+variance")
+        else:
+            result["notes"] = f"metadata says channel {metadata_call} is the reference, variance says channel {variance_call} -- disagree"
+    elif metadata_call:
+        result.update(reference_channel=metadata_call, signal_channel=3 - metadata_call, method="metadata")
+    elif variance_call:
+        result.update(reference_channel=variance_call, signal_channel=3 - variance_call, method="variance")
+
+    return result
 
 
 def aggregate_probes_to_genes(probe_matrix: pd.DataFrame, probe_gene_map: pd.DataFrame, agg: str = "mean") -> pd.DataFrame:

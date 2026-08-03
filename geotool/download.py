@@ -83,6 +83,28 @@ def _persist_series_annotation(out_dir: Path, series_row: dict, samples: pd.Data
     samples.to_csv(out_dir / "samples.tsv", sep="\t", index=False)
 
 
+def _write_channel_roles(out_dir: Path, channel_roles: dict) -> None:
+    """Sidecar for probe_mapping.detect_reference_channel's result -- a
+    separate small file rather than a series.tsv column since it's only ever
+    produced partway through a fresh download, after series.tsv is already
+    written. Only written when a confident call was actually made (method !=
+    "ambiguous"), so its mere existence on disk means "there's a call here"
+    for both the fresh-download and cache-reuse (_cached_result) paths.
+    """
+    if not channel_roles or channel_roles.get("method") == "ambiguous":
+        return
+    with open(out_dir / "channel_roles.json", "w", encoding="utf-8") as f:
+        json.dump(channel_roles, f, indent=2)
+
+
+def _load_channel_roles(out_dir: Path) -> dict | None:
+    path = out_dir / "channel_roles.json"
+    if not path.exists():
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def _write_matrix(df: pd.DataFrame, path: Path, index: bool = True) -> None:
     """Write a probe/gene x sample matrix as gzip-compressed TSV.
 
@@ -211,15 +233,24 @@ def build_and_map_expression_matrix(gse, out_dir: Path) -> Path | None:
 
 def build_and_map_channel_expression_matrices(
     gse, out_dir: Path, platform_details: list[dict]
-) -> dict[int, Path]:
+) -> tuple[dict[int, Path], dict]:
     """For two-channel Agilent samples whose own data table exposes
     recognizable per-channel columns (probe_mapping.detect_channel_columns),
     write each channel's own probe/gene matrix as an *additional* output --
     channel1_expression.tsv.gz / channel2_expression.tsv.gz -- alongside the
     ratio-based expression.tsv.gz that build_and_map_expression_matrix always
-    produces unchanged. Neither channel is assumed to be "the real sample" or
-    "the reference" (that's a per-study convention, not something derivable
-    from the data alone) -- both are just named by channel number.
+    produces unchanged. Neither channel1/channel2 is assumed to be "the real
+    sample" or "the reference" -- both are always written, just named by
+    channel number.
+
+    Returns (channel_expression_paths, channel_roles) -- channel_roles is
+    probe_mapping.detect_reference_channel's best-effort, confidence-gated
+    guess at which channel is which. When it's confident (method != that
+    dict's default "ambiguous"), this *additionally* writes
+    channel_signal_expression.tsv.gz / channel_reference_expression.tsv.gz --
+    plain copies of whichever channelN_expression.tsv.gz was determined to
+    hold the actual biological sample / the fixed reference, respectively.
+    Those neutral channelN_expression.tsv.gz files are unaffected either way.
 
     Most two-channel series don't publish per-channel columns at all (only
     the precomputed ratio), so this silently writes nothing when there's
@@ -227,11 +258,11 @@ def build_and_map_channel_expression_matrices(
     """
     agilent_gpl_ids = {p["gpl_id"] for p in platform_details if p.get("vendor") == "agilent"}
     if not agilent_gpl_ids:
-        return {}
+        return {}, {}
 
     channel1_matrix, channel2_matrix = probe_mapping.build_channel_probe_matrices(gse)
     if channel1_matrix.empty:
-        return {}
+        return {}, {}
 
     # Only samples on an Agilent platform qualify, even though the channel
     # matrices themselves are built vendor-agnostically -- restrict both
@@ -243,11 +274,14 @@ def build_and_map_channel_expression_matrices(
         if agilent_gpl_ids & set(gse.gsms[gsm_id].metadata.get("platform_id", []))
     ]
     if not eligible_cols:
-        return {}
+        return {}, {}
     channel1_matrix = channel1_matrix[eligible_cols]
     channel2_matrix = channel2_matrix[eligible_cols]
 
+    channel_roles = probe_mapping.detect_reference_channel(gse, channel1_matrix, channel2_matrix)
+
     result: dict[int, Path] = {}
+    channel_expressions: dict[int, pd.DataFrame] = {}
     for channel_num, probe_matrix in ((1, channel1_matrix), (2, channel2_matrix)):
         platform_ids = sorted({
             gpl_id
@@ -275,8 +309,16 @@ def build_and_map_channel_expression_matrices(
         expression_path = out_dir / f"channel{channel_num}_expression.tsv.gz"
         _write_matrix(expression, expression_path, index=False)
         result[channel_num] = expression_path
+        channel_expressions[channel_num] = expression
 
-    return result
+    signal_channel = channel_roles.get("signal_channel")
+    if signal_channel in channel_expressions:
+        _write_matrix(channel_expressions[signal_channel], out_dir / "channel_signal_expression.tsv.gz", index=False)
+    reference_channel = channel_roles.get("reference_channel")
+    if reference_channel in channel_expressions:
+        _write_matrix(channel_expressions[reference_channel], out_dir / "channel_reference_expression.tsv.gz", index=False)
+
+    return result, channel_roles
 
 
 def download_cel_files(gse, out_dir: Path) -> dict[str, Path]:
@@ -398,6 +440,16 @@ def _cached_result(gse_id: str, out_dir: Path) -> tuple[dict, list[dict]] | None
     if channel_paths:
         result["channel_expression_paths"] = channel_paths
 
+    channel_roles = _load_channel_roles(out_dir)
+    if channel_roles:
+        result["channel_roles"] = channel_roles
+        signal_path = out_dir / "channel_signal_expression.tsv.gz"
+        if signal_path.exists():
+            result["channel_signal_expression_path"] = str(signal_path)
+        reference_path = out_dir / "channel_reference_expression.tsv.gz"
+        if reference_path.exists():
+            result["channel_reference_expression_path"] = str(reference_path)
+
     rma_path = out_dir / "expression_rma.tsv.gz"
     if rma_path.exists():
         result["expression_rma_path"] = str(rma_path)
@@ -509,9 +561,16 @@ def download_cohort(
     elif "microarray" in assay_types:
         expr_path = build_and_map_expression_matrix(gse, out_dir)
         result["expression_path"] = str(expr_path) if expr_path else None
-        channel_paths = build_and_map_channel_expression_matrices(gse, out_dir, platform_details)
+        channel_paths, channel_roles = build_and_map_channel_expression_matrices(gse, out_dir, platform_details)
         if channel_paths:
             result["channel_expression_paths"] = {str(k): str(v) for k, v in channel_paths.items()}
+        if channel_roles and channel_roles.get("method") != "ambiguous":
+            _write_channel_roles(out_dir, channel_roles)
+            result["channel_roles"] = channel_roles
+            if channel_roles.get("signal_channel") in channel_paths:
+                result["channel_signal_expression_path"] = str(out_dir / "channel_signal_expression.tsv.gz")
+            if channel_roles.get("reference_channel") in channel_paths:
+                result["channel_reference_expression_path"] = str(out_dir / "channel_reference_expression.tsv.gz")
         if rma:
             rma_path = build_and_renormalize_expression_matrix(gse, out_dir, platform_details)
             result["expression_rma_path"] = str(rma_path) if rma_path else None

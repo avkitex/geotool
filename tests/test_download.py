@@ -193,6 +193,57 @@ def make_agilent_two_channel_gse():
 _AGILENT_PLATFORM_DETAILS = [{"gpl_id": "GPL2011", "assay_type": "microarray", "vendor": "agilent", "coverage": "full_transcriptome"}]
 
 
+def make_agilent_two_channel_gse_with_reference(gse_id="GSE_AGILENT_REF", n_samples=6):
+    """A common-reference-design fixture: channel 1 is a fixed reference RNA
+    (metadata-labeled, constant raw values across samples) and channel 2 is
+    the actual biological sample (metadata-labeled, values that vary per
+    sample) -- shaped after the real GSE50470/GSE21997/GSE22049 pattern that
+    motivated probe_mapping.detect_reference_channel.
+    """
+    metadata = {"geo_accession": [gse_id], "title": ["A reference-design two-channel series"], "summary": ["s"]}
+    gsms = {}
+    for i in range(1, n_samples + 1):
+        gsms[f"GSM{i}"] = FakeGSM(
+            {
+                "title": [f"s{i}"], "geo_accession": [f"GSM{i}"], "platform_id": ["GPL2011"],
+                "organism_ch1": ["Homo sapiens"], "channel_count": ["2"],
+                "source_name_ch1": ["Human Universal Reference"],
+                "characteristics_ch1": ["reference: Human Universal Reference"],
+                "source_name_ch2": [f"Tumor sample {i}"],
+                "characteristics_ch2": [f"tissue: Breast Cancer {i}"],
+            },
+            table=pd.DataFrame({
+                "ID_REF": ["1007_s_at", "1053_at"],
+                "ch1 Intensity": [100.0, 100.0],
+                "ch2 Intensity": [50.0 * i, 5.0 * i],
+                "VALUE": [1.0, 1.0],
+            }),
+        )
+    gpls = {"GPL2011": FakeGPL({"title": ["Agilent two-color array"], "technology": ["in situ oligonucleotide"], "manufacturer": ["Agilent Technologies"]})}
+    return FakeGSE(metadata, gsms, gpls)
+
+
+def test_build_and_map_channel_expression_matrices_writes_signal_and_reference_when_confident(monkeypatch, tmp_path):
+    gse = make_agilent_two_channel_gse_with_reference()
+    fake_map = pd.DataFrame([
+        {"probe_id": "1007_s_at", "gene_symbol": "DDR1", "entrez_id": "780", "source": "direct_columns"},
+        {"probe_id": "1053_at", "gene_symbol": "RFC2", "entrez_id": "5982", "source": "direct_columns"},
+    ])
+    monkeypatch.setattr(download.probe_mapping, "get_or_build_probe_gene_map", lambda gpl_id: fake_map)
+
+    channel_paths, channel_roles = download.build_and_map_channel_expression_matrices(gse, tmp_path, _AGILENT_PLATFORM_DETAILS)
+
+    assert channel_roles["method"] == "metadata+variance"
+    assert channel_roles["reference_channel"] == 1
+    assert channel_roles["signal_channel"] == 2
+    assert (tmp_path / "channel_signal_expression.tsv.gz").exists()
+    assert (tmp_path / "channel_reference_expression.tsv.gz").exists()
+    signal = pd.read_csv(tmp_path / "channel_signal_expression.tsv.gz", sep="\t")
+    reference = pd.read_csv(tmp_path / "channel_reference_expression.tsv.gz", sep="\t")
+    assert signal.equals(pd.read_csv(channel_paths[2], sep="\t"))
+    assert reference.equals(pd.read_csv(channel_paths[1], sep="\t"))
+
+
 def test_build_and_map_channel_expression_matrices_writes_both_channels(monkeypatch, tmp_path):
     gse = make_agilent_two_channel_gse()
     fake_map = pd.DataFrame([
@@ -201,16 +252,17 @@ def test_build_and_map_channel_expression_matrices_writes_both_channels(monkeypa
     ])
     monkeypatch.setattr(download.probe_mapping, "get_or_build_probe_gene_map", lambda gpl_id: fake_map)
 
-    result = download.build_and_map_channel_expression_matrices(gse, tmp_path, _AGILENT_PLATFORM_DETAILS)
+    channel_paths, channel_roles = download.build_and_map_channel_expression_matrices(gse, tmp_path, _AGILENT_PLATFORM_DETAILS)
 
-    assert set(result.keys()) == {1, 2}
-    assert result[1] == tmp_path / "channel1_expression.tsv.gz"
-    assert result[2] == tmp_path / "channel2_expression.tsv.gz"
+    assert set(channel_paths.keys()) == {1, 2}
+    assert channel_paths[1] == tmp_path / "channel1_expression.tsv.gz"
+    assert channel_paths[2] == tmp_path / "channel2_expression.tsv.gz"
     assert (tmp_path / "channel1_probe_matrix.tsv.gz").exists()
     assert (tmp_path / "channel2_probe_matrix.tsv.gz").exists()
+    assert channel_roles["method"] in ("ambiguous", "metadata", "variance", "metadata+variance")
 
-    channel1 = pd.read_csv(result[1], sep="\t")
-    channel2 = pd.read_csv(result[2], sep="\t")
+    channel1 = pd.read_csv(channel_paths[1], sep="\t")
+    channel2 = pd.read_csv(channel_paths[2], sep="\t")
     assert set(channel1["gene_symbol"]) == {"DDR1", "RFC2"}
     ddr1 = channel1[channel1["gene_symbol"] == "DDR1"].iloc[0]
     assert ddr1["GSM1"] == 10.0
@@ -242,7 +294,7 @@ def test_build_and_map_channel_expression_matrices_returns_empty_without_agilent
     result = download.build_and_map_channel_expression_matrices(
         gse, None, [{"gpl_id": "GPL96", "assay_type": "microarray", "vendor": "affymetrix"}]
     )
-    assert result == {}
+    assert result == ({}, {})
 
 
 def test_build_and_map_channel_expression_matrices_returns_empty_when_no_channel_columns():
@@ -260,7 +312,7 @@ def test_build_and_map_channel_expression_matrices_returns_empty_when_no_channel
     result = download.build_and_map_channel_expression_matrices(
         gse, None, [{"gpl_id": "GPL887", "assay_type": "microarray", "vendor": "agilent"}]
     )
-    assert result == {}
+    assert result == ({}, {})
 
 
 def test_download_cohort_includes_channel_expression_paths_for_agilent(monkeypatch, tmp_path):
@@ -282,6 +334,42 @@ def test_download_cohort_includes_channel_expression_paths_for_agilent(monkeypat
     assert (tmp_path / "GSE_AGILENT" / "channel1_expression.tsv.gz").exists()
     assert (tmp_path / "GSE_AGILENT" / "channel2_expression.tsv.gz").exists()
     assert (tmp_path / "GSE_AGILENT" / "expression.tsv.gz").exists()  # ratio path still runs
+    # make_agilent_two_channel_gse has no reference-design metadata hints, but
+    # its hardcoded values do happen to clear the variance-gap threshold even
+    # with just 2 samples -- exercises the variance-only path (no metadata
+    # hint at all) alongside the dedicated, more realistic fixture in
+    # test_download_cohort_persists_and_reuses_channel_roles.
+    assert result["channel_roles"]["method"] == "variance"
+    assert (tmp_path / "GSE_AGILENT" / "channel_roles.json").exists()
+
+
+def test_download_cohort_persists_and_reuses_channel_roles(monkeypatch, tmp_path):
+    gse = make_agilent_two_channel_gse_with_reference()
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)
+    monkeypatch.setattr(
+        download.clinical_annotate, "plan_column_mapping", lambda samples, model=None: clinical_annotate.ColumnMappingPlan()
+    )
+    fake_map = pd.DataFrame([
+        {"probe_id": "1007_s_at", "gene_symbol": "DDR1", "entrez_id": "780", "source": "direct_columns"},
+        {"probe_id": "1053_at", "gene_symbol": "RFC2", "entrez_id": "5982", "source": "direct_columns"},
+    ])
+    monkeypatch.setattr(download.probe_mapping, "get_or_build_probe_gene_map", lambda gpl_id: fake_map)
+
+    result = download.download_cohort("GSE_AGILENT_REF", series_dir=tmp_path)
+
+    assert result["channel_roles"] == {
+        "reference_channel": 1, "signal_channel": 2, "method": "metadata+variance", "notes": "",
+    }
+    assert result["channel_signal_expression_path"] == str(tmp_path / "GSE_AGILENT_REF" / "channel_signal_expression.tsv.gz")
+    assert result["channel_reference_expression_path"] == str(tmp_path / "GSE_AGILENT_REF" / "channel_reference_expression.tsv.gz")
+    assert (tmp_path / "GSE_AGILENT_REF" / "channel_roles.json").exists()
+
+    # Reuse path: re-derived purely from files on disk, no re-fetch.
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", _raise)
+    cached = download.download_cohort("GSE_AGILENT_REF", series_dir=tmp_path)
+    assert cached["channel_roles"] == result["channel_roles"]
+    assert cached["channel_signal_expression_path"] == result["channel_signal_expression_path"]
+    assert cached["channel_reference_expression_path"] == result["channel_reference_expression_path"]
 
 
 def test_download_cohort_routes_rnaseq_and_writes_annotation(monkeypatch, tmp_path):

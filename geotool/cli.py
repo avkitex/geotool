@@ -161,8 +161,13 @@ def download(gse_ids, from_report, rma_flag, force_flag):
     platform's own annotation table. Two-channel Agilent samples that publish
     per-channel intensity columns also get channel1_expression.tsv.gz /
     channel2_expression.tsv.gz alongside the ratio-based expression.tsv.gz
-    (unchanged). Add --rma to also RMA-renormalize Affymetrix series from raw
-    CEL files. Every cohort also gets a cleaned, semantically-unified
+    (unchanged). When it's confident which channel is the actual biological
+    sample vs. a fixed reference (metadata text and/or lower cross-sample
+    variance -- see probe_mapping.detect_reference_channel), also writes
+    channel_signal_expression.tsv.gz / channel_reference_expression.tsv.gz;
+    otherwise only the neutral channel1/channel2 files are written. Add
+    --rma to also RMA-renormalize Affymetrix series from raw CEL files.
+    Every cohort also gets a cleaned, semantically-unified
     annotation.tsv (redundant columns dropped; treatment/response/RECIST/
     survival unified where possible). A cohort that's already been downloaded
     is reused rather than redone -- pass --force to redo it anyway. Needs
@@ -206,6 +211,16 @@ def download(gse_ids, from_report, rma_flag, force_flag):
             if result.get("channel_expression_paths"):
                 for channel_num, path in sorted(result["channel_expression_paths"].items()):
                     click.echo(f"  channel {channel_num} expression matrix: {path}")
+            if result.get("channel_roles"):
+                roles = result["channel_roles"]
+                click.echo(
+                    f"  channel roles ({roles['method']}): "
+                    f"channel {roles['signal_channel']} = signal, channel {roles['reference_channel']} = reference"
+                )
+            if result.get("channel_signal_expression_path"):
+                click.echo(f"  channel signal expression matrix: {result['channel_signal_expression_path']}")
+            if result.get("channel_reference_expression_path"):
+                click.echo(f"  channel reference expression matrix: {result['channel_reference_expression_path']}")
             if result.get("expression_rma_path"):
                 click.echo(f"  RMA expression matrix: {result['expression_rma_path']}")
             if result.get("expression_files"):
