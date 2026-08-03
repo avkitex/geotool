@@ -291,7 +291,8 @@ def build_probe_matrix(gse) -> pd.DataFrame:
         table = getattr(gsm, "table", None)
         if table is None or table.empty or "ID_REF" not in table.columns or "VALUE" not in table.columns:
             continue
-        values = pd.to_numeric(table.set_index("ID_REF")["VALUE"], errors="coerce")
+        indexed = table.set_index(table["ID_REF"].astype(str))
+        values = pd.to_numeric(indexed["VALUE"], errors="coerce")
         columns[gsm_id] = values
     if not columns:
         return pd.DataFrame()
