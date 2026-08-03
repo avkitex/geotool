@@ -64,6 +64,8 @@ def test_classify_platform_microarray_gets_vendor_and_coverage():
         "assay_type": "microarray",
         "vendor": "affymetrix",
         "coverage": "full_transcriptome",
+        "content": "mrna",
+        "data_row_count": 54675,
     }
 
 
@@ -75,6 +77,8 @@ def test_classify_platform_rnaseq_has_no_vendor_or_coverage():
     assert result["assay_type"] == "bulk_rnaseq"
     assert result["vendor"] is None
     assert result["coverage"] is None
+    assert result["content"] is None
+    assert result["data_row_count"] is None
 
 
 def test_classify_platform_accepts_esummary_docsum_shape():
@@ -120,3 +124,63 @@ def test_classify_scrna_platform_unknown_when_no_hint():
     series_row = {"title": "some series", "overall_design": "", "summary": ""}
     samples = pd.DataFrame({"description": [""]})
     assert platform_classify.classify_scrna_platform(series_row, samples) == "unknown"
+
+
+@pytest.mark.parametrize(
+    "title,expected",
+    [
+        # Real platforms from GSE32688 -- the exact combined mRNA+CNA+miRNA series
+        # that motivated this classification.
+        ("[HG-U133_Plus_2] Affymetrix Human Genome U133 Plus 2.0 Array", "mrna"),
+        ("[GenomeWideSNP_6] Affymetrix Genome-Wide Human SNP 6.0 Array", "cna"),
+        ("miRCURY LNA microRNA Array, v.11.0 - hsa, mmu & rno", "mirna"),
+        ("Agilent-019118 Human miRNA Microarray 2.0 G4470B (miRNA ID version)", "mirna"),
+        ("Agilent-014950 Human Genome CGH Microarray 244A", "cna"),
+        ("Affymetrix Genome-Wide Human SNP Array 5.0", "cna"),
+        ("Arraystar Human LncRNA Microarray V2.0", "lncrna"),
+        # Combined chips explicitly mentioning mRNA content stay "mrna", not
+        # mirna/lncrna -- the "combined is fine" case.
+        ("Agilent-062918 Human LncRNA + mRNA Array", "mrna"),
+        ("Arraystar Human LncRNA and mRNA Expression Microarray V4.0", "mrna"),
+        ("Illumina HumanHT-12 V4.0 expression beadchip", "mrna"),
+    ],
+)
+def test_classify_array_content(title, expected):
+    assert platform_classify.classify_array_content(title) == expected
+
+
+@pytest.mark.parametrize(
+    "detail,expected_ok",
+    [
+        ({"assay_type": "bulk_rnaseq"}, True),  # not gated at all
+        ({"assay_type": "microarray", "content": "mrna", "data_row_count": 54675}, True),
+        ({"assay_type": "microarray", "content": "mrna", "data_row_count": 8000}, True),  # boundary: kept
+        ({"assay_type": "microarray", "content": "mrna", "data_row_count": 7999}, False),  # boundary: rejected
+        ({"assay_type": "microarray", "content": "cna", "data_row_count": 900000}, False),
+        ({"assay_type": "microarray", "content": "mirna", "data_row_count": 100}, False),
+        ({"assay_type": "microarray", "content": "lncrna", "data_row_count": 30000}, False),
+        ({"assay_type": "microarray", "content": "mrna", "data_row_count": None}, True),  # unknown count, benefit of the doubt
+    ],
+)
+def test_platform_supported(detail, expected_ok):
+    ok, reason = platform_classify.platform_supported(detail)
+    assert ok is expected_ok
+    if not ok:
+        assert reason
+
+
+def test_summarize_array_content_joins_dedupes_and_sorts():
+    docsums = {
+        "GPL570": {"title": "[HG-U133_Plus_2] Affymetrix Human Genome U133 Plus 2.0 Array", "ptechtype": "in situ oligonucleotide"},
+        "GPL6801": {"title": "[GenomeWideSNP_6] Affymetrix Genome-Wide Human SNP 6.0 Array", "ptechtype": "in situ oligonucleotide"},
+        "GPL7723": {"title": "miRCURY LNA microRNA Array, v.11.0 - hsa, mmu & rno", "ptechtype": "spotted oligonucleotide"},
+    }
+    result = platform_classify.summarize_array_content(docsums, ["GPL7723", "GPL570", "GPL6801"])
+    assert result == "cna;mirna;mrna"
+
+
+def test_summarize_array_content_skips_missing_and_non_microarray_platforms():
+    docsums = {
+        "GPL34284": {"title": "Illumina NovaSeq X Plus (Homo sapiens)", "ptechtype": "high-throughput sequencing"},
+    }
+    assert platform_classify.summarize_array_content(docsums, ["GPL34284", "GPL_UNKNOWN"]) == ""

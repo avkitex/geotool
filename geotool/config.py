@@ -26,6 +26,12 @@ LLM_ESCALATION_MODEL = os.environ.get("GEOTOOL_LLM_ESCALATION_MODEL", "claude-so
 # coverage rather than an older, lower-density platform.
 COVERAGE_THRESHOLD = int(os.environ.get("GEOTOOL_COVERAGE_THRESHOLD", "12000"))
 
+# Microarray platforms below this many probes/genes are rejected outright at download
+# time (too old/low-density to be a usable expression platform, e.g. early spotted-cDNA
+# or BAC arrays) -- a separate, lower bar than COVERAGE_THRESHOLD above, which is only an
+# informational "full_transcriptome" vs "limited" label, not a hard gate.
+MIN_ARRAY_PROBE_COUNT = int(os.environ.get("GEOTOOL_MIN_ARRAY_PROBE_COUNT", "8000"))
+
 
 def ensure_dirs() -> None:
     for d in (GEO_CACHE_DIR, REPORTS_DIR, SERIES_DIR, PLATFORMS_DIR):

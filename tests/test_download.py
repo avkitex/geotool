@@ -1,6 +1,7 @@
 import json
 
 import pandas as pd
+import pytest
 import requests
 
 from geotool import clinical_annotate, download
@@ -572,3 +573,103 @@ def test_download_cohort_routes_microarray(monkeypatch, tmp_path):
     assert (tmp_path / "GSE_ARRAY" / "probe_matrix.tsv.gz").exists()
     assert (tmp_path / "GSE_ARRAY" / "expression.tsv.gz").exists()
     assert (tmp_path / "GSE_ARRAY" / "annotation.tsv").exists()
+
+
+def test_download_cohort_rejects_non_human_organism(monkeypatch, tmp_path):
+    gse = make_microarray_gse()
+    for gsm in gse.gsms.values():
+        gsm.metadata["organism_ch1"] = ["Mus musculus"]
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)
+
+    with pytest.raises(download.UnsupportedCohortError, match="Mus musculus"):
+        download.download_cohort("GSE_MOUSE", series_dir=tmp_path)
+
+    assert not (tmp_path / "GSE_MOUSE" / "annotation.tsv").exists()
+
+
+def make_mixed_mrna_and_cna_gse():
+    """One mRNA platform (GPL96, allowed) plus a CNA/SNP platform (GPL_CNA,
+    rejected) on the same series -- the exact shape of GSE32688 (mRNA + CNA +
+    miRNA combined), just with only the CNA half added on top of the plain
+    microarray fixture."""
+    gse = make_microarray_gse()
+    gse.gsms["GSM_CNA"] = FakeGSM(
+        {
+            "title": ["cna1"], "geo_accession": ["GSM_CNA"], "platform_id": ["GPL_CNA"],
+            "organism_ch1": ["Homo sapiens"], "characteristics_ch1": [],
+        },
+        table=pd.DataFrame({"ID_REF": [1, 2], "VALUE": [0.1, -0.2]}),
+    )
+    gse.gpls["GPL_CNA"] = FakeGPL({
+        "title": ["[GenomeWideSNP_6] Affymetrix Genome-Wide Human SNP 6.0 Array"],
+        "technology": ["in situ oligonucleotide"], "manufacturer": ["Affymetrix"],
+        "data_row_count": ["900000"],
+    })
+    return gse
+
+
+def test_download_cohort_skips_unsupported_platform_but_keeps_supported_one(monkeypatch, tmp_path, capsys):
+    gse = make_mixed_mrna_and_cna_gse()
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)
+    monkeypatch.setattr(
+        download.clinical_annotate, "plan_column_mapping", lambda samples, model=None: clinical_annotate.ColumnMappingPlan()
+    )
+    fake_map = pd.DataFrame([
+        {"probe_id": "1007_s_at", "gene_symbol": "DDR1", "entrez_id": "780", "source": "direct_columns"},
+        {"probe_id": "1053_at", "gene_symbol": "RFC2", "entrez_id": "5982", "source": "direct_columns"},
+    ])
+    monkeypatch.setattr(download.probe_mapping, "get_or_build_probe_gene_map", lambda gpl_id: fake_map)
+
+    result = download.download_cohort("GSE_MIXED", series_dir=tmp_path)
+
+    assert "GPL_CNA (cna array" in capsys.readouterr().out
+    samples = pd.read_csv(tmp_path / "GSE_MIXED" / "samples.tsv", sep="\t")
+    assert set(samples["gsm_id"]) == {"GSM1", "GSM2"}  # GSM_CNA dropped
+    genes = pd.read_csv(result["expression_path"], sep="\t")
+    assert set(genes["gene_symbol"]) == {"DDR1", "RFC2"}
+
+
+def test_download_cohort_fails_when_every_platform_is_unsupported(monkeypatch, tmp_path):
+    gse = make_mixed_mrna_and_cna_gse()
+    del gse.gsms["GSM1"]
+    del gse.gsms["GSM2"]
+    del gse.gpls["GPL96"]
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)
+
+    with pytest.raises(download.UnsupportedCohortError, match="GPL_CNA"):
+        download.download_cohort("GSE_CNA_ONLY", series_dir=tmp_path)
+
+    assert not (tmp_path / "GSE_CNA_ONLY" / "annotation.tsv").exists()
+
+
+def test_download_cohort_rejects_low_density_microarray_platform(monkeypatch, tmp_path):
+    gse = make_microarray_gse()
+    gse.gpls["GPL96"].metadata["data_row_count"] = ["500"]
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)
+
+    with pytest.raises(download.UnsupportedCohortError, match="500"):
+        download.download_cohort("GSE_OLD_ARRAY", series_dir=tmp_path)
+
+
+def test_resolve_download_targets_returns_cached_id_with_zero_fetches(monkeypatch, tmp_path):
+    gse = make_microarray_gse()
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)
+    monkeypatch.setattr(
+        download.clinical_annotate, "plan_column_mapping", lambda samples, model=None: clinical_annotate.ColumnMappingPlan()
+    )
+    fake_map = pd.DataFrame([
+        {"probe_id": "1007_s_at", "gene_symbol": "DDR1", "entrez_id": "780", "source": "direct_columns"},
+        {"probe_id": "1053_at", "gene_symbol": "RFC2", "entrez_id": "5982", "source": "direct_columns"},
+    ])
+    monkeypatch.setattr(download.probe_mapping, "get_or_build_probe_gene_map", lambda gpl_id: fake_map)
+    download.download_cohort("GSE_ARRAY", series_dir=tmp_path)  # populate the cache
+
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", _raise)
+    monkeypatch.setattr(download.geo_fetch, "resolve_leaf_series_ids", _raise)
+
+    assert download.resolve_download_targets("GSE_ARRAY", series_dir=tmp_path) == ["GSE_ARRAY"]
+
+
+def test_resolve_download_targets_expands_uncached_superseries(monkeypatch, tmp_path):
+    monkeypatch.setattr(download.geo_fetch, "resolve_leaf_series_ids", lambda gse_id: ["GSE101", "GSE102"])
+    assert download.resolve_download_targets("GSE100", series_dir=tmp_path) == ["GSE101", "GSE102"]
