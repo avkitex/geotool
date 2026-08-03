@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 
 from geotool import probe_mapping
 
@@ -458,6 +459,10 @@ def test_detect_channel_columns_finds_known_naming_variants():
     df2 = pd.DataFrame({"ID_REF": ["p1"], "Intensity_Cy3": [1.0], "Intensity_Cy5": [2.0]})
     assert probe_mapping.detect_channel_columns(df2) == ("Intensity_Cy3", "Intensity_Cy5")
 
+    # GenePix-style CH1_MEAN/CH2_MEAN, seen live on GPL7504 (GSE50470/GSE21997/GSE22049)
+    df3 = pd.DataFrame({"ID_REF": ["p1"], "CH1_MEAN": [1.0], "CH2_MEAN": [2.0]})
+    assert probe_mapping.detect_channel_columns(df3) == ("CH1_MEAN", "CH2_MEAN")
+
 
 def test_detect_channel_columns_none_when_only_ratio_value_present():
     """The common case: most two-channel series only publish the precomputed
@@ -513,3 +518,128 @@ def test_build_channel_probe_matrices_skips_two_channel_samples_without_detectab
     channel1, channel2 = probe_mapping.build_channel_probe_matrices(gse)
     assert channel1.empty
     assert channel2.empty
+
+
+# --- detect_reference_channel -----------------------------------------------
+# Ground truth for the metadata-hint text below is real GSE50470 sample
+# metadata, captured live during planning: ch1 is a fixed Stratagene/Human
+# Universal Reference RNA hybridized on every array, ch2 is the actual
+# per-sample biological material.
+_REFERENCE_CH1_METADATA = {
+    "source_name_ch1": ["Stratagene Human Universal Reference that contained 1/10 added MCF7 and ME16C RNAs"],
+    "characteristics_ch1": ["reference: Stratagene Human Universal Reference that contained 1/10 added MCF7 and ME16C RNAs"],
+}
+
+
+def _sample_metadata(i: int) -> dict:
+    return {**_REFERENCE_CH1_METADATA, "source_name_ch2": [f"Tumor sample {i}"], "characteristics_ch2": [f"tissue: Breast Cancer {i}"]}
+
+
+@pytest.mark.parametrize(
+    "ch1_text,ch2_text,expected",
+    [
+        ("reference: Human Universal Reference", "tissue: Breast Cancer", 1),
+        ("pooled control RNA", "tissue: Breast Cancer", 1),
+        ("tissue: Breast Cancer", "reference RNA pool", 2),
+        ("tissue: Breast Cancer", "tissue: Normal Breast", None),  # neither -- no clear signal
+        ("reference RNA", "reference RNA pool", None),  # both -- no clear signal
+    ],
+)
+def test_channel_metadata_hint(ch1_text, ch2_text, expected):
+    gsm = FakeGSM(pd.DataFrame(), metadata={"characteristics_ch1": [ch1_text], "characteristics_ch2": [ch2_text]})
+    assert probe_mapping._channel_metadata_hint(gsm) == expected
+
+
+def test_detect_reference_channel_returns_ambiguous_for_empty_matrices():
+    gse = FakeGSE({})
+    result = probe_mapping.detect_reference_channel(gse, pd.DataFrame(), pd.DataFrame())
+    assert result == {"reference_channel": None, "signal_channel": None, "method": "ambiguous", "notes": ""}
+
+
+def test_detect_reference_channel_calls_via_metadata_when_variance_is_inconclusive():
+    """10 samples, clear >=90% metadata agreement that channel 1 is the
+    reference, but near-identical variance between channels (no real biology
+    baked into the numbers) -- metadata alone should still make the call."""
+    gsms = {f"GSM{i}": FakeGSM(pd.DataFrame(), metadata=_sample_metadata(i)) for i in range(1, 11)}
+    gse = FakeGSE(gsms)
+    channel1 = pd.DataFrame({gsm_id: [100.0, 200.0, 300.0] for gsm_id in gsms}, index=["p1", "p2", "p3"])
+    channel2 = pd.DataFrame({gsm_id: [101.0, 201.0, 301.0] for gsm_id in gsms}, index=["p1", "p2", "p3"])
+
+    result = probe_mapping.detect_reference_channel(gse, channel1, channel2)
+
+    assert result["method"] == "metadata"
+    assert result["reference_channel"] == 1
+    assert result["signal_channel"] == 2
+
+
+def test_detect_reference_channel_calls_via_variance_when_metadata_absent():
+    """No characteristics/source_name hints at all, but channel 1 is
+    constant across samples (as a fixed reference would be) while channel 2
+    varies widely -- variance alone should make the call."""
+    gsms = {f"GSM{i}": FakeGSM(pd.DataFrame(), metadata={}) for i in range(1, 11)}
+    gse = FakeGSE(gsms)
+    channel1 = pd.DataFrame({gsm_id: [100.0, 100.0, 100.0] for gsm_id in gsms}, index=["p1", "p2", "p3"])
+    channel2 = pd.DataFrame(
+        {gsm_id: [50.0 * i, 60.0 * i, 5.0 * i] for i, gsm_id in enumerate(gsms, start=1)}, index=["p1", "p2", "p3"]
+    )
+
+    result = probe_mapping.detect_reference_channel(gse, channel1, channel2)
+
+    assert result["method"] == "variance"
+    assert result["reference_channel"] == 1
+    assert result["signal_channel"] == 2
+
+
+def test_detect_reference_channel_confident_when_both_signals_agree():
+    gsms = {f"GSM{i}": FakeGSM(pd.DataFrame(), metadata=_sample_metadata(i)) for i in range(1, 11)}
+    gse = FakeGSE(gsms)
+    channel1 = pd.DataFrame({gsm_id: [100.0, 100.0, 100.0] for gsm_id in gsms}, index=["p1", "p2", "p3"])
+    channel2 = pd.DataFrame(
+        {gsm_id: [50.0 * i, 60.0 * i, 5.0 * i] for i, gsm_id in enumerate(gsms, start=1)}, index=["p1", "p2", "p3"]
+    )
+
+    result = probe_mapping.detect_reference_channel(gse, channel1, channel2)
+
+    assert result["method"] == "metadata+variance"
+    assert result["reference_channel"] == 1
+    assert result["signal_channel"] == 2
+
+
+def test_detect_reference_channel_ambiguous_when_signals_disagree():
+    """Metadata says channel 1 is the reference, but channel 2 is the one
+    with lower variance -- must not pick one arbitrarily."""
+    gsms = {f"GSM{i}": FakeGSM(pd.DataFrame(), metadata=_sample_metadata(i)) for i in range(1, 11)}
+    gse = FakeGSE(gsms)
+    channel1 = pd.DataFrame(
+        {gsm_id: [50.0 * i, 60.0 * i, 5.0 * i] for i, gsm_id in enumerate(gsms, start=1)}, index=["p1", "p2", "p3"]
+    )
+    channel2 = pd.DataFrame({gsm_id: [100.0, 100.0, 100.0] for gsm_id in gsms}, index=["p1", "p2", "p3"])
+
+    result = probe_mapping.detect_reference_channel(gse, channel1, channel2)
+
+    assert result["method"] == "ambiguous"
+    assert result["reference_channel"] is None
+    assert result["signal_channel"] is None
+    assert "disagree" in result["notes"]
+
+
+def test_detect_reference_channel_ambiguous_below_metadata_agreement_threshold():
+    """Half the samples say channel 1 is the reference, the other half say
+    channel 2 is (e.g. a dye-swap subset) -- below _MIN_METADATA_AGREEMENT
+    either way, so metadata shouldn't call it, and with no real variance gap
+    either the result stays ambiguous."""
+    gsms = {}
+    for i in range(1, 6):
+        gsms[f"GSM{i}"] = FakeGSM(pd.DataFrame(), metadata=_sample_metadata(i))
+    for i in range(6, 11):
+        gsms[f"GSM{i}"] = FakeGSM(pd.DataFrame(), metadata={
+            "source_name_ch1": [f"Tumor sample {i}"], "characteristics_ch1": [f"tissue: Breast Cancer {i}"],
+            "source_name_ch2": ["Human Universal Reference"], "characteristics_ch2": ["reference: Human Universal Reference"],
+        })
+    gse = FakeGSE(gsms)
+    channel1 = pd.DataFrame({gsm_id: [100.0, 200.0, 300.0] for gsm_id in gsms}, index=["p1", "p2", "p3"])
+    channel2 = pd.DataFrame({gsm_id: [101.0, 201.0, 301.0] for gsm_id in gsms}, index=["p1", "p2", "p3"])
+
+    result = probe_mapping.detect_reference_channel(gse, channel1, channel2)
+
+    assert result["method"] == "ambiguous"
