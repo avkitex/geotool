@@ -135,6 +135,45 @@ def test_select_primary_expression_file_prioritizes_fpkm_over_cpm():
     assert download.select_primary_expression_file(paths) == (Path("GSE1_FPKM.csv.gz"), "fpkm")
 
 
+def test_select_primary_expression_file_recognizes_rpkm():
+    """Real GSE246325 shape: "..._prmtRPKM.csv.gz" -- RPKM is FPKM's
+    single-end-read equivalent, ranked alongside it."""
+    paths = [Path("GSE1_CPM.txt.gz"), Path("GSE246325_prmtRPKM.csv.gz")]
+    assert download.select_primary_expression_file(paths) == (Path("GSE246325_prmtRPKM.csv.gz"), "rpkm")
+
+
+def test_select_primary_expression_file_recognizes_singular_count():
+    """Real GSE273376 shape: "..._count_matrix.csv.gz" -- the old "counts"
+    (plural-only) keyword missed this singular naming convention entirely."""
+    paths = [Path("GSE273376_pancreas_cell_lines.AM9747.count_matrix.csv.gz")]
+    assert download.select_primary_expression_file(paths) == (paths[0], "count")
+
+
+def test_select_primary_expression_file_excludes_non_data_extensions():
+    """Real GSE161706 shape: "..._dexseq_count.py.gz" is a compressed Python
+    *script*, not data -- it must not be picked just because its name
+    happens to contain "count"."""
+    paths = [
+        Path("GSE161706_dexseq_count.py.gz"),
+        Path("GSE161706_DEXseq.R.gz"),
+        Path("GSE161706_Processed_data_for_Table_S3_Figure_6.xlsx"),
+    ]
+    # The only actual data file has no recognizable unit keyword either --
+    # correctly nothing is picked, not the script.
+    assert download.select_primary_expression_file(paths) is None
+
+
+def test_select_primary_expression_file_excludes_derived_comparison_files():
+    """Real GSE194360/GSE194362 shape: "..._snp_counts_significance.csv.gz"
+    matches the "count" unit keyword but is a differential-significance
+    table derived from expression data, not a per-gene-per-sample matrix."""
+    paths = [
+        Path("GSE194360_Sample_A_vs_Control_snp_counts_significance.csv.gz"),
+        Path("GSE194360_Sample_B_vs_Control_snp_counts_significance.csv.gz"),
+    ]
+    assert download.select_primary_expression_file(paths) is None
+
+
 def test_select_primary_expression_file_none_when_no_recognizable_unit():
     """Real GSE163305 shape: two rMATS splicing-analysis files and a
     differential-expression results table -- none is a gene-expression
@@ -157,6 +196,28 @@ def test_select_primary_expression_file_finds_fpkm_among_non_matrix_files():
         Path("GSE163305_GSK_vs_DMSO_D6.csv.gz"),
     ]
     assert download.select_primary_expression_file(paths) == (Path("GSE163305_FPKM_6D_GSK6_DMSO.csv.gz"), "fpkm")
+
+
+def test_select_primary_expression_file_excludes_gsm_named_per_sample_files():
+    """Real GSE236498/GSE236499 shape: 12 "GSM*_gene_counts.txt.gz" files,
+    one per sample, no combined matrix -- none of these may be picked as if
+    one of them were the whole cohort's matrix, even though each matches the
+    "counts" keyword."""
+    paths = [
+        Path("GSM7548847_MCF-7_WT1_gene_counts.txt.gz"),
+        Path("GSM7548848_MCF-7_WT2_gene_counts.txt.gz"),
+        Path("GSM7548849_MCF-7_WT3_gene_counts.txt.gz"),
+    ]
+    assert download.select_primary_expression_file(paths) is None
+
+
+def test_select_primary_expression_file_still_finds_combined_matrix_among_gsm_named_files():
+    paths = [
+        Path("GSM7548847_MCF-7_WT1_gene_counts.txt.gz"),
+        Path("GSM7548848_MCF-7_WT2_gene_counts.txt.gz"),
+        Path("GSE236498_combined_TPM.txt.gz"),
+    ]
+    assert download.select_primary_expression_file(paths) == (Path("GSE236498_combined_TPM.txt.gz"), "tpm")
 
 
 def test_check_rnaseq_expression_qc_flags_linear_scale_fpkm_matrix(tmp_path):
@@ -205,6 +266,21 @@ def test_check_rnaseq_expression_qc_notes_unparseable_file(tmp_path):
     assert unit == "tpm"
     assert len(notes) == 1
     assert "could not parse" in notes[0]
+
+
+def test_check_rnaseq_expression_qc_reads_xlsx_files(tmp_path):
+    """Real shape: several PRMT5/MTAP cohorts (e.g. GSE310927, GSE277490)
+    publish their combined matrix as an .xlsx file rather than a
+    delimited/gzipped text file."""
+    path = tmp_path / "GSE310927_L3.6_EPZ_Prex_Combo_CPM.xlsx"
+    pd.DataFrame({"GSM1": [0.0, 999.0], "GSM2": [1.0, 500.0]}, index=["GENE1", "GENE2"]).to_excel(path)
+
+    primary_path, unit, notes = download.check_rnaseq_expression_qc([path])
+
+    assert primary_path == path
+    assert unit == "cpm"
+    assert len(notes) == 1
+    assert "not log2-transformed" in notes[0]
 
 
 def make_microarray_gse():
@@ -507,16 +583,59 @@ def test_download_cohort_reports_rnaseq_expression_qc_and_reuses_from_cache(monk
 
     result = download.download_cohort("GSE_RNASEQ_QC", series_dir=tmp_path)
 
-    assert result["primary_expression_unit"] == "counts"
+    assert result["primary_expression_unit"] == "count"
     assert result["primary_expression_file"] == str(tmp_path / "GSE_RNASEQ_QC" / "expression" / "GSE_RNASEQ_counts.tsv.gz")
     assert result["expression_qc_notes"] == ["GSE_RNASEQ_counts.tsv.gz: linear-scale, not log2-transformed (max value 16096.1)"]
+    assert result["expression_status"] == clinical_annotate.EXPRESSION_STATUS_NOT_LOG2_TRANSFORMED
     assert (tmp_path / "GSE_RNASEQ_QC" / "expression_qc.json").exists()
+
+    annotation = pd.read_csv(tmp_path / "GSE_RNASEQ_QC" / "annotation.tsv", sep="\t")
+    assert (annotation["expression_status"] == clinical_annotate.EXPRESSION_STATUS_NOT_LOG2_TRANSFORMED).all()
 
     monkeypatch.setattr(download.geo_fetch, "fetch_series", _raise)
     cached = download.download_cohort("GSE_RNASEQ_QC", series_dir=tmp_path)
     assert cached["primary_expression_file"] == result["primary_expression_file"]
     assert cached["primary_expression_unit"] == result["primary_expression_unit"]
     assert cached["expression_qc_notes"] == result["expression_qc_notes"]
+    assert cached["expression_status"] == result["expression_status"]
+
+
+def test_download_cohort_flags_no_expression_matrix_when_only_non_matrix_files_published(monkeypatch, tmp_path):
+    """Real GSE108651 shape: the only per-sample supplementary files are a
+    Cuffdiff differential-expression table and an rMATS splicing-analysis
+    spreadsheet -- neither is a raw/normalized expression matrix, so nothing
+    matches select_primary_expression_file's unit keywords at all."""
+    gse = make_rnaseq_gse()
+    gse.metadata["supplementary_file"] = [
+        "ftp://example.com/GSM1_gene_exp.diff.gz",
+        "ftp://example.com/GSM1_novel_filtered_rMATS.xlsx",
+    ]
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)
+    monkeypatch.setattr(
+        download.clinical_annotate, "plan_column_mapping", lambda samples, model=None: clinical_annotate.ColumnMappingPlan()
+    )
+
+    class _NoopResponse:
+        content = b"irrelevant"
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(download.requests, "get", lambda *a, **k: _NoopResponse())
+
+    result = download.download_cohort("GSE_NO_MATRIX", series_dir=tmp_path)
+
+    assert "primary_expression_file" not in result
+    assert result["expression_status"] == clinical_annotate.EXPRESSION_STATUS_NO_MATRIX
+    # No sidecar either -- nothing was found or flagged to write.
+    assert not (tmp_path / "GSE_NO_MATRIX" / "expression_qc.json").exists()
+
+    annotation = pd.read_csv(tmp_path / "GSE_NO_MATRIX" / "annotation.tsv", sep="\t")
+    assert (annotation["expression_status"] == clinical_annotate.EXPRESSION_STATUS_NO_MATRIX).all()
+
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", _raise)
+    cached = download.download_cohort("GSE_NO_MATRIX", series_dir=tmp_path)
+    assert cached["expression_status"] == clinical_annotate.EXPRESSION_STATUS_NO_MATRIX
 
 
 def test_download_cel_files_downloads_only_cel_urls_keyed_by_gsm(requests_mock, tmp_path):
@@ -784,6 +903,12 @@ def test_download_cohort_routes_microarray(monkeypatch, tmp_path):
     assert (tmp_path / "GSE_ARRAY" / "probe_matrix.tsv.gz").exists()
     assert (tmp_path / "GSE_ARRAY" / "expression.tsv.gz").exists()
     assert (tmp_path / "GSE_ARRAY" / "annotation.tsv").exists()
+    # aggregate_probes_to_genes already auto-log2-transforms microarray values,
+    # so a clean matrix comes out "ok" here (unlike a raw RNA-seq FPKM/counts
+    # file, which is never transformed since it isn't ours to mutate).
+    assert result["expression_status"] == clinical_annotate.EXPRESSION_STATUS_OK
+    annotation = pd.read_csv(tmp_path / "GSE_ARRAY" / "annotation.tsv", sep="\t")
+    assert (annotation["expression_status"] == clinical_annotate.EXPRESSION_STATUS_OK).all()
 
 
 def test_download_cohort_rejects_non_human_organism(monkeypatch, tmp_path):

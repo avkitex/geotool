@@ -157,7 +157,7 @@ def download(gse_ids, from_report, rma_flag, force_flag):
 
     RNA-seq series get their supplementary expression file(s) downloaded as-is
     -- when there's more than one, the one that looks like the actual
-    quantification matrix (by filename: TPM > FPKM > CPM > raw counts) is
+    quantification matrix (by filename: TPM > FPKM > RPKM > CPM > raw counts) is
     additionally checked for two easy-to-miss problems and reported as
     "expression QC" notes: values that don't look log2-transformed (a linear-
     scale note, not necessarily wrong), and negative values (a real red flag
@@ -177,7 +177,13 @@ def download(gse_ids, from_report, rma_flag, force_flag):
     --rma to also RMA-renormalize Affymetrix series from raw CEL files.
     Every cohort also gets a cleaned, semantically-unified
     annotation.tsv (redundant columns dropped; treatment/response/RECIST/
-    survival unified where possible). A cohort that's already been downloaded
+    survival unified where possible), plus an expression_status column
+    (clinical_annotate.classify_expression_status) flagging, in every row,
+    the same cohort-level QC verdict as a word-enum: "ok", "no_expression_
+    matrix" (e.g. a series that only ever published differential-expression/
+    splicing-analysis output, never a raw or normalized matrix -- see
+    GSE108651), "unparseable", or "not_log2_transformed"/"negative_values"
+    (joined with ";" if both apply). A cohort that's already been downloaded
     is reused rather than redone -- pass --force to redo it anyway. Needs
     ANTHROPIC_API_KEY. Writes into data/series/<GSE_ID>/.
 
@@ -238,6 +244,8 @@ def download(gse_ids, from_report, rma_flag, force_flag):
             if result.get("expression_qc_notes"):
                 for note in result["expression_qc_notes"]:
                     click.echo(f"  expression QC: {note}")
+            if result.get("expression_status"):
+                click.echo(f"  expression status: {result['expression_status']}")
             click.echo(f"  annotation: {result['annotation_path']}")
 
 

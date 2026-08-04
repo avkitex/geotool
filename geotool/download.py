@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -223,15 +224,51 @@ def download_rnaseq_files(gse, out_dir: Path) -> list[Path]:
 
 
 # Quantification-unit keywords a supplementary filename might carry, ranked
-# best-first: TPM > FPKM > CPM > raw counts. An RNA-seq series routinely also
-# publishes non-matrix supplementary files alongside the real expression
-# matrix (differential-expression result tables, splicing-analysis output,
-# ...) -- live example, GSE163305: 4 supplementary files, only one
-# ("..._FPKM_....csv.gz") is an actual gene x sample matrix; the other 3 are
-# rMATS splicing output and a Cuffdiff-style DE table whose log2_fold_change
-# column is legitimately negative, which would be a false positive for
-# check_expression_qc below if it were treated as an expression matrix.
-_QUANT_UNIT_PRIORITY = ["tpm", "fpkm", "cpm", "counts"]
+# best-first: TPM > FPKM > RPKM (paired-end-normalized equivalent of FPKM,
+# ranked alongside it) > CPM > raw counts ("count", not "counts", so
+# "count_matrix"/"gene_count"-style singular names still match -- live
+# example, GSE273376's "..._count_matrix.csv.gz"). An RNA-seq series
+# routinely also publishes non-matrix supplementary files alongside the real
+# expression matrix (differential-expression result tables, splicing-
+# analysis output, ...) -- live example, GSE163305: 4 supplementary files,
+# only one ("..._FPKM_....csv.gz") is an actual gene x sample matrix; the
+# other 3 are rMATS splicing output and a Cuffdiff-style DE table whose
+# log2_fold_change column is legitimately negative, which would be a false
+# positive for check_expression_qc below if it were treated as an
+# expression matrix.
+_QUANT_UNIT_PRIORITY = ["tpm", "fpkm", "rpkm", "cpm", "count"]
+
+# A filename carrying its own GSM accession is inherently a per-sample
+# fragment, never a whole-cohort combined matrix, regardless of what
+# quantification-unit keyword also appears in it -- live example,
+# GSE236498/GSE236499: 12 "GSM*_gene_counts.txt.gz" files, one per sample,
+# no combined matrix at all. Without this exclusion, select_primary_
+# expression_file would pick one arbitrary sample's own file and silently
+# misrepresent the whole cohort's data as if it were that one sample's.
+_GSM_NAME_RE = re.compile(r"GSM\d+", re.IGNORECASE)
+
+# Only these extensions (after stripping a trailing .gz) are ever plausible
+# for a delimited/Excel expression matrix -- live example, GSE161706's
+# "..._dexseq_count.py.gz": a compressed Python *script*, not data, that
+# would otherwise match the "count" unit keyword purely because of its name.
+_DATA_FILE_EXTENSIONS = (".txt", ".tsv", ".csv", ".xlsx", ".xls")
+
+
+def _is_data_file(path: Path) -> bool:
+    name = path.name.lower()
+    if name.endswith(".gz"):
+        name = name[: -len(".gz")]
+    return name.endswith(_DATA_FILE_EXTENSIONS)
+
+
+# A filename carrying one of these is a comparison/analysis output derived
+# from an expression matrix, not the matrix itself -- even when it also
+# happens to carry a quantification-unit keyword. Live example, GSE194360/
+# GSE194362: "..._snp_counts_significance.csv.gz" matches "count" but is a
+# differential-significance table, not a per-gene-per-sample matrix (same
+# false-positive risk already handled for GSE163305's "_GSK_vs_DMSO_D6.csv.gz"
+# -- that one just didn't happen to also contain a unit keyword).
+_NON_MATRIX_KEYWORDS = ("diff", "deg", "significance", "clinical", "rmats", "dexseq", "novel_filtered")
 
 
 def select_primary_expression_file(paths: list[Path]) -> tuple[Path, str] | None:
@@ -240,11 +277,16 @@ def select_primary_expression_file(paths: list[Path]) -> tuple[Path, str] | None
     _QUANT_UNIT_PRIORITY -- (path, unit), or None if no filename carries a
     recognizable unit keyword at all (nothing is guessed at that point,
     rather than risk QC-checking an unrelated file as if it were expression
-    data).
+    data). Files named after an individual GSM accession (_GSM_NAME_RE),
+    that aren't a plausible data file at all (_is_data_file), or that look
+    like a derived comparison/analysis output rather than the matrix itself
+    (_NON_MATRIX_KEYWORDS) are never candidates.
     """
     best: tuple[int, Path, str] | None = None
     for path in paths:
         name = path.name.lower()
+        if _GSM_NAME_RE.search(path.name) or not _is_data_file(path) or any(k in name for k in _NON_MATRIX_KEYWORDS):
+            continue
         for rank, unit in enumerate(_QUANT_UNIT_PRIORITY):
             if unit in name:
                 if best is None or rank < best[0]:
@@ -261,6 +303,8 @@ def _load_expression_file_for_qc(path: Path) -> pd.DataFrame | None:
     a QC nice-to-have must never be able to fail a real download.
     """
     try:
+        if path.name.lower().endswith((".xlsx", ".xls")):
+            return pd.read_excel(path)
         return pd.read_csv(path, sep=None, engine="python", compression="infer")
     except Exception:
         return None
@@ -526,6 +570,10 @@ def _cached_result(gse_id: str, out_dir: Path) -> tuple[dict, list[dict]] | None
         "expression_path": None, "annotation_path": str(annotation_path),
     }
 
+    annotation_df = pd.read_csv(annotation_path, sep="\t", nrows=1)
+    if "expression_status" in annotation_df.columns and len(annotation_df):
+        result["expression_status"] = annotation_df.iloc[0]["expression_status"]
+
     expr_path = out_dir / "expression.tsv.gz"
     if expr_path.exists():
         result["expression_path"] = str(expr_path)
@@ -661,6 +709,7 @@ def download_cohort(
     qc_notes: list[str] = []
     primary_path: Path | None = None
     primary_unit: str | None = None
+    matrix_found = False
 
     if assay_types & {"bulk_rnaseq", "scrnaseq"}:
         files = download_rnaseq_files(gse, out_dir)
@@ -672,11 +721,13 @@ def download_cohort(
             if primary_path is not None:
                 result["primary_expression_file"] = str(primary_path)
                 result["primary_expression_unit"] = primary_unit
+                matrix_found = True
             qc_notes.extend(rnaseq_qc_notes)
     elif "microarray" in assay_types:
         expr_path, expr_qc_notes = build_and_map_expression_matrix(gse, out_dir)
         result["expression_path"] = str(expr_path) if expr_path else None
         if expr_path is not None:
+            matrix_found = True
             qc_notes.extend(f"expression.tsv.gz: {note}" for note in expr_qc_notes)
         channel_paths, channel_roles = build_and_map_channel_expression_matrices(gse, out_dir, platform_details)
         if channel_paths:
@@ -700,8 +751,13 @@ def download_cohort(
             print(f"  {gse_id}: expression QC: {note}")
     _write_expression_qc(out_dir, primary_path, primary_unit, qc_notes)
 
+    expression_status = clinical_annotate.classify_expression_status(qc_notes, matrix_found)
+    result["expression_status"] = expression_status
+    print(f"  {gse_id}: expression status: {expression_status}")
+
     plan = clinical_annotate.plan_column_mapping(samples)
     annotation = clinical_annotate.apply_column_mapping(samples, plan)
+    annotation["expression_status"] = expression_status
     annotation_path = out_dir / "annotation.tsv"
     annotation.to_csv(annotation_path, sep="\t", index=False)
     result["annotation_path"] = str(annotation_path)
