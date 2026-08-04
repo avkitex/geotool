@@ -261,21 +261,32 @@ def _is_data_file(path: Path) -> bool:
     return name.endswith(_DATA_FILE_EXTENSIONS)
 
 
+# A filename carrying one of these is a comparison/analysis output derived
+# from an expression matrix, not the matrix itself -- even when it also
+# happens to carry a quantification-unit keyword. Live example, GSE194360/
+# GSE194362: "..._snp_counts_significance.csv.gz" matches "count" but is a
+# differential-significance table, not a per-gene-per-sample matrix (same
+# false-positive risk already handled for GSE163305's "_GSK_vs_DMSO_D6.csv.gz"
+# -- that one just didn't happen to also contain a unit keyword).
+_NON_MATRIX_KEYWORDS = ("diff", "deg", "significance", "clinical", "rmats", "dexseq", "novel_filtered")
+
+
 def select_primary_expression_file(paths: list[Path]) -> tuple[Path, str] | None:
     """Among downloaded RNA-seq supplementary files, pick the one that looks
     like the actual gene-expression quantification matrix, by
     _QUANT_UNIT_PRIORITY -- (path, unit), or None if no filename carries a
     recognizable unit keyword at all (nothing is guessed at that point,
     rather than risk QC-checking an unrelated file as if it were expression
-    data). Files named after an individual GSM accession (_GSM_NAME_RE) or
-    that aren't a plausible data file at all (_is_data_file) are never
-    candidates.
+    data). Files named after an individual GSM accession (_GSM_NAME_RE),
+    that aren't a plausible data file at all (_is_data_file), or that look
+    like a derived comparison/analysis output rather than the matrix itself
+    (_NON_MATRIX_KEYWORDS) are never candidates.
     """
     best: tuple[int, Path, str] | None = None
     for path in paths:
-        if _GSM_NAME_RE.search(path.name) or not _is_data_file(path):
-            continue
         name = path.name.lower()
+        if _GSM_NAME_RE.search(path.name) or not _is_data_file(path) or any(k in name for k in _NON_MATRIX_KEYWORDS):
+            continue
         for rank, unit in enumerate(_QUANT_UNIT_PRIORITY):
             if unit in name:
                 if best is None or rank < best[0]:

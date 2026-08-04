@@ -163,6 +163,17 @@ def test_select_primary_expression_file_excludes_non_data_extensions():
     assert download.select_primary_expression_file(paths) is None
 
 
+def test_select_primary_expression_file_excludes_derived_comparison_files():
+    """Real GSE194360/GSE194362 shape: "..._snp_counts_significance.csv.gz"
+    matches the "count" unit keyword but is a differential-significance
+    table derived from expression data, not a per-gene-per-sample matrix."""
+    paths = [
+        Path("GSE194360_Sample_A_vs_Control_snp_counts_significance.csv.gz"),
+        Path("GSE194360_Sample_B_vs_Control_snp_counts_significance.csv.gz"),
+    ]
+    assert download.select_primary_expression_file(paths) is None
+
+
 def test_select_primary_expression_file_none_when_no_recognizable_unit():
     """Real GSE163305 shape: two rMATS splicing-analysis files and a
     differential-expression results table -- none is a gene-expression
