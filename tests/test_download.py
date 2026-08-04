@@ -510,13 +510,56 @@ def test_download_cohort_reports_rnaseq_expression_qc_and_reuses_from_cache(monk
     assert result["primary_expression_unit"] == "counts"
     assert result["primary_expression_file"] == str(tmp_path / "GSE_RNASEQ_QC" / "expression" / "GSE_RNASEQ_counts.tsv.gz")
     assert result["expression_qc_notes"] == ["GSE_RNASEQ_counts.tsv.gz: linear-scale, not log2-transformed (max value 16096.1)"]
+    assert result["expression_status"] == clinical_annotate.EXPRESSION_STATUS_NOT_LOG2_TRANSFORMED
     assert (tmp_path / "GSE_RNASEQ_QC" / "expression_qc.json").exists()
+
+    annotation = pd.read_csv(tmp_path / "GSE_RNASEQ_QC" / "annotation.tsv", sep="\t")
+    assert (annotation["expression_status"] == clinical_annotate.EXPRESSION_STATUS_NOT_LOG2_TRANSFORMED).all()
 
     monkeypatch.setattr(download.geo_fetch, "fetch_series", _raise)
     cached = download.download_cohort("GSE_RNASEQ_QC", series_dir=tmp_path)
     assert cached["primary_expression_file"] == result["primary_expression_file"]
     assert cached["primary_expression_unit"] == result["primary_expression_unit"]
     assert cached["expression_qc_notes"] == result["expression_qc_notes"]
+    assert cached["expression_status"] == result["expression_status"]
+
+
+def test_download_cohort_flags_no_expression_matrix_when_only_non_matrix_files_published(monkeypatch, tmp_path):
+    """Real GSE108651 shape: the only per-sample supplementary files are a
+    Cuffdiff differential-expression table and an rMATS splicing-analysis
+    spreadsheet -- neither is a raw/normalized expression matrix, so nothing
+    matches select_primary_expression_file's unit keywords at all."""
+    gse = make_rnaseq_gse()
+    gse.metadata["supplementary_file"] = [
+        "ftp://example.com/GSM1_gene_exp.diff.gz",
+        "ftp://example.com/GSM1_novel_filtered_rMATS.xlsx",
+    ]
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)
+    monkeypatch.setattr(
+        download.clinical_annotate, "plan_column_mapping", lambda samples, model=None: clinical_annotate.ColumnMappingPlan()
+    )
+
+    class _NoopResponse:
+        content = b"irrelevant"
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(download.requests, "get", lambda *a, **k: _NoopResponse())
+
+    result = download.download_cohort("GSE_NO_MATRIX", series_dir=tmp_path)
+
+    assert "primary_expression_file" not in result
+    assert result["expression_status"] == clinical_annotate.EXPRESSION_STATUS_NO_MATRIX
+    # No sidecar either -- nothing was found or flagged to write.
+    assert not (tmp_path / "GSE_NO_MATRIX" / "expression_qc.json").exists()
+
+    annotation = pd.read_csv(tmp_path / "GSE_NO_MATRIX" / "annotation.tsv", sep="\t")
+    assert (annotation["expression_status"] == clinical_annotate.EXPRESSION_STATUS_NO_MATRIX).all()
+
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", _raise)
+    cached = download.download_cohort("GSE_NO_MATRIX", series_dir=tmp_path)
+    assert cached["expression_status"] == clinical_annotate.EXPRESSION_STATUS_NO_MATRIX
 
 
 def test_download_cel_files_downloads_only_cel_urls_keyed_by_gsm(requests_mock, tmp_path):
@@ -784,6 +827,12 @@ def test_download_cohort_routes_microarray(monkeypatch, tmp_path):
     assert (tmp_path / "GSE_ARRAY" / "probe_matrix.tsv.gz").exists()
     assert (tmp_path / "GSE_ARRAY" / "expression.tsv.gz").exists()
     assert (tmp_path / "GSE_ARRAY" / "annotation.tsv").exists()
+    # aggregate_probes_to_genes already auto-log2-transforms microarray values,
+    # so a clean matrix comes out "ok" here (unlike a raw RNA-seq FPKM/counts
+    # file, which is never transformed since it isn't ours to mutate).
+    assert result["expression_status"] == clinical_annotate.EXPRESSION_STATUS_OK
+    annotation = pd.read_csv(tmp_path / "GSE_ARRAY" / "annotation.tsv", sep="\t")
+    assert (annotation["expression_status"] == clinical_annotate.EXPRESSION_STATUS_OK).all()
 
 
 def test_download_cohort_rejects_non_human_organism(monkeypatch, tmp_path):

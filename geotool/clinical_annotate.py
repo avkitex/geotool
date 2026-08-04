@@ -24,6 +24,45 @@ PROTECTED_COLUMNS = {"gsm_id", "gse_id", "platform_id"}
 
 EXAMPLE_VALUES_PER_COLUMN = 5
 
+# Word-enum values for the expression_status column (see
+# classify_expression_status) -- a cohort-level status added by download.py
+# after apply_column_mapping, not something the LLM plan ever sees. Not
+# mutually exclusive: NOT_LOG2_TRANSFORMED and NEGATIVE_VALUES can both apply
+# to the same matrix, joined with ";" (see classify_expression_status).
+EXPRESSION_STATUS_OK = "ok"
+EXPRESSION_STATUS_NO_MATRIX = "no_expression_matrix"
+EXPRESSION_STATUS_UNPARSEABLE = "unparseable"
+EXPRESSION_STATUS_NOT_LOG2_TRANSFORMED = "not_log2_transformed"
+EXPRESSION_STATUS_NEGATIVE_VALUES = "negative_values"
+
+
+def classify_expression_status(qc_notes: list[str], has_matrix: bool) -> str:
+    """Word-enum summary of download.py's expression-matrix QC findings
+    (probe_mapping.check_expression_qc / check_rnaseq_expression_qc), for the
+    expression_status column in annotation.tsv -- lets a human or downstream
+    script filter/flag a cohort with no usable expression matrix at all (e.g.
+    GSE108651, which only ever published differential-expression/splicing-
+    analysis output, never a raw or normalized matrix), or a matrix with a
+    known scale/sign problem, without re-deriving it from qc_notes' free text.
+
+    has_matrix is False whenever download.py never got a usable matrix at
+    all -- no file its select_primary_expression_file recognized (RNA-seq),
+    no probe->gene mapping available (microarray), or an unhandled assay
+    type -- in which case there's nothing left to check and the other
+    qc_notes-derived tags don't apply.
+    """
+    if not has_matrix:
+        return EXPRESSION_STATUS_NO_MATRIX
+    if any("could not parse" in note for note in qc_notes):
+        return EXPRESSION_STATUS_UNPARSEABLE
+
+    tags = []
+    if any("not log2-transformed" in note for note in qc_notes):
+        tags.append(EXPRESSION_STATUS_NOT_LOG2_TRANSFORMED)
+    if any("negative value" in note for note in qc_notes):
+        tags.append(EXPRESSION_STATUS_NEGATIVE_VALUES)
+    return ";".join(tags) if tags else EXPRESSION_STATUS_OK
+
 SYSTEM_PROMPT = """You are cleaning up a GEO series' per-sample annotation table for a
 bioinformatics search tool. You are given every column name and a few example values from
 each -- not the full data.

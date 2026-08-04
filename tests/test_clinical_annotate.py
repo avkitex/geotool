@@ -287,3 +287,39 @@ def test_plan_column_mapping_returns_parsed_plan(monkeypatch):
     result = ca.plan_column_mapping(make_samples_df())
     assert result == plan
     assert len(fake_client.messages.calls) == 1
+
+
+def test_classify_expression_status_no_matrix():
+    """GSE108651 shape: only differential-expression/splicing-analysis
+    output was ever published, no raw or normalized matrix at all."""
+    assert ca.classify_expression_status([], has_matrix=False) == ca.EXPRESSION_STATUS_NO_MATRIX
+    # qc_notes are irrelevant once there's no matrix to have generated them from.
+    assert ca.classify_expression_status(["some note"], has_matrix=False) == ca.EXPRESSION_STATUS_NO_MATRIX
+
+
+def test_classify_expression_status_ok_when_matrix_found_and_clean():
+    assert ca.classify_expression_status([], has_matrix=True) == ca.EXPRESSION_STATUS_OK
+
+
+def test_classify_expression_status_unparseable():
+    notes = ["GSE1_TPM.csv.gz: could not parse for QC"]
+    assert ca.classify_expression_status(notes, has_matrix=True) == ca.EXPRESSION_STATUS_UNPARSEABLE
+
+
+def test_classify_expression_status_not_log2_transformed():
+    notes = ["expression.tsv.gz: linear-scale, not log2-transformed (max value 16096.1)"]
+    assert ca.classify_expression_status(notes, has_matrix=True) == ca.EXPRESSION_STATUS_NOT_LOG2_TRANSFORMED
+
+
+def test_classify_expression_status_negative_values():
+    notes = ["expression.tsv.gz: 3 negative value(s) found -- possible log2 transform without a +1 pseudocount"]
+    assert ca.classify_expression_status(notes, has_matrix=True) == ca.EXPRESSION_STATUS_NEGATIVE_VALUES
+
+
+def test_classify_expression_status_joins_both_tags_when_both_present():
+    notes = [
+        "expression.tsv.gz: linear-scale, not log2-transformed (max value 99.0)",
+        "expression.tsv.gz: 1 negative value(s) found -- possible log2 transform without a +1 pseudocount",
+    ]
+    status = ca.classify_expression_status(notes, has_matrix=True)
+    assert status == f"{ca.EXPRESSION_STATUS_NOT_LOG2_TRANSFORMED};{ca.EXPRESSION_STATUS_NEGATIVE_VALUES}"

@@ -526,6 +526,10 @@ def _cached_result(gse_id: str, out_dir: Path) -> tuple[dict, list[dict]] | None
         "expression_path": None, "annotation_path": str(annotation_path),
     }
 
+    annotation_df = pd.read_csv(annotation_path, sep="\t", nrows=1)
+    if "expression_status" in annotation_df.columns and len(annotation_df):
+        result["expression_status"] = annotation_df.iloc[0]["expression_status"]
+
     expr_path = out_dir / "expression.tsv.gz"
     if expr_path.exists():
         result["expression_path"] = str(expr_path)
@@ -661,6 +665,7 @@ def download_cohort(
     qc_notes: list[str] = []
     primary_path: Path | None = None
     primary_unit: str | None = None
+    matrix_found = False
 
     if assay_types & {"bulk_rnaseq", "scrnaseq"}:
         files = download_rnaseq_files(gse, out_dir)
@@ -672,11 +677,13 @@ def download_cohort(
             if primary_path is not None:
                 result["primary_expression_file"] = str(primary_path)
                 result["primary_expression_unit"] = primary_unit
+                matrix_found = True
             qc_notes.extend(rnaseq_qc_notes)
     elif "microarray" in assay_types:
         expr_path, expr_qc_notes = build_and_map_expression_matrix(gse, out_dir)
         result["expression_path"] = str(expr_path) if expr_path else None
         if expr_path is not None:
+            matrix_found = True
             qc_notes.extend(f"expression.tsv.gz: {note}" for note in expr_qc_notes)
         channel_paths, channel_roles = build_and_map_channel_expression_matrices(gse, out_dir, platform_details)
         if channel_paths:
@@ -700,8 +707,13 @@ def download_cohort(
             print(f"  {gse_id}: expression QC: {note}")
     _write_expression_qc(out_dir, primary_path, primary_unit, qc_notes)
 
+    expression_status = clinical_annotate.classify_expression_status(qc_notes, matrix_found)
+    result["expression_status"] = expression_status
+    print(f"  {gse_id}: expression status: {expression_status}")
+
     plan = clinical_annotate.plan_column_mapping(samples)
     annotation = clinical_annotate.apply_column_mapping(samples, plan)
+    annotation["expression_status"] = expression_status
     annotation_path = out_dir / "annotation.tsv"
     annotation.to_csv(annotation_path, sep="\t", index=False)
     result["annotation_path"] = str(annotation_path)
