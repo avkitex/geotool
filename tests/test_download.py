@@ -1,5 +1,8 @@
 import gzip
+import io
 import json
+import tarfile
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -222,18 +225,20 @@ def test_select_primary_expression_file_still_finds_combined_matrix_among_gsm_na
 
 def test_check_rnaseq_expression_qc_flags_linear_scale_fpkm_matrix(tmp_path):
     """Real GSE163305 FPKM matrix shape: nonnegative, max value in the
-    thousands."""
+    thousands. Source is .csv.gz (comma-separated), which needs converting
+    to the guaranteed final .tsv.gz format -- see resolve_primary_expression_
+    matrix's dedicated tests for that conversion behavior in isolation."""
     path = tmp_path / "GSE163305_FPKM_6D_GSK6_DMSO.csv.gz"
     pd.DataFrame(
         {"GSK6D_0": [0.0, 16096.1], "DMSO6D_0": [0.0, 12677.3]}, index=["XLOC_1", "XLOC_2"]
     ).to_csv(path, compression="gzip")
 
-    primary_path, unit, notes = download.check_rnaseq_expression_qc([path])
+    primary_path, unit, notes = download.check_rnaseq_expression_qc([path], tmp_path)
 
-    assert primary_path == path
+    assert primary_path == tmp_path / "GSE163305_FPKM_6D_GSK6_DMSO.tsv.gz"
     assert unit == "fpkm"
     assert len(notes) == 1
-    assert path.name in notes[0]
+    assert primary_path.name in notes[0]
     assert "not log2-transformed" in notes[0]
 
 
@@ -243,7 +248,7 @@ def test_check_rnaseq_expression_qc_flags_negative_values(tmp_path):
     path = tmp_path / "GSE1_TPM.csv.gz"
     pd.DataFrame({"GSM1": [-1.2, 3.0]}, index=["GENE1", "GENE2"]).to_csv(path, compression="gzip")
 
-    primary_path, unit, notes = download.check_rnaseq_expression_qc([path])
+    primary_path, unit, notes = download.check_rnaseq_expression_qc([path], tmp_path)
 
     assert unit == "tpm"
     assert len(notes) == 1
@@ -252,7 +257,7 @@ def test_check_rnaseq_expression_qc_flags_negative_values(tmp_path):
 
 def test_check_rnaseq_expression_qc_returns_nothing_when_no_matrix_file(tmp_path):
     paths = [tmp_path / "some_de_table.csv.gz"]
-    primary_path, unit, notes = download.check_rnaseq_expression_qc(paths)
+    primary_path, unit, notes = download.check_rnaseq_expression_qc(paths, tmp_path)
     assert primary_path is None
     assert unit is None
     assert notes == []
@@ -261,7 +266,8 @@ def test_check_rnaseq_expression_qc_returns_nothing_when_no_matrix_file(tmp_path
 def test_check_rnaseq_expression_qc_notes_unparseable_file(tmp_path):
     path = tmp_path / "broken_tpm.csv.gz"
     path.write_bytes(b"not actually gzip-compressed data")
-    primary_path, unit, notes = download.check_rnaseq_expression_qc([path])
+    primary_path, unit, notes = download.check_rnaseq_expression_qc([path], tmp_path)
+    # Couldn't be converted either -- falls back to reporting the original.
     assert primary_path == path
     assert unit == "tpm"
     assert len(notes) == 1
@@ -271,16 +277,128 @@ def test_check_rnaseq_expression_qc_notes_unparseable_file(tmp_path):
 def test_check_rnaseq_expression_qc_reads_xlsx_files(tmp_path):
     """Real shape: several PRMT5/MTAP cohorts (e.g. GSE310927, GSE277490)
     publish their combined matrix as an .xlsx file rather than a
-    delimited/gzipped text file."""
+    delimited/gzipped text file -- converted to .tsv.gz, per the guaranteed
+    final format."""
     path = tmp_path / "GSE310927_L3.6_EPZ_Prex_Combo_CPM.xlsx"
     pd.DataFrame({"GSM1": [0.0, 999.0], "GSM2": [1.0, 500.0]}, index=["GENE1", "GENE2"]).to_excel(path)
 
-    primary_path, unit, notes = download.check_rnaseq_expression_qc([path])
+    primary_path, unit, notes = download.check_rnaseq_expression_qc([path], tmp_path)
 
-    assert primary_path == path
+    assert primary_path == tmp_path / "GSE310927_L3.6_EPZ_Prex_Combo_CPM.tsv.gz"
     assert unit == "cpm"
     assert len(notes) == 1
     assert "not log2-transformed" in notes[0]
+
+
+# --- resolve_primary_expression_matrix: the guaranteed-.tsv.gz-output fix ---
+
+def _tsv_gz_dataframe():
+    return pd.DataFrame({"GSM1": [1.0, 2.0], "GSM2": [3.0, 4.0]}, index=["GENE1", "GENE2"])
+
+
+def test_resolve_primary_expression_matrix_leaves_already_tsv_gz_untouched(tmp_path):
+    """A plain, already-conformant .tsv.gz file is returned as-is -- no new
+    file written, nothing re-parsed/rewritten unnecessarily."""
+    path = tmp_path / "GSE1_TPM.tsv.gz"
+    _tsv_gz_dataframe().to_csv(path, sep="\t", compression="gzip")
+
+    result = download.resolve_primary_expression_matrix([path], tmp_path)
+
+    assert result == (path, "tpm")
+    assert list(tmp_path.iterdir()) == [path]  # nothing new written
+
+
+def test_resolve_primary_expression_matrix_converts_csv_to_tsv_gz(tmp_path):
+    path = tmp_path / "GSE1_FPKM.csv.gz"
+    _tsv_gz_dataframe().to_csv(path, compression="gzip")
+
+    dest, unit = download.resolve_primary_expression_matrix([path], tmp_path)
+
+    assert dest == tmp_path / "GSE1_FPKM.tsv.gz"
+    assert unit == "fpkm"
+    result = pd.read_csv(dest, sep="\t", index_col=0)
+    assert result.loc["GENE1", "GSM1"] == 1.0
+
+
+def test_resolve_primary_expression_matrix_converts_xlsx_to_tsv_gz(tmp_path):
+    """Real shape: GSE310927/GSE277490/GSE197728/GSE161706 publish Excel."""
+    path = tmp_path / "GSE1_CPM.xlsx"
+    _tsv_gz_dataframe().to_excel(path)
+
+    dest, unit = download.resolve_primary_expression_matrix([path], tmp_path)
+
+    assert dest == tmp_path / "GSE1_CPM.tsv.gz"
+    assert unit == "cpm"
+    assert dest.name.lower().endswith(".tsv.gz")
+    result = pd.read_csv(dest, sep="\t")
+    assert result["GSM1"].tolist() == [1.0, 2.0]
+
+
+def test_resolve_primary_expression_matrix_extracts_matching_member_from_zip(tmp_path):
+    """Real-shaped scenario: a combined matrix published as a .zip archive
+    rather than a standalone file."""
+    zip_path = tmp_path / "GSE1_supplementary.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("GSE1_TPM_matrix.csv", _tsv_gz_dataframe().to_csv())
+        zf.writestr("readme.txt", "not a matrix")
+
+    dest, unit = download.resolve_primary_expression_matrix([zip_path], tmp_path)
+
+    assert dest == tmp_path / "GSE1_TPM_matrix.tsv.gz"
+    assert unit == "tpm"
+    result = pd.read_csv(dest, sep="\t", index_col=0)
+    assert result.loc["GENE1", "GSM1"] == 1.0
+
+
+def test_resolve_primary_expression_matrix_extracts_matching_member_from_tar(tmp_path):
+    """Real-shaped scenario: e.g. a "..._RAW.tar" that happens to also
+    contain the one real combined matrix alongside unrelated per-sample
+    fragments."""
+    tar_path = tmp_path / "GSE1_RAW.tar"
+    csv_bytes = _tsv_gz_dataframe().to_csv().encode()
+    with tarfile.open(tar_path, "w") as tf:
+        info = tarfile.TarInfo(name="GSE1_FPKM_combined.csv")
+        info.size = len(csv_bytes)
+        tf.addfile(info, io.BytesIO(csv_bytes))
+        gsm_bytes = b"gene,value\nGENE1,5\n"
+        info2 = tarfile.TarInfo(name="GSM1234567_sample.csv")
+        info2.size = len(gsm_bytes)
+        tf.addfile(info2, io.BytesIO(gsm_bytes))
+
+    dest, unit = download.resolve_primary_expression_matrix([tar_path], tmp_path)
+
+    assert dest == tmp_path / "GSE1_FPKM_combined.tsv.gz"
+    assert unit == "fpkm"
+
+
+def test_resolve_primary_expression_matrix_none_when_tar_only_has_per_sample_members(tmp_path):
+    """Real GSE108651/GSE215847/GSE236498/GSE236499/GSE286560 shape:
+    "..._RAW.tar" bundling only GSM-named per-sample fragments, no combined
+    matrix -- correctly nothing is extracted or picked."""
+    tar_path = tmp_path / "GSE1_RAW.tar"
+    with tarfile.open(tar_path, "w") as tf:
+        for i in range(1, 4):
+            data = f"gene,count\nGENE1,{i}\n".encode()
+            info = tarfile.TarInfo(name=f"GSM100000{i}_sample_counts.csv")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+
+    assert download.resolve_primary_expression_matrix([tar_path], tmp_path) is None
+
+
+def test_resolve_primary_expression_matrix_extracts_already_tsv_member_without_reparsing(tmp_path):
+    """An archive member that's already tab-separated is extracted verbatim
+    (byte copy), not round-tripped through pandas."""
+    zip_path = tmp_path / "GSE1_supplementary.zip"
+    original_bytes = b"gene\tGSM1\tGSM2\nGENE1\t1.5\t2.5\n"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("GSE1_counts.tsv", original_bytes)
+
+    dest, unit = download.resolve_primary_expression_matrix([zip_path], tmp_path)
+
+    assert dest == tmp_path / "GSE1_counts.tsv"
+    assert unit == "count"
+    assert dest.read_bytes() == original_bytes
 
 
 def make_microarray_gse():

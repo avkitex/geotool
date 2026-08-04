@@ -48,9 +48,13 @@ per leaf, each getting its own independent eligibility check.
 """
 from __future__ import annotations
 
+import gzip
+import io
 import json
 import os
 import re
+import tarfile
+import zipfile
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -271,6 +275,24 @@ def _is_data_file(path: Path) -> bool:
 _NON_MATRIX_KEYWORDS = ("diff", "deg", "significance", "clinical", "rmats", "dexseq", "novel_filtered")
 
 
+def _classify_candidate(name: str) -> tuple[int, str] | None:
+    """(rank, unit) if `name` (a filename, or an archive member name -- it
+    doesn't need to exist on disk) looks like a plausible primary expression
+    matrix, honoring the same exclusions select_primary_expression_file
+    documents; None otherwise. Factored out so archive members can be
+    ranked by the exact same rules as plain downloaded files (see
+    resolve_primary_expression_matrix).
+    """
+    candidate = Path(name)
+    lname = candidate.name.lower()
+    if _GSM_NAME_RE.search(candidate.name) or not _is_data_file(candidate) or any(k in lname for k in _NON_MATRIX_KEYWORDS):
+        return None
+    for rank, unit in enumerate(_QUANT_UNIT_PRIORITY):
+        if unit in lname:
+            return rank, unit
+    return None
+
+
 def select_primary_expression_file(paths: list[Path]) -> tuple[Path, str] | None:
     """Among downloaded RNA-seq supplementary files, pick the one that looks
     like the actual gene-expression quantification matrix, by
@@ -280,18 +302,17 @@ def select_primary_expression_file(paths: list[Path]) -> tuple[Path, str] | None
     data). Files named after an individual GSM accession (_GSM_NAME_RE),
     that aren't a plausible data file at all (_is_data_file), or that look
     like a derived comparison/analysis output rather than the matrix itself
-    (_NON_MATRIX_KEYWORDS) are never candidates.
+    (_NON_MATRIX_KEYWORDS) are never candidates. Doesn't look inside .zip/
+    .tar archives -- see resolve_primary_expression_matrix for that.
     """
     best: tuple[int, Path, str] | None = None
     for path in paths:
-        name = path.name.lower()
-        if _GSM_NAME_RE.search(path.name) or not _is_data_file(path) or any(k in name for k in _NON_MATRIX_KEYWORDS):
+        classified = _classify_candidate(path.name)
+        if classified is None:
             continue
-        for rank, unit in enumerate(_QUANT_UNIT_PRIORITY):
-            if unit in name:
-                if best is None or rank < best[0]:
-                    best = (rank, path, unit)
-                break
+        rank, unit = classified
+        if best is None or rank < best[0]:
+            best = (rank, path, unit)
     return (best[1], best[2]) if best else None
 
 
@@ -310,18 +331,167 @@ def _load_expression_file_for_qc(path: Path) -> pd.DataFrame | None:
         return None
 
 
-def check_rnaseq_expression_qc(paths: list[Path]) -> tuple[Path | None, str | None, list[str]]:
-    """select_primary_expression_file + probe_mapping.check_expression_qc on
-    whichever supplementary file that picks, for the common (one series- or
+# Submitters routinely bundle a series' supplementary files (or even the one
+# real combined matrix, alongside unrelated per-sample fragments) into an
+# archive rather than publishing it standalone -- e.g. a "..._RAW.tar".
+_ARCHIVE_EXTENSIONS = (".zip", ".tar", ".tar.gz", ".tgz")
+
+
+def _is_archive(path: Path) -> bool:
+    return path.name.lower().endswith(_ARCHIVE_EXTENSIONS)
+
+
+def _archive_member_names(path: Path) -> list[str]:
+    """Best-effort listing of every regular-file member inside a .zip/.tar/
+    .tar.gz/.tgz archive, without extracting anything yet -- cheap enough to
+    do for every archive, so only a member that's actually worth extracting
+    (see resolve_primary_expression_matrix) ever gets pulled out.
+    """
+    try:
+        if path.name.lower().endswith(".zip"):
+            with zipfile.ZipFile(path) as zf:
+                return [n for n in zf.namelist() if not n.endswith("/")]
+        with tarfile.open(path) as tf:
+            return [m.name for m in tf.getmembers() if m.isfile()]
+    except Exception:
+        return []
+
+
+def _extract_archive_member_bytes(path: Path, member_name: str) -> bytes | None:
+    try:
+        if path.name.lower().endswith(".zip"):
+            with zipfile.ZipFile(path) as zf:
+                return zf.read(member_name)
+        with tarfile.open(path) as tf:
+            extracted = tf.extractfile(member_name)
+            return extracted.read() if extracted else None
+    except Exception:
+        return None
+
+
+def _strip_known_extensions(name: str) -> str:
+    if name.lower().endswith(".gz"):
+        name = name[: -len(".gz")]
+    for ext in (".xlsx", ".xls", ".csv", ".tsv", ".txt"):
+        if name.lower().endswith(ext):
+            return name[: -len(ext)]
+    return name
+
+
+def _needs_tsv_conversion(name: str) -> bool:
+    """False for a file already in the guaranteed final format (plain,
+    gzip-or-not, tab-separated -- GEO's usual ".tsv"/".txt" convention);
+    True for anything that needs reformatting (Excel, comma-separated) or
+    that isn't even a standalone file yet (an archive member).
+    """
+    return not name.lower().endswith((".tsv.gz", ".txt.gz", ".tsv", ".txt"))
+
+
+def _read_dataframe_bytes(data: bytes, name: str) -> pd.DataFrame | None:
+    """Same best-effort sniffing as _load_expression_file_for_qc, but reading
+    from in-memory bytes (an already-extracted archive member) instead of a
+    file on disk.
+    """
+    try:
+        lname = name.lower()
+        if lname.endswith((".xlsx", ".xls")):
+            return pd.read_excel(io.BytesIO(data))
+        if lname.endswith(".gz"):
+            data = gzip.decompress(data)
+        return pd.read_csv(io.BytesIO(data), sep=None, engine="python")
+    except Exception:
+        return None
+
+
+def resolve_primary_expression_matrix(files: list[Path], out_dir: Path) -> tuple[Path, str] | None:
+    """Find this RNA-seq cohort's primary expression matrix among its
+    downloaded supplementary files -- including inside .zip/.tar/.tar.gz/
+    .tgz archives -- and guarantee the result is a plain, gzip-compressed,
+    tab-separated .tsv.gz file, regardless of how the submitter originally
+    published it (Excel, comma-separated, or packed inside an archive
+    alongside unrelated files). Pure format conversion only: rows/columns/
+    values are carried through exactly as submitted -- e.g. a transcript-
+    level file stays transcript-level, not aggregated to genes here (a
+    separate concern).
+
+    Returns (path, unit), or None if nothing recognizable was found (mirrors
+    select_primary_expression_file). A plain downloaded file that's already
+    an acceptable .tsv/.txt(.gz) is returned as-is, no new file written; an
+    Excel/CSV file, or a member pulled out of an archive, is written as a
+    new "<name>.tsv.gz" in out_dir (which should be the cohort's own
+    expression/ directory) alongside the original download -- nothing
+    already on disk is ever modified or deleted. If a candidate is found but
+    can't actually be parsed/converted, its (extracted, if needed) original
+    file is returned unconverted rather than None -- callers that go on to
+    parse it themselves (check_rnaseq_expression_qc) can still report
+    exactly which file and why, instead of that looking identical to "no
+    candidate found at all".
+    """
+    candidates = list(files)
+    archive_sources: dict[str, tuple[Path, str]] = {}  # virtual name -> (archive path, member name)
+    for path in files:
+        if not _is_archive(path):
+            continue
+        for member_name in _archive_member_names(path):
+            if _classify_candidate(member_name) is None:
+                continue
+            virtual_name = Path(member_name).name
+            candidates.append(Path(virtual_name))
+            archive_sources[virtual_name] = (path, member_name)
+
+    picked = select_primary_expression_file(candidates)
+    if picked is None:
+        return None
+    primary, unit = picked
+
+    if primary.name in archive_sources:
+        archive_path, member_name = archive_sources[primary.name]
+        data = _extract_archive_member_bytes(archive_path, member_name)
+        if data is None:
+            return None  # genuinely couldn't even extract -- no file to point to at all
+        source_name = Path(member_name).name
+        if not _needs_tsv_conversion(source_name):
+            dest = out_dir / source_name
+            if not dest.exists():
+                dest.write_bytes(data)
+            return dest, unit
+        df = _read_dataframe_bytes(data, source_name)
+        if df is None:
+            # Extracted fine but couldn't parse -- write the raw extracted
+            # bytes out under their own name so the caller still has a real
+            # file to point to and report "could not parse" against, same as
+            # the plain-file case below (rather than looking identical to
+            # "no candidate found at all").
+            dest = out_dir / source_name
+            if not dest.exists():
+                dest.write_bytes(data)
+            return dest, unit
+        dest = out_dir / f"{_strip_known_extensions(source_name)}.tsv.gz"
+        _write_matrix(df, dest, index=False)
+        return dest, unit
+
+    if not _needs_tsv_conversion(primary.name):
+        return primary, unit
+    df = _load_expression_file_for_qc(primary)
+    if df is None:
+        return primary, unit  # couldn't parse/convert -- return the original so the caller can still report it
+    dest = out_dir / f"{_strip_known_extensions(primary.name)}.tsv.gz"
+    _write_matrix(df, dest, index=False)
+    return dest, unit
+
+
+def check_rnaseq_expression_qc(paths: list[Path], out_dir: Path) -> tuple[Path | None, str | None, list[str]]:
+    """resolve_primary_expression_matrix + probe_mapping.check_expression_qc
+    on the resulting canonical .tsv.gz, for the common (one series- or
     sample-level matrix per series) case. Returns (primary_path, unit,
     qc_notes) -- primary_path/unit are None if nothing recognizable was
     found; qc_notes is empty if the file couldn't be parsed either (noted as
     its own entry) or nothing stood out.
     """
-    picked = select_primary_expression_file(paths)
-    if picked is None:
+    resolved = resolve_primary_expression_matrix(paths, out_dir)
+    if resolved is None:
         return None, None, []
-    primary_path, unit = picked
+    primary_path, unit = resolved
 
     matrix = _load_expression_file_for_qc(primary_path)
     if matrix is None:
@@ -717,7 +887,7 @@ def download_cohort(
         if not files:
             print(f"  {gse_id}: no supplementary expression files found")
         else:
-            primary_path, primary_unit, rnaseq_qc_notes = check_rnaseq_expression_qc(files)
+            primary_path, primary_unit, rnaseq_qc_notes = check_rnaseq_expression_qc(files, out_dir / "expression")
             if primary_path is not None:
                 result["primary_expression_file"] = str(primary_path)
                 result["primary_expression_unit"] = primary_unit

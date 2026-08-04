@@ -323,9 +323,20 @@ def maybe_log2_transform(matrix: pd.DataFrame) -> pd.DataFrame:
     return np.log2(matrix + 1)
 
 
+# A whole-transcriptome (or even a modest targeted-panel) gene-level matrix
+# always has far more features (rows) than samples (columns) -- thousands to
+# tens of thousands of genes vs. tens to a few hundred samples. More columns
+# than rows is a strong, submitter-naming-convention-independent signal that
+# a matrix has samples in rows and features in columns instead of the
+# expected orientation (this codebase's own build_probe_matrix/
+# aggregate_probes_to_genes always produce genes-as-rows; a submitter's own
+# RNA-seq file has no such guarantee).
+_MIN_ROWS_FOR_ORIENTATION_CHECK = 10
+
+
 def check_expression_qc(matrix: pd.DataFrame) -> list[str]:
     """Sanity-check a *final* expression matrix (any numeric orientation) for
-    two easy-to-miss problems, reported rather than auto-fixed here -- this
+    three easy-to-miss problems, reported rather than auto-fixed here -- this
     runs on data we didn't produce ourselves too (e.g. an RNA-seq
     supplementary file downloaded verbatim from the submitter), so silently
     mutating it isn't our call to make:
@@ -341,6 +352,10 @@ def check_expression_qc(matrix: pd.DataFrame) -> list[str]:
        where 0-count genes are common -- or the file isn't actually a raw
        expression matrix at all (e.g. a log-fold-change column from a
        differential-expression results table).
+    3. Looks transposed -- more columns than rows (see
+       _MIN_ROWS_FOR_ORIENTATION_CHECK), i.e. probably samples-as-rows /
+       features-as-columns instead of the expected genes-as-rows /
+       samples-as-columns.
 
     Returns human-readable notes, empty if nothing stood out.
     """
@@ -358,6 +373,13 @@ def check_expression_qc(matrix: pd.DataFrame) -> list[str]:
         notes.append(
             f"{n_negative} negative value(s) found -- possible log2 transform without a "
             "+1 pseudocount, or this isn't a raw/log2 expression matrix"
+        )
+
+    n_rows, n_cols = matrix.shape
+    if n_rows >= _MIN_ROWS_FOR_ORIENTATION_CHECK and n_cols > n_rows:
+        notes.append(
+            f"more columns ({n_cols}) than rows ({n_rows}) -- expected features (genes) as rows and "
+            "samples as columns; this matrix may be transposed"
         )
 
     return notes

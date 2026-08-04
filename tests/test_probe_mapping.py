@@ -381,6 +381,35 @@ def test_check_expression_qc_empty_matrix():
     assert probe_mapping.check_expression_qc(pd.DataFrame()) == []
 
 
+def test_check_expression_qc_flags_likely_transposed_matrix():
+    """15 "samples" (rows) x 20 "genes" (columns) -- the reverse of the
+    expected genes-as-rows/samples-as-columns orientation."""
+    matrix = pd.DataFrame(
+        np.random.default_rng(0).uniform(0, 10, size=(15, 20)),
+        columns=[f"GENE{i}" for i in range(20)],
+    )
+    notes = probe_mapping.check_expression_qc(matrix)
+    assert len(notes) == 1
+    assert "may be transposed" in notes[0]
+    assert "15" in notes[0] and "20" in notes[0]
+
+
+def test_check_expression_qc_clean_for_normal_orientation_even_with_many_genes():
+    """20 genes (rows) x 3 samples (columns) -- the expected orientation,
+    must not be flagged just because it happens to have few columns."""
+    matrix = pd.DataFrame(
+        np.random.default_rng(0).uniform(0, 10, size=(20, 3)), columns=["GSM1", "GSM2", "GSM3"]
+    )
+    assert probe_mapping.check_expression_qc(matrix) == []
+
+
+def test_check_expression_qc_skips_orientation_check_below_min_rows():
+    """A tiny matrix with more columns than rows isn't necessarily
+    transposed -- below _MIN_ROWS_FOR_ORIENTATION_CHECK, nothing is guessed."""
+    matrix = pd.DataFrame({"GSM1": [1.0, 2.0], "GSM2": [3.0, 4.0], "GSM3": [5.0, 6.0]})
+    assert probe_mapping.check_expression_qc(matrix) == []
+
+
 def test_aggregate_probes_to_genes_log2_transforms_raw_linear_scale_values():
     """Raw, untransformed microarray values (e.g. Affymetrix MAS5-style
     intensities in the hundreds) must come out log2(x + 1)-transformed at
