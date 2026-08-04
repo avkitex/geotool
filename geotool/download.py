@@ -224,15 +224,19 @@ def download_rnaseq_files(gse, out_dir: Path) -> list[Path]:
 
 
 # Quantification-unit keywords a supplementary filename might carry, ranked
-# best-first: TPM > FPKM > CPM > raw counts. An RNA-seq series routinely also
-# publishes non-matrix supplementary files alongside the real expression
-# matrix (differential-expression result tables, splicing-analysis output,
-# ...) -- live example, GSE163305: 4 supplementary files, only one
-# ("..._FPKM_....csv.gz") is an actual gene x sample matrix; the other 3 are
-# rMATS splicing output and a Cuffdiff-style DE table whose log2_fold_change
-# column is legitimately negative, which would be a false positive for
-# check_expression_qc below if it were treated as an expression matrix.
-_QUANT_UNIT_PRIORITY = ["tpm", "fpkm", "cpm", "counts"]
+# best-first: TPM > FPKM > RPKM (paired-end-normalized equivalent of FPKM,
+# ranked alongside it) > CPM > raw counts ("count", not "counts", so
+# "count_matrix"/"gene_count"-style singular names still match -- live
+# example, GSE273376's "..._count_matrix.csv.gz"). An RNA-seq series
+# routinely also publishes non-matrix supplementary files alongside the real
+# expression matrix (differential-expression result tables, splicing-
+# analysis output, ...) -- live example, GSE163305: 4 supplementary files,
+# only one ("..._FPKM_....csv.gz") is an actual gene x sample matrix; the
+# other 3 are rMATS splicing output and a Cuffdiff-style DE table whose
+# log2_fold_change column is legitimately negative, which would be a false
+# positive for check_expression_qc below if it were treated as an
+# expression matrix.
+_QUANT_UNIT_PRIORITY = ["tpm", "fpkm", "rpkm", "cpm", "count"]
 
 # A filename carrying its own GSM accession is inherently a per-sample
 # fragment, never a whole-cohort combined matrix, regardless of what
@@ -243,6 +247,19 @@ _QUANT_UNIT_PRIORITY = ["tpm", "fpkm", "cpm", "counts"]
 # misrepresent the whole cohort's data as if it were that one sample's.
 _GSM_NAME_RE = re.compile(r"GSM\d+", re.IGNORECASE)
 
+# Only these extensions (after stripping a trailing .gz) are ever plausible
+# for a delimited/Excel expression matrix -- live example, GSE161706's
+# "..._dexseq_count.py.gz": a compressed Python *script*, not data, that
+# would otherwise match the "count" unit keyword purely because of its name.
+_DATA_FILE_EXTENSIONS = (".txt", ".tsv", ".csv", ".xlsx", ".xls")
+
+
+def _is_data_file(path: Path) -> bool:
+    name = path.name.lower()
+    if name.endswith(".gz"):
+        name = name[: -len(".gz")]
+    return name.endswith(_DATA_FILE_EXTENSIONS)
+
 
 def select_primary_expression_file(paths: list[Path]) -> tuple[Path, str] | None:
     """Among downloaded RNA-seq supplementary files, pick the one that looks
@@ -250,12 +267,13 @@ def select_primary_expression_file(paths: list[Path]) -> tuple[Path, str] | None
     _QUANT_UNIT_PRIORITY -- (path, unit), or None if no filename carries a
     recognizable unit keyword at all (nothing is guessed at that point,
     rather than risk QC-checking an unrelated file as if it were expression
-    data). Files named after an individual GSM accession are never
-    candidates (see _GSM_NAME_RE).
+    data). Files named after an individual GSM accession (_GSM_NAME_RE) or
+    that aren't a plausible data file at all (_is_data_file) are never
+    candidates.
     """
     best: tuple[int, Path, str] | None = None
     for path in paths:
-        if _GSM_NAME_RE.search(path.name):
+        if _GSM_NAME_RE.search(path.name) or not _is_data_file(path):
             continue
         name = path.name.lower()
         for rank, unit in enumerate(_QUANT_UNIT_PRIORITY):

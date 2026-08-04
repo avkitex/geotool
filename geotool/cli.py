@@ -157,7 +157,7 @@ def download(gse_ids, from_report, rma_flag, force_flag):
 
     RNA-seq series get their supplementary expression file(s) downloaded as-is
     -- when there's more than one, the one that looks like the actual
-    quantification matrix (by filename: TPM > FPKM > CPM > raw counts) is
+    quantification matrix (by filename: TPM > FPKM > RPKM > CPM > raw counts) is
     additionally checked for two easy-to-miss problems and reported as
     "expression QC" notes: values that don't look log2-transformed (a linear-
     scale note, not necessarily wrong), and negative values (a real red flag

@@ -135,6 +135,34 @@ def test_select_primary_expression_file_prioritizes_fpkm_over_cpm():
     assert download.select_primary_expression_file(paths) == (Path("GSE1_FPKM.csv.gz"), "fpkm")
 
 
+def test_select_primary_expression_file_recognizes_rpkm():
+    """Real GSE246325 shape: "..._prmtRPKM.csv.gz" -- RPKM is FPKM's
+    single-end-read equivalent, ranked alongside it."""
+    paths = [Path("GSE1_CPM.txt.gz"), Path("GSE246325_prmtRPKM.csv.gz")]
+    assert download.select_primary_expression_file(paths) == (Path("GSE246325_prmtRPKM.csv.gz"), "rpkm")
+
+
+def test_select_primary_expression_file_recognizes_singular_count():
+    """Real GSE273376 shape: "..._count_matrix.csv.gz" -- the old "counts"
+    (plural-only) keyword missed this singular naming convention entirely."""
+    paths = [Path("GSE273376_pancreas_cell_lines.AM9747.count_matrix.csv.gz")]
+    assert download.select_primary_expression_file(paths) == (paths[0], "count")
+
+
+def test_select_primary_expression_file_excludes_non_data_extensions():
+    """Real GSE161706 shape: "..._dexseq_count.py.gz" is a compressed Python
+    *script*, not data -- it must not be picked just because its name
+    happens to contain "count"."""
+    paths = [
+        Path("GSE161706_dexseq_count.py.gz"),
+        Path("GSE161706_DEXseq.R.gz"),
+        Path("GSE161706_Processed_data_for_Table_S3_Figure_6.xlsx"),
+    ]
+    # The only actual data file has no recognizable unit keyword either --
+    # correctly nothing is picked, not the script.
+    assert download.select_primary_expression_file(paths) is None
+
+
 def test_select_primary_expression_file_none_when_no_recognizable_unit():
     """Real GSE163305 shape: two rMATS splicing-analysis files and a
     differential-expression results table -- none is a gene-expression
@@ -544,7 +572,7 @@ def test_download_cohort_reports_rnaseq_expression_qc_and_reuses_from_cache(monk
 
     result = download.download_cohort("GSE_RNASEQ_QC", series_dir=tmp_path)
 
-    assert result["primary_expression_unit"] == "counts"
+    assert result["primary_expression_unit"] == "count"
     assert result["primary_expression_file"] == str(tmp_path / "GSE_RNASEQ_QC" / "expression" / "GSE_RNASEQ_counts.tsv.gz")
     assert result["expression_qc_notes"] == ["GSE_RNASEQ_counts.tsv.gz: linear-scale, not log2-transformed (max value 16096.1)"]
     assert result["expression_status"] == clinical_annotate.EXPRESSION_STATUS_NOT_LOG2_TRANSFORMED
