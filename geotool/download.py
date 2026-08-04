@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -233,6 +234,15 @@ def download_rnaseq_files(gse, out_dir: Path) -> list[Path]:
 # check_expression_qc below if it were treated as an expression matrix.
 _QUANT_UNIT_PRIORITY = ["tpm", "fpkm", "cpm", "counts"]
 
+# A filename carrying its own GSM accession is inherently a per-sample
+# fragment, never a whole-cohort combined matrix, regardless of what
+# quantification-unit keyword also appears in it -- live example,
+# GSE236498/GSE236499: 12 "GSM*_gene_counts.txt.gz" files, one per sample,
+# no combined matrix at all. Without this exclusion, select_primary_
+# expression_file would pick one arbitrary sample's own file and silently
+# misrepresent the whole cohort's data as if it were that one sample's.
+_GSM_NAME_RE = re.compile(r"GSM\d+", re.IGNORECASE)
+
 
 def select_primary_expression_file(paths: list[Path]) -> tuple[Path, str] | None:
     """Among downloaded RNA-seq supplementary files, pick the one that looks
@@ -240,10 +250,13 @@ def select_primary_expression_file(paths: list[Path]) -> tuple[Path, str] | None
     _QUANT_UNIT_PRIORITY -- (path, unit), or None if no filename carries a
     recognizable unit keyword at all (nothing is guessed at that point,
     rather than risk QC-checking an unrelated file as if it were expression
-    data).
+    data). Files named after an individual GSM accession are never
+    candidates (see _GSM_NAME_RE).
     """
     best: tuple[int, Path, str] | None = None
     for path in paths:
+        if _GSM_NAME_RE.search(path.name):
+            continue
         name = path.name.lower()
         for rank, unit in enumerate(_QUANT_UNIT_PRIORITY):
             if unit in name:
@@ -261,6 +274,8 @@ def _load_expression_file_for_qc(path: Path) -> pd.DataFrame | None:
     a QC nice-to-have must never be able to fail a real download.
     """
     try:
+        if path.name.lower().endswith((".xlsx", ".xls")):
+            return pd.read_excel(path)
         return pd.read_csv(path, sep=None, engine="python", compression="infer")
     except Exception:
         return None

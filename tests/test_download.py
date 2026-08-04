@@ -159,6 +159,28 @@ def test_select_primary_expression_file_finds_fpkm_among_non_matrix_files():
     assert download.select_primary_expression_file(paths) == (Path("GSE163305_FPKM_6D_GSK6_DMSO.csv.gz"), "fpkm")
 
 
+def test_select_primary_expression_file_excludes_gsm_named_per_sample_files():
+    """Real GSE236498/GSE236499 shape: 12 "GSM*_gene_counts.txt.gz" files,
+    one per sample, no combined matrix -- none of these may be picked as if
+    one of them were the whole cohort's matrix, even though each matches the
+    "counts" keyword."""
+    paths = [
+        Path("GSM7548847_MCF-7_WT1_gene_counts.txt.gz"),
+        Path("GSM7548848_MCF-7_WT2_gene_counts.txt.gz"),
+        Path("GSM7548849_MCF-7_WT3_gene_counts.txt.gz"),
+    ]
+    assert download.select_primary_expression_file(paths) is None
+
+
+def test_select_primary_expression_file_still_finds_combined_matrix_among_gsm_named_files():
+    paths = [
+        Path("GSM7548847_MCF-7_WT1_gene_counts.txt.gz"),
+        Path("GSM7548848_MCF-7_WT2_gene_counts.txt.gz"),
+        Path("GSE236498_combined_TPM.txt.gz"),
+    ]
+    assert download.select_primary_expression_file(paths) == (Path("GSE236498_combined_TPM.txt.gz"), "tpm")
+
+
 def test_check_rnaseq_expression_qc_flags_linear_scale_fpkm_matrix(tmp_path):
     """Real GSE163305 FPKM matrix shape: nonnegative, max value in the
     thousands."""
@@ -205,6 +227,21 @@ def test_check_rnaseq_expression_qc_notes_unparseable_file(tmp_path):
     assert unit == "tpm"
     assert len(notes) == 1
     assert "could not parse" in notes[0]
+
+
+def test_check_rnaseq_expression_qc_reads_xlsx_files(tmp_path):
+    """Real shape: several PRMT5/MTAP cohorts (e.g. GSE310927, GSE277490)
+    publish their combined matrix as an .xlsx file rather than a
+    delimited/gzipped text file."""
+    path = tmp_path / "GSE310927_L3.6_EPZ_Prex_Combo_CPM.xlsx"
+    pd.DataFrame({"GSM1": [0.0, 999.0], "GSM2": [1.0, 500.0]}, index=["GENE1", "GENE2"]).to_excel(path)
+
+    primary_path, unit, notes = download.check_rnaseq_expression_qc([path])
+
+    assert primary_path == path
+    assert unit == "cpm"
+    assert len(notes) == 1
+    assert "not log2-transformed" in notes[0]
 
 
 def make_microarray_gse():
