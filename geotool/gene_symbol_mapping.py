@@ -27,6 +27,7 @@ compute_tpm is a separate, optional final step for raw-count matrices only.
 """
 from __future__ import annotations
 
+import random
 import re
 from pathlib import Path
 from typing import Literal, NamedTuple
@@ -39,14 +40,38 @@ _VERSION_SUFFIX_RE = re.compile(r"\.\d+$")
 _ENST_RE = re.compile(r"^ENST\d+$")
 _ENSG_RE = re.compile(r"^ENSG\d+$")
 
-# Fraction of a sampled identifier axis that must match a pattern (or be a
-# known symbol) before trusting the classification -- guards against a
-# handful of stray/malformed IDs flipping the verdict.
+# Kallisto/Salmon-style transcript FASTA headers pack several fields into one
+# pipe-delimited string: "ENST00000456328.2|ENSG00000223972.5|OTTHUMG...|
+# OTTHUMT...|transcript_name|gene_name|length|biotype" -- live example,
+# GSE264630. _composite_leading_id extracts just the leading ENST/ENSG field
+# so this classifies/maps like a normal identifier rather than "unknown".
+_COMPOSITE_ID_RE = re.compile(r"^(ENS[TG]\d+(?:\.\d+)?)\|")
+
+# Fraction of a sampled identifier axis that must match the ENST/ENSG regex
+# before trusting the classification -- these are exact pattern matches, so
+# a high bar is fine; a handful of stray malformed IDs shouldn't flip it.
 MIN_ID_MATCH_FRACTION = 0.5
 
+# A real, whole-transcriptome gene-symbol list only ever partially overlaps
+# any *single* reference's own current nomenclature -- verified live against
+# GSE273376's real (legitimate, submitter-supplied) gene_symbol column: only
+# ~58% of its ~60k symbols are an exact literal match to GENCODE v50's own
+# gene_symbol field (symbol aliases, withdrawn/renamed HGNC entries, and
+# genuinely reference-specific gene sets are all expected and normal). A
+# genuinely unrelated identifier scheme (Cufflinks XLOC_ loci, custom
+# repeat-annotation IDs) scores a clean 0% in the same check, so this can
+# stay far below MIN_ID_MATCH_FRACTION without risking a false positive.
+MIN_SYMBOL_MATCH_FRACTION = 0.2
+
 # Sampling every ID in a 50k-row matrix to classify its identifier axis is
-# wasted work; a few hundred is already a robust majority-vote sample.
+# wasted work; a few hundred is already a robust majority-vote sample --
+# must be a *random* sample, not the first N: real files are routinely
+# sorted (e.g. alphabetically), and a contiguous slice of a sorted gene list
+# is not representative of the whole (verified live: the first 500 rows of
+# GSE273376's alphabetically-sorted, ~58%-matching symbol list scored a
+# misleadingly low 31%, purely from landing in an unlucky alphabetic range).
 _CLASSIFY_SAMPLE_SIZE = 500
+_RANDOM_SEED = 0
 
 IdentifierType = Literal["transcript", "gene", "symbol", "unknown"]
 
@@ -57,6 +82,18 @@ def strip_version(value) -> str:
     cohort's own GENCODE/Ensembl version rarely matches this reference's.
     """
     return _VERSION_SUFFIX_RE.sub("", str(value))
+
+
+def canonical_id(value) -> str:
+    """strip_version, plus first unwrapping a Kallisto/Salmon-style
+    pipe-delimited composite header down to its leading ENST/ENSG field (see
+    _COMPOSITE_ID_RE) -- the form a cohort's own *identifier axis* values
+    come in. Reference-side IDs (already single, clean ENST/ENSG strings
+    straight from a GENCODE table) only ever need strip_version, not this.
+    """
+    text = str(value)
+    match = _COMPOSITE_ID_RE.match(text)
+    return strip_version(match.group(1) if match else text)
 
 
 class GencodeReference(NamedTuple):
@@ -113,21 +150,25 @@ def _match_fraction(values: list[str], pattern: re.Pattern) -> float:
 
 
 def detect_identifier_type(ids, reference: GencodeReference) -> IdentifierType:
-    """Classify a sample of `ids` (any iterable of raw identifier strings) as
-    Ensembl transcript, Ensembl gene, an already-known gene symbol, or
-    unrecognized -- majority-vote over a capped sample (_CLASSIFY_SAMPLE_SIZE),
-    not every value, since a whole-transcriptome matrix can have tens of
-    thousands of rows.
+    """Classify a *random* sample of `ids` (any iterable of raw identifier
+    strings, capped at _CLASSIFY_SAMPLE_SIZE -- a whole-transcriptome matrix
+    can have tens of thousands of rows) as Ensembl transcript, Ensembl gene,
+    an already-known gene symbol, or unrecognized.
     """
-    sample = [str(v) for v in list(ids)[:_CLASSIFY_SAMPLE_SIZE]]
-    stripped = [strip_version(v) for v in sample]
+    all_values = [str(v) for v in ids]
+    if len(all_values) > _CLASSIFY_SAMPLE_SIZE:
+        sample = random.Random(_RANDOM_SEED).sample(all_values, _CLASSIFY_SAMPLE_SIZE)
+    else:
+        sample = all_values
+
+    stripped = [canonical_id(v) for v in sample]
     if _match_fraction(stripped, _ENST_RE) >= MIN_ID_MATCH_FRACTION:
         return "transcript"
     if _match_fraction(stripped, _ENSG_RE) >= MIN_ID_MATCH_FRACTION:
         return "gene"
     if sample:
         known_fraction = sum(1 for v in sample if v in reference.known_symbols) / len(sample)
-        if known_fraction >= MIN_ID_MATCH_FRACTION:
+        if known_fraction >= MIN_SYMBOL_MATCH_FRACTION:
             return "symbol"
     return "unknown"
 
@@ -192,7 +233,7 @@ def convert_to_gene_symbols(matrix: pd.DataFrame, reference: GencodeReference) -
         note_prefix = "already gene symbols"
     else:
         mapping = reference.transcript_to_symbol if id_type == "transcript" else reference.gene_to_symbol
-        symbols = ids.astype(str).map(strip_version).map(mapping)
+        symbols = ids.astype(str).map(canonical_id).map(mapping)
         note_prefix = f"converted from {id_type} identifiers via GENCODE v{reference.version}"
 
     working = numeric.reset_index(drop=True).copy()

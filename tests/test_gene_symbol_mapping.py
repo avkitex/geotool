@@ -10,6 +10,19 @@ def test_strip_version():
     assert gsm.strip_version("ENSG00000223972") == "ENSG00000223972"  # already unversioned
 
 
+def test_canonical_id_unwraps_kallisto_salmon_composite_header():
+    """Real GSE264630 shape: "ENST00000456328.2|ENSG00000223972.5|OTTHUMG...
+    |OTTHUMT...|transcript_name|gene_name|length|biotype" -- extract just
+    the leading ENST field."""
+    composite = "ENST00000456328.2|ENSG00000223972.5|OTTHUMG00000000961.2|OTTHUMT00000362751.1|DDX11L1-202|DDX11L1|1657|processed_transcript"
+    assert gsm.canonical_id(composite) == "ENST00000456328"
+
+
+def test_canonical_id_plain_id_unaffected():
+    assert gsm.canonical_id("ENSG00000000003.18") == "ENSG00000000003"
+    assert gsm.canonical_id("TSPAN6") == "TSPAN6"
+
+
 def make_reference(
     gene_to_symbol=None, transcript_to_symbol=None, gene_length=None,
 ) -> gsm.GencodeReference:
@@ -82,6 +95,13 @@ def test_detect_identifier_type_transcript():
     assert gsm.detect_identifier_type(["ENST00000373020.9", "ENST00000373031.5"], _REF) == "transcript"
 
 
+def test_detect_identifier_type_composite_kallisto_header():
+    """Real GSE264630 shape: pipe-delimited Kallisto/Salmon transcript
+    FASTA headers -- still recognized as transcript IDs."""
+    composite = "ENST00000373020.9|ENSG00000000003.18|OTTHUMG1|OTTHUMT1|TSPAN6-001|TSPAN6|2206|protein_coding"
+    assert gsm.detect_identifier_type([composite, composite], _REF) == "transcript"
+
+
 def test_detect_identifier_type_gene():
     assert gsm.detect_identifier_type(["ENSG00000000003.18", "ENSG00000000005.7"], _REF) == "gene"
 
@@ -94,6 +114,29 @@ def test_detect_identifier_type_unknown():
     """Real GSE163305 shape: Cufflinks XLOC_ novel-locus IDs have no stable
     cross-reference to Ensembl at all -- must not be guessed at."""
     assert gsm.detect_identifier_type(["XLOC_000001", "XLOC_000002"], _REF) == "unknown"
+
+
+def test_detect_identifier_type_symbol_below_min_id_match_fraction_still_recognized():
+    """Real GSE273376 shape: a genuine, submitter-supplied gene-symbol list
+    only ever partially overlaps GENCODE's own current nomenclature (~58%
+    live-measured against real data) -- well below MIN_ID_MATCH_FRACTION
+    (0.5, meant for exact ENST/ENSG regex matches) but should still clear
+    the deliberately lower MIN_SYMBOL_MATCH_FRACTION."""
+    ref = make_reference(gene_to_symbol={f"ENSG{i:011d}": f"GENE{i}" for i in range(10)})
+    ids = [f"GENE{i}" for i in range(3)] + [f"UNMATCHED{i}" for i in range(7)]  # 30% known
+    assert gsm.detect_identifier_type(ids, ref) == "symbol"
+
+
+def test_detect_identifier_type_samples_randomly_not_just_the_first_n(monkeypatch):
+    """Real bug found live: sampling literally the first N rows of a sorted
+    file (e.g. alphabetical) can land in an unrepresentative run and
+    misclassify an otherwise-clearly-symbol column as unknown. A large,
+    unsorted-in-the-relevant-sense list where only the *tail* half is known
+    symbols must still classify correctly once sampled from throughout."""
+    monkeypatch.setattr(gsm, "_CLASSIFY_SAMPLE_SIZE", 100)
+    ref = make_reference(gene_to_symbol={f"ENSG{i:011d}": f"GENE{i}" for i in range(300)})
+    ids = [f"UNMATCHED{i}" for i in range(700)] + [f"GENE{i}" for i in range(300)]
+    assert gsm.detect_identifier_type(ids, ref) == "symbol"
 
 
 def test_locate_identifier_axis_prefers_index_when_recognizable():
@@ -148,6 +191,23 @@ def test_convert_to_gene_symbols_from_transcripts_sums_by_gene():
     assert row["GSM1"] == 15.0
     assert row["GSM2"] == 28.0
     assert "converted from transcript" in note
+
+
+def test_convert_to_gene_symbols_from_composite_kallisto_headers():
+    """Real GSE264630 shape: pipe-delimited transcript headers must still
+    map and sum correctly, not fall through to "unrecognized"."""
+    matrix = pd.DataFrame(
+        {"GSM1": [10.0, 5.0]},
+        index=[
+            "ENST00000373020.9|ENSG00000000003.18|OTTHUMG1|OTTHUMT1|TSPAN6-001|TSPAN6|2206|protein_coding",
+            "ENST00000373031.5|ENSG00000000003.18|OTTHUMG1|OTTHUMT2|TSPAN6-002|TSPAN6|1900|protein_coding",
+        ],
+    )
+    ref = make_reference(transcript_to_symbol={"ENST00000373020": "TSPAN6", "ENST00000373031": "TSPAN6"})
+    result, note = gsm.convert_to_gene_symbols(matrix, ref)
+    assert result is not None
+    assert list(result["gene_symbol"]) == ["TSPAN6"]
+    assert result.iloc[0]["GSM1"] == 15.0
 
 
 def test_convert_to_gene_symbols_from_genes_direct_mapping():
