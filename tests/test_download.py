@@ -177,6 +177,18 @@ def test_select_primary_expression_file_excludes_derived_comparison_files():
     assert download.select_primary_expression_file(paths) is None
 
 
+def test_select_primary_expression_file_excludes_original_backup_files():
+    """A "<name>.original.tsv.gz" backup sitting next to the real file it
+    was copied from (e.g. geotool.gene_symbol_mapping's in-place replacement
+    convention) must never compete with it -- live bug: both matched the
+    same "count" unit and tied, so whichever happened to come first in
+    filesystem listing order won nondeterministically."""
+    real = Path("GSE1_raw_counts.txt.gz")
+    backup = Path("GSE1_raw_counts.original.tsv.gz")
+    assert download.select_primary_expression_file([backup, real]) == (real, "count")
+    assert download.select_primary_expression_file([real, backup]) == (real, "count")
+
+
 def test_select_primary_expression_file_none_when_no_recognizable_unit():
     """Real GSE163305 shape: two rMATS splicing-analysis files and a
     differential-expression results table -- none is a gene-expression
