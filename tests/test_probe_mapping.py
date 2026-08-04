@@ -343,6 +343,44 @@ def test_maybe_log2_transform_leaves_already_log2_data_untouched():
     assert result["GSM1"].tolist() == [-4.68, 6.29]
 
 
+def test_check_expression_qc_flags_linear_scale_values():
+    """Real GSE163305 FPKM matrix shape: nonnegative, max value in the
+    thousands -- legitimate raw FPKM, but not log2-transformed."""
+    matrix = pd.DataFrame({"GSM1": [0.0, 1.5, 16096.1], "GSM2": [0.0, 0.25, 12677.3]})
+    notes = probe_mapping.check_expression_qc(matrix)
+    assert len(notes) == 1
+    assert "not log2-transformed" in notes[0]
+    assert "16096.1" in notes[0]
+
+
+def test_check_expression_qc_flags_negative_values():
+    matrix = pd.DataFrame({"GSM1": [-1.2, 3.0], "GSM2": [2.0, 5.0]})
+    notes = probe_mapping.check_expression_qc(matrix)
+    assert len(notes) == 1
+    assert "negative value" in notes[0]
+    assert "1 negative value(s)" in notes[0]
+
+
+def test_check_expression_qc_flags_both_when_both_present():
+    matrix = pd.DataFrame({"GSM1": [-1.0, 999.0]})
+    notes = probe_mapping.check_expression_qc(matrix)
+    assert len(notes) == 2
+
+
+def test_check_expression_qc_clean_for_well_formed_log2_data():
+    matrix = pd.DataFrame({"GSM1": [0.0, 4.5, 9.2], "GSM2": [1.1, 3.3, 8.8]})
+    assert probe_mapping.check_expression_qc(matrix) == []
+
+
+def test_check_expression_qc_ignores_non_numeric_columns():
+    matrix = pd.DataFrame({"gene_symbol": ["A1BG", "TP53"], "GSM1": [1.0, 2.0]})
+    assert probe_mapping.check_expression_qc(matrix) == []
+
+
+def test_check_expression_qc_empty_matrix():
+    assert probe_mapping.check_expression_qc(pd.DataFrame()) == []
+
+
 def test_aggregate_probes_to_genes_log2_transforms_raw_linear_scale_values():
     """Raw, untransformed microarray values (e.g. Affymetrix MAS5-style
     intensities in the hundreds) must come out log2(x + 1)-transformed at

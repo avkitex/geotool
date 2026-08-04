@@ -155,8 +155,16 @@ def download(gse_ids, from_report, rma_flag, force_flag):
 
     geotool download GSE10846 GSE339488
 
-    RNA-seq series get their supplementary expression file(s) downloaded as-is.
-    Microarray series get reshaped from each sample's probe values into a
+    RNA-seq series get their supplementary expression file(s) downloaded as-is
+    -- when there's more than one, the one that looks like the actual
+    quantification matrix (by filename: TPM > FPKM > CPM > raw counts) is
+    additionally checked for two easy-to-miss problems and reported as
+    "expression QC" notes: values that don't look log2-transformed (a linear-
+    scale note, not necessarily wrong), and negative values (a real red flag
+    -- often means log2 was applied without a +1 pseudocount, or the file
+    isn't actually a raw expression matrix). The same QC runs on microarray
+    series' expression.tsv.gz. Microarray series get reshaped from each
+    sample's probe values into a
     probes x samples matrix, then mapped to a genes x samples matrix via each
     platform's own annotation table. Two-channel Agilent samples that publish
     per-channel intensity columns also get channel1_expression.tsv.gz /
@@ -225,6 +233,11 @@ def download(gse_ids, from_report, rma_flag, force_flag):
                 click.echo(f"  RMA expression matrix: {result['expression_rma_path']}")
             if result.get("expression_files"):
                 click.echo(f"  expression files: {len(result['expression_files'])} downloaded")
+            if result.get("primary_expression_file"):
+                click.echo(f"  primary expression file ({result.get('primary_expression_unit')}): {result['primary_expression_file']}")
+            if result.get("expression_qc_notes"):
+                for note in result["expression_qc_notes"]:
+                    click.echo(f"  expression QC: {note}")
             click.echo(f"  annotation: {result['annotation_path']}")
 
 
