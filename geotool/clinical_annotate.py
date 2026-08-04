@@ -34,6 +34,7 @@ EXPRESSION_STATUS_NO_MATRIX = "no_expression_matrix"
 EXPRESSION_STATUS_UNPARSEABLE = "unparseable"
 EXPRESSION_STATUS_NOT_LOG2_TRANSFORMED = "not_log2_transformed"
 EXPRESSION_STATUS_NEGATIVE_VALUES = "negative_values"
+EXPRESSION_STATUS_LOOKS_TRANSPOSED = "looks_transposed"
 
 
 def classify_expression_status(qc_notes: list[str], has_matrix: bool) -> str:
@@ -61,6 +62,8 @@ def classify_expression_status(qc_notes: list[str], has_matrix: bool) -> str:
         tags.append(EXPRESSION_STATUS_NOT_LOG2_TRANSFORMED)
     if any("negative value" in note for note in qc_notes):
         tags.append(EXPRESSION_STATUS_NEGATIVE_VALUES)
+    if any("may be transposed" in note for note in qc_notes):
+        tags.append(EXPRESSION_STATUS_LOOKS_TRANSPOSED)
     return ";".join(tags) if tags else EXPRESSION_STATUS_OK
 
 SYSTEM_PROMPT = """You are cleaning up a GEO series' per-sample annotation table for a

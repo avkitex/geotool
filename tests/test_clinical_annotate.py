@@ -323,3 +323,8 @@ def test_classify_expression_status_joins_both_tags_when_both_present():
     ]
     status = ca.classify_expression_status(notes, has_matrix=True)
     assert status == f"{ca.EXPRESSION_STATUS_NOT_LOG2_TRANSFORMED};{ca.EXPRESSION_STATUS_NEGATIVE_VALUES}"
+
+
+def test_classify_expression_status_looks_transposed():
+    notes = ["expression.tsv.gz: more columns (20) than rows (15) -- expected features (genes) as rows and samples as columns; this matrix may be transposed"]
+    assert ca.classify_expression_status(notes, has_matrix=True) == ca.EXPRESSION_STATUS_LOOKS_TRANSPOSED
