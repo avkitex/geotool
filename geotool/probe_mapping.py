@@ -323,6 +323,46 @@ def maybe_log2_transform(matrix: pd.DataFrame) -> pd.DataFrame:
     return np.log2(matrix + 1)
 
 
+def check_expression_qc(matrix: pd.DataFrame) -> list[str]:
+    """Sanity-check a *final* expression matrix (any numeric orientation) for
+    two easy-to-miss problems, reported rather than auto-fixed here -- this
+    runs on data we didn't produce ourselves too (e.g. an RNA-seq
+    supplementary file downloaded verbatim from the submitter), so silently
+    mutating it isn't our call to make:
+
+    1. Not log2-transformed -- informational, not necessarily wrong (most
+       submitted RNA-seq FPKM/TPM/counts files are legitimately linear-scale)
+       -- same heuristic as needs_log2_transform (any value over
+       _LOG2_ALREADY_TRANSFORMED_MAX).
+    2. Negative values -- never valid for a raw or log2(x+1)-transformed
+       expression matrix. Most often means either log2(x) was applied
+       *without* the +1 pseudocount (log2 of a value between 0 and 1 goes
+       negative, log2(0) is -inf) -- a real risk specifically for RNA-seq,
+       where 0-count genes are common -- or the file isn't actually a raw
+       expression matrix at all (e.g. a log-fold-change column from a
+       differential-expression results table).
+
+    Returns human-readable notes, empty if nothing stood out.
+    """
+    numeric = matrix.select_dtypes(include="number")
+    if numeric.empty:
+        return []
+
+    notes = []
+    max_value = numeric.max(numeric_only=True).max()
+    if pd.notna(max_value) and max_value > _LOG2_ALREADY_TRANSFORMED_MAX:
+        notes.append(f"linear-scale, not log2-transformed (max value {max_value:.1f})")
+
+    n_negative = int((numeric < 0).to_numpy().sum())
+    if n_negative:
+        notes.append(
+            f"{n_negative} negative value(s) found -- possible log2 transform without a "
+            "+1 pseudocount, or this isn't a raw/log2 expression matrix"
+        )
+
+    return notes
+
+
 def build_probe_matrix(gse) -> pd.DataFrame:
     """Probes x samples matrix from every fetched sample's own data table
     (ID_REF -> VALUE). Samples with no data table (e.g. RNA-seq, handled via

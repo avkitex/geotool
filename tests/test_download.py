@@ -1,4 +1,6 @@
+import gzip
 import json
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -123,6 +125,88 @@ def test_download_rnaseq_files_skips_cel_supplementary_files(requests_mock, tmp_
     assert not any(name.endswith(".CEL.gz") for name in names)
 
 
+def test_select_primary_expression_file_prioritizes_tpm_over_fpkm_and_cpm():
+    paths = [Path("GSE1_counts.txt.gz"), Path("GSE1_CPM.txt.gz"), Path("GSE1_FPKM.csv.gz"), Path("GSE1_TPM.tsv.gz")]
+    assert download.select_primary_expression_file(paths) == (Path("GSE1_TPM.tsv.gz"), "tpm")
+
+
+def test_select_primary_expression_file_prioritizes_fpkm_over_cpm():
+    paths = [Path("GSE1_CPM.txt.gz"), Path("GSE1_FPKM.csv.gz")]
+    assert download.select_primary_expression_file(paths) == (Path("GSE1_FPKM.csv.gz"), "fpkm")
+
+
+def test_select_primary_expression_file_none_when_no_recognizable_unit():
+    """Real GSE163305 shape: two rMATS splicing-analysis files and a
+    differential-expression results table -- none is a gene-expression
+    quantification matrix."""
+    paths = [
+        Path("GSE163305_D6.RI.MATS.JC.txt.gz"),
+        Path("GSE163305_D6.SE.MATS.JC.txt.gz"),
+        Path("GSE163305_GSK_vs_DMSO_D6.csv.gz"),
+    ]
+    assert download.select_primary_expression_file(paths) is None
+
+
+def test_select_primary_expression_file_finds_fpkm_among_non_matrix_files():
+    """The real GSE163305 supplementary file set: only the FPKM file is an
+    actual expression matrix among 4 files."""
+    paths = [
+        Path("GSE163305_D6.RI.MATS.JC.txt.gz"),
+        Path("GSE163305_D6.SE.MATS.JC.txt.gz"),
+        Path("GSE163305_FPKM_6D_GSK6_DMSO.csv.gz"),
+        Path("GSE163305_GSK_vs_DMSO_D6.csv.gz"),
+    ]
+    assert download.select_primary_expression_file(paths) == (Path("GSE163305_FPKM_6D_GSK6_DMSO.csv.gz"), "fpkm")
+
+
+def test_check_rnaseq_expression_qc_flags_linear_scale_fpkm_matrix(tmp_path):
+    """Real GSE163305 FPKM matrix shape: nonnegative, max value in the
+    thousands."""
+    path = tmp_path / "GSE163305_FPKM_6D_GSK6_DMSO.csv.gz"
+    pd.DataFrame(
+        {"GSK6D_0": [0.0, 16096.1], "DMSO6D_0": [0.0, 12677.3]}, index=["XLOC_1", "XLOC_2"]
+    ).to_csv(path, compression="gzip")
+
+    primary_path, unit, notes = download.check_rnaseq_expression_qc([path])
+
+    assert primary_path == path
+    assert unit == "fpkm"
+    assert len(notes) == 1
+    assert path.name in notes[0]
+    assert "not log2-transformed" in notes[0]
+
+
+def test_check_rnaseq_expression_qc_flags_negative_values(tmp_path):
+    """The RNA-seq-specific risk called out by design: log2(x) applied
+    without a +1 pseudocount goes negative for x in (0, 1)."""
+    path = tmp_path / "GSE1_TPM.csv.gz"
+    pd.DataFrame({"GSM1": [-1.2, 3.0]}, index=["GENE1", "GENE2"]).to_csv(path, compression="gzip")
+
+    primary_path, unit, notes = download.check_rnaseq_expression_qc([path])
+
+    assert unit == "tpm"
+    assert len(notes) == 1
+    assert "negative value" in notes[0]
+
+
+def test_check_rnaseq_expression_qc_returns_nothing_when_no_matrix_file(tmp_path):
+    paths = [tmp_path / "some_de_table.csv.gz"]
+    primary_path, unit, notes = download.check_rnaseq_expression_qc(paths)
+    assert primary_path is None
+    assert unit is None
+    assert notes == []
+
+
+def test_check_rnaseq_expression_qc_notes_unparseable_file(tmp_path):
+    path = tmp_path / "broken_tpm.csv.gz"
+    path.write_bytes(b"not actually gzip-compressed data")
+    primary_path, unit, notes = download.check_rnaseq_expression_qc([path])
+    assert primary_path == path
+    assert unit == "tpm"
+    assert len(notes) == 1
+    assert "could not parse" in notes[0]
+
+
 def make_microarray_gse():
     metadata = {"geo_accession": ["GSE_ARRAY"], "title": ["An array series"], "summary": ["s"]}
     gsms = {
@@ -147,10 +231,11 @@ def test_build_and_map_expression_matrix_writes_both_files(monkeypatch, tmp_path
     ])
     monkeypatch.setattr(download.probe_mapping, "get_or_build_probe_gene_map", lambda gpl_id: fake_map)
 
-    expr_path = download.build_and_map_expression_matrix(gse, tmp_path)
+    expr_path, qc_notes = download.build_and_map_expression_matrix(gse, tmp_path)
 
     assert (tmp_path / "probe_matrix.tsv.gz").exists()
     assert expr_path == tmp_path / "expression.tsv.gz"
+    assert qc_notes == []
     genes = pd.read_csv(expr_path, sep="\t")
     assert set(genes["gene_symbol"]) == {"DDR1", "RFC2"}
 
@@ -394,6 +479,44 @@ def test_download_cohort_routes_rnaseq_and_writes_annotation(monkeypatch, tmp_pa
     assert (tmp_path / "GSE_RNASEQ" / "samples.tsv").exists()
     assert (tmp_path / "GSE_RNASEQ" / "annotation.tsv").exists()
     assert (tmp_path / "GSE_RNASEQ" / "expression").exists()
+
+
+def test_download_cohort_reports_rnaseq_expression_qc_and_reuses_from_cache(monkeypatch, tmp_path):
+    """Real GSE163305 shape: an FPKM matrix (linear-scale, so flagged) is the
+    only genuine expression file among its supplementary files."""
+    gse = make_rnaseq_gse()
+    gse.metadata["supplementary_file"].append("ftp://example.com/GSE_RNASEQ_notes.txt")
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)
+    monkeypatch.setattr(
+        download.clinical_annotate, "plan_column_mapping", lambda samples, model=None: clinical_annotate.ColumnMappingPlan()
+    )
+
+    fpkm_bytes = pd.DataFrame({"GSM1": [0.0, 16096.1]}, index=["GENE1", "GENE2"]).to_csv().encode()
+    fpkm_gz = gzip.compress(fpkm_bytes)
+
+    def fake_get(url, timeout=None):
+        class _Resp:
+            content = fpkm_gz if "counts" in url else b"unrelated notes file"
+
+            def raise_for_status(self):
+                pass
+
+        return _Resp()
+
+    monkeypatch.setattr(download.requests, "get", fake_get)
+
+    result = download.download_cohort("GSE_RNASEQ_QC", series_dir=tmp_path)
+
+    assert result["primary_expression_unit"] == "counts"
+    assert result["primary_expression_file"] == str(tmp_path / "GSE_RNASEQ_QC" / "expression" / "GSE_RNASEQ_counts.tsv.gz")
+    assert result["expression_qc_notes"] == ["GSE_RNASEQ_counts.tsv.gz: linear-scale, not log2-transformed (max value 16096.1)"]
+    assert (tmp_path / "GSE_RNASEQ_QC" / "expression_qc.json").exists()
+
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", _raise)
+    cached = download.download_cohort("GSE_RNASEQ_QC", series_dir=tmp_path)
+    assert cached["primary_expression_file"] == result["primary_expression_file"]
+    assert cached["primary_expression_unit"] == result["primary_expression_unit"]
+    assert cached["expression_qc_notes"] == result["expression_qc_notes"]
 
 
 def test_download_cel_files_downloads_only_cel_urls_keyed_by_gsm(requests_mock, tmp_path):

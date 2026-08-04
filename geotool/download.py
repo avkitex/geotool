@@ -105,6 +105,32 @@ def _load_channel_roles(out_dir: Path) -> dict | None:
         return json.load(f)
 
 
+def _write_expression_qc(out_dir: Path, primary_path: Path | None, primary_unit: str | None, qc_notes: list[str]) -> None:
+    """Sidecar for check_rnaseq_expression_qc/check_expression_qc's findings --
+    same reasoning as _write_channel_roles: only written when there's
+    actually something to say (a primary file was picked, and/or QC notes
+    exist), so both the fresh-download and cache-reuse paths can tell "was
+    this checked at all" from the file's mere existence.
+    """
+    if primary_path is None and not qc_notes:
+        return
+    payload = {
+        "primary_expression_file": str(primary_path) if primary_path else None,
+        "primary_expression_unit": primary_unit,
+        "notes": qc_notes,
+    }
+    with open(out_dir / "expression_qc.json", "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
+def _load_expression_qc(out_dir: Path) -> dict | None:
+    path = out_dir / "expression_qc.json"
+    if not path.exists():
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def _write_matrix(df: pd.DataFrame, path: Path, index: bool = True) -> None:
     """Write a probe/gene x sample matrix as gzip-compressed TSV.
 
@@ -196,12 +222,82 @@ def download_rnaseq_files(gse, out_dir: Path) -> list[Path]:
     return downloaded
 
 
-def build_and_map_expression_matrix(gse, out_dir: Path) -> Path | None:
-    """Probe matrix (raw) + gene-level matrix (mapped via probe_mapping.py)."""
+# Quantification-unit keywords a supplementary filename might carry, ranked
+# best-first: TPM > FPKM > CPM > raw counts. An RNA-seq series routinely also
+# publishes non-matrix supplementary files alongside the real expression
+# matrix (differential-expression result tables, splicing-analysis output,
+# ...) -- live example, GSE163305: 4 supplementary files, only one
+# ("..._FPKM_....csv.gz") is an actual gene x sample matrix; the other 3 are
+# rMATS splicing output and a Cuffdiff-style DE table whose log2_fold_change
+# column is legitimately negative, which would be a false positive for
+# check_expression_qc below if it were treated as an expression matrix.
+_QUANT_UNIT_PRIORITY = ["tpm", "fpkm", "cpm", "counts"]
+
+
+def select_primary_expression_file(paths: list[Path]) -> tuple[Path, str] | None:
+    """Among downloaded RNA-seq supplementary files, pick the one that looks
+    like the actual gene-expression quantification matrix, by
+    _QUANT_UNIT_PRIORITY -- (path, unit), or None if no filename carries a
+    recognizable unit keyword at all (nothing is guessed at that point,
+    rather than risk QC-checking an unrelated file as if it were expression
+    data).
+    """
+    best: tuple[int, Path, str] | None = None
+    for path in paths:
+        name = path.name.lower()
+        for rank, unit in enumerate(_QUANT_UNIT_PRIORITY):
+            if unit in name:
+                if best is None or rank < best[0]:
+                    best = (rank, path, unit)
+                break
+    return (best[1], best[2]) if best else None
+
+
+def _load_expression_file_for_qc(path: Path) -> pd.DataFrame | None:
+    """Best-effort read of an arbitrary submitter supplementary file for QC
+    purposes only -- format/delimiter varies a lot across submitters, so
+    this sniffs rather than assumes, and returns None (not raised) on
+    anything it can't parse. Never used for anything but check_expression_qc:
+    a QC nice-to-have must never be able to fail a real download.
+    """
+    try:
+        return pd.read_csv(path, sep=None, engine="python", compression="infer")
+    except Exception:
+        return None
+
+
+def check_rnaseq_expression_qc(paths: list[Path]) -> tuple[Path | None, str | None, list[str]]:
+    """select_primary_expression_file + probe_mapping.check_expression_qc on
+    whichever supplementary file that picks, for the common (one series- or
+    sample-level matrix per series) case. Returns (primary_path, unit,
+    qc_notes) -- primary_path/unit are None if nothing recognizable was
+    found; qc_notes is empty if the file couldn't be parsed either (noted as
+    its own entry) or nothing stood out.
+    """
+    picked = select_primary_expression_file(paths)
+    if picked is None:
+        return None, None, []
+    primary_path, unit = picked
+
+    matrix = _load_expression_file_for_qc(primary_path)
+    if matrix is None:
+        return primary_path, unit, [f"{primary_path.name}: could not parse for QC"]
+
+    notes = probe_mapping.check_expression_qc(matrix)
+    return primary_path, unit, [f"{primary_path.name}: {note}" for note in notes]
+
+
+def build_and_map_expression_matrix(gse, out_dir: Path) -> tuple[Path | None, list[str]]:
+    """Probe matrix (raw) + gene-level matrix (mapped via probe_mapping.py).
+
+    Returns (expression_path, qc_notes) -- qc_notes is
+    probe_mapping.check_expression_qc's report on the final gene-level
+    matrix (empty if nothing stood out).
+    """
     probe_matrix = probe_mapping.build_probe_matrix(gse)
     if probe_matrix.empty:
         print("    no per-sample data tables found; skipping expression matrix")
-        return None
+        return None, []
     _write_matrix(probe_matrix, out_dir / "probe_matrix.tsv.gz")
 
     # Usually one platform per series; handle the rare multi-platform case by
@@ -220,15 +316,16 @@ def build_and_map_expression_matrix(gse, out_dir: Path) -> Path | None:
 
     if not gene_frames:
         print("    no probe->gene mapping available for this platform; wrote probe_matrix.tsv.gz only")
-        return None
+        return None, []
 
     expression = gene_frames[0]
     for other in gene_frames[1:]:
         expression = expression.merge(other, on=["gene_symbol", "entrez_id"], how="outer")
 
+    qc_notes = probe_mapping.check_expression_qc(expression)
     expression_path = out_dir / "expression.tsv.gz"
     _write_matrix(expression, expression_path, index=False)
-    return expression_path
+    return expression_path, qc_notes
 
 
 def build_and_map_channel_expression_matrices(
@@ -460,6 +557,14 @@ def _cached_result(gse_id: str, out_dir: Path) -> tuple[dict, list[dict]] | None
         if files:
             result["expression_files"] = [str(p) for p in files]
 
+    expression_qc = _load_expression_qc(out_dir)
+    if expression_qc:
+        if expression_qc.get("primary_expression_file"):
+            result["primary_expression_file"] = expression_qc["primary_expression_file"]
+            result["primary_expression_unit"] = expression_qc.get("primary_expression_unit")
+        if expression_qc.get("notes"):
+            result["expression_qc_notes"] = expression_qc["notes"]
+
     return result, platform_details
 
 
@@ -553,14 +658,26 @@ def download_cohort(
 
     result = {"gse_id": gse_id, "assay_types": sorted(assay_types), "expression_path": None}
 
+    qc_notes: list[str] = []
+    primary_path: Path | None = None
+    primary_unit: str | None = None
+
     if assay_types & {"bulk_rnaseq", "scrnaseq"}:
         files = download_rnaseq_files(gse, out_dir)
         result["expression_files"] = [str(p) for p in files]
         if not files:
             print(f"  {gse_id}: no supplementary expression files found")
+        else:
+            primary_path, primary_unit, rnaseq_qc_notes = check_rnaseq_expression_qc(files)
+            if primary_path is not None:
+                result["primary_expression_file"] = str(primary_path)
+                result["primary_expression_unit"] = primary_unit
+            qc_notes.extend(rnaseq_qc_notes)
     elif "microarray" in assay_types:
-        expr_path = build_and_map_expression_matrix(gse, out_dir)
+        expr_path, expr_qc_notes = build_and_map_expression_matrix(gse, out_dir)
         result["expression_path"] = str(expr_path) if expr_path else None
+        if expr_path is not None:
+            qc_notes.extend(f"expression.tsv.gz: {note}" for note in expr_qc_notes)
         channel_paths, channel_roles = build_and_map_channel_expression_matrices(gse, out_dir, platform_details)
         if channel_paths:
             result["channel_expression_paths"] = {str(k): str(v) for k, v in channel_paths.items()}
@@ -576,6 +693,12 @@ def download_cohort(
             result["expression_rma_path"] = str(rma_path) if rma_path else None
     else:
         print(f"  {gse_id}: platform assay type(s) {sorted(assay_types)} not handled yet, skipping expression download")
+
+    if qc_notes:
+        result["expression_qc_notes"] = qc_notes
+        for note in qc_notes:
+            print(f"  {gse_id}: expression QC: {note}")
+    _write_expression_qc(out_dir, primary_path, primary_unit, qc_notes)
 
     plan = clinical_annotate.plan_column_mapping(samples)
     annotation = clinical_annotate.apply_column_mapping(samples, plan)
