@@ -302,6 +302,129 @@ def test_check_rnaseq_expression_qc_reads_xlsx_files(tmp_path):
     assert "not log2-transformed" in notes[0]
 
 
+# --- select_primary_expression_file_by_content: content-based fallback for a
+# real matrix whose filename carries no recognizable unit keyword at all ---
+
+def _big_matrix_dataframe(n_genes: int, n_samples: int) -> pd.DataFrame:
+    """A synthetic matrix big enough (_MIN_MATRIX_ROWS) to pass the
+    "is this even plausibly a real expression matrix" row-count sanity
+    check, with a caller-controlled sample-column count for the
+    column-count-vs-n_samples verification under test."""
+    return pd.DataFrame(
+        {f"GSM{i}": [1.0] * n_genes for i in range(n_samples)},
+        index=[f"GENE{i}" for i in range(n_genes)],
+    )
+
+
+def test_select_primary_expression_file_by_content_verifies_sole_candidate(tmp_path):
+    """Real GSE253260 shape: sole file "..._BACAP.rawct.tsv.gz" -- "rawct"
+    doesn't literally contain "count", so the filename-only path finds
+    nothing, but its column count (60671 genes x 397 samples) matches the
+    cohort's real sample count."""
+    path = tmp_path / "GSE253260_BACAP.rawct.tsv.gz"
+    _big_matrix_dataframe(1200, 397).to_csv(path, sep="\t", compression="gzip")
+
+    result = download.select_primary_expression_file_by_content([path], n_samples=397)
+
+    assert result == ([path], "unknown")
+
+
+def test_select_primary_expression_file_by_content_rejects_table_excerpt(tmp_path):
+    """Real GSE161706 shape: the sole remaining file after excluding script
+    files, "..._Processed_data_for_Table_S3_Figure_6.xlsx", parses to a
+    single descriptive text cell -- 0 data rows -- not the whole-cohort
+    matrix, even though it's the only candidate left. Must stay rejected
+    even with n_samples given, exactly like the filename-only path already
+    (correctly) rejects it."""
+    path = tmp_path / "GSE161706_Processed_data_for_Table_S3_Figure_6.xlsx"
+    pd.DataFrame({"note": ["a description sentence, not gene data"]}).to_excel(path, index=False)
+
+    assert download.select_primary_expression_file_by_content([path], n_samples=12) is None
+
+
+def test_select_primary_expression_file_by_content_rejects_column_count_mismatch(tmp_path):
+    """A real, big-enough matrix whose column count has nothing to do with
+    the cohort's sample count must not be picked just for being the sole
+    remaining candidate."""
+    path = tmp_path / "GSE1_some_other_cohorts_matrix.tsv.gz"
+    _big_matrix_dataframe(1200, 4).to_csv(path, sep="\t", compression="gzip")
+
+    assert download.select_primary_expression_file_by_content([path], n_samples=397) is None
+
+
+def test_select_primary_expression_file_by_content_sums_multiple_candidates(tmp_path):
+    """Real GSE293744 shape: two files, "Matrix-File1.txt.gz" (12 sample
+    columns) and "Matrix-File2.txt.gz" (36), neither alone matches the
+    cohort's 48 samples, but together they do -- two real batches, not
+    noise, live-verified against the real files (13/37 total columns
+    including one gene-ID column each, 12+36=48)."""
+    path1 = tmp_path / "GSE293744_Matrix-File1.txt.gz"
+    path2 = tmp_path / "GSE293744_Matrix-File2.txt.gz"
+    _big_matrix_dataframe(1200, 12).to_csv(path1, sep="\t", compression="gzip")
+    _big_matrix_dataframe(1200, 36).to_csv(path2, sep="\t", compression="gzip")
+
+    result = download.select_primary_expression_file_by_content([path1, path2], n_samples=48)
+
+    assert result is not None
+    assert set(result[0]) == {path1, path2}
+    assert result[1] == "unknown"
+
+
+def test_select_primary_expression_file_by_content_gives_up_beyond_five_candidates():
+    """More than 5 remaining candidates is too large a pool to confidently
+    sum an arbitrary subset against the sample count -- summing some subset
+    to hit the target by chance becomes a real risk rather than a signal."""
+    paths = [Path(f"GSE1_batch{i}.tsv.gz") for i in range(6)]
+    assert download.select_primary_expression_file_by_content(paths, n_samples=48) is None
+
+
+def test_check_rnaseq_expression_qc_uses_content_verification_when_no_unit_keyword(tmp_path):
+    """Integration: the whole check_rnaseq_expression_qc path picks up a
+    real matrix by content when resolve_primary_expression_matrix's
+    filename-only path finds nothing, given n_samples."""
+    path = tmp_path / "GSE172356_PDA_gene_expression_matrix.txt.gz"
+    _big_matrix_dataframe(1200, 62).to_csv(path, sep="\t", compression="gzip")
+
+    primary_path, unit, notes = download.check_rnaseq_expression_qc([path], tmp_path, n_samples=62)
+
+    assert primary_path == path
+    assert unit == "unknown"
+
+
+def test_check_rnaseq_expression_qc_notes_multi_file_sum_without_picking_primary(tmp_path):
+    """Real GSE131050 shape: two files, neither individually the whole
+    matrix, but their combined column count matches the sample count --
+    reported as an informational note pointing at both files rather than
+    silently guessing one of them is "the" primary (neither is)."""
+    path1 = tmp_path / "GSE131050_PurIST_Linehan_seq.tsv.gz"
+    path2 = tmp_path / "GSE131050_PurIST_Yeh_seq.tsv.gz"
+    _big_matrix_dataframe(1200, 66).to_csv(path1, sep="\t", compression="gzip")
+    _big_matrix_dataframe(1200, 125).to_csv(path2, sep="\t", compression="gzip")
+
+    primary_path, unit, notes = download.check_rnaseq_expression_qc([path1, path2], tmp_path, n_samples=191)
+
+    assert primary_path is None
+    assert unit is None
+    assert len(notes) == 1
+    assert path1.name in notes[0] and path2.name in notes[0]
+    assert "191" in notes[0]
+
+
+def test_check_rnaseq_expression_qc_still_rejects_no_matrix_file_with_n_samples(tmp_path):
+    """n_samples being given must not turn a genuinely-not-a-matrix file
+    into a false positive -- same real GSE161706 shape as the filename-only
+    regression test, but this time exercised with content verification
+    active (n_samples given) to confirm it doesn't override the row-count
+    floor."""
+    path = tmp_path / "GSE1_some_table.csv.gz"
+    pd.DataFrame({"note": ["not gene data"]}).to_csv(path, compression="gzip")
+
+    primary_path, unit, notes = download.check_rnaseq_expression_qc([path], tmp_path, n_samples=12)
+
+    assert primary_path is None
+    assert unit is None
+
+
 # --- resolve_primary_expression_matrix: the guaranteed-.tsv.gz-output fix ---
 
 def _tsv_gz_dataframe():
