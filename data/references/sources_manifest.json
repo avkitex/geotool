@@ -1,0 +1,30 @@
+{
+  "description": "Third-party source files this pipeline depends on. Too large (or too purely-derivative of an external download) to vendor into git; fetch_sources() in build_gencode_reference.py downloads and sha256-verifies each into `dest` on demand.",
+  "sources": [
+    {
+      "name": "gencode_v50_gtf",
+      "url": "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_50/gencode.v50.annotation.gtf.gz",
+      "dest": "gencode50/gencode.v50.annotation.gtf.gz",
+      "sha256": "83fba3e9b03f0b8c958f3595c6c350adc55f468abf8b0e47b6d5284cfe13a453",
+      "size_bytes": 124527720,
+      "note": "GENCODE release 50 comprehensive gene annotation, GRCh38.p14."
+    },
+    {
+      "name": "gencode_v50lift37_gtf",
+      "url": "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_50/GRCh37_mapping/gencode.v50lift37.annotation.gtf.gz",
+      "dest": "gencode50_hg19/gencode.v50lift37.annotation.gtf.gz",
+      "sha256": "29aaf3c2a04bd2497c46f2fb6328b21fd5f7160d4e399d4d75bb68d1a9d75388",
+      "size_bytes": 159680082,
+      "note": "GENCODE release 50 gene models, backmapped to GRCh37/hg19 coordinates."
+    },
+    {
+      "name": "intogen_drivers",
+      "url": "https://www.intogen.org/download?file=IntOGen-Drivers-20240920.zip",
+      "dest": "cancer_genes/IntOGen-Drivers-20240920.zip",
+      "sha256": "854def4465bcd7f90f0f8c7857dee9a4cf9da66a4c477c3fe4abeb510358a53c",
+      "size_bytes": 964758,
+      "note": "IntOGen compendium of cancer driver genes, release 2024-06-18, CC0 licensed.",
+      "unzip_to": "cancer_genes/"
+    }
+  ]
+}
