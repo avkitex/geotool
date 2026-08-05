@@ -1,4 +1,18 @@
-data/
+data/*
+# GENCODE/cancer-gene reference pipeline: small enough to track directly.
+# Raw third-party downloads (100-160MB GTFs, IntOGen zip) are the
+# exception -- reproducibly re-fetched by fetch_sources() from
+# sources_manifest.json, so they stay untracked. See
+# data/references/build_gencode_reference.py.
+!data/references/
+data/references/*
+!data/references/build_gencode_reference.py
+!data/references/sources_manifest.json
+!data/references/gencode32/
+!data/references/gencode50/
+!data/references/gencode50_hg19/
+data/references/gencode50/gencode.v50.annotation.gtf.gz
+data/references/gencode50_hg19/gencode.v50lift37.annotation.gtf.gz
 .env
 __pycache__/
 *.pyc
