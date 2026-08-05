@@ -127,6 +127,24 @@ class TestModeratedTtest:
         assert np.isfinite(result["t"]).all()
         assert np.isfinite(result["P.Value"]).all()
 
+    def test_uniform_gene_variance_does_not_crash_ebayes(self):
+        # regression test for a real bug in vendored InMoose (geotool/
+        # _vendor/inmoose/limma/ebayes.py): when every gene's residual
+        # variance agrees closely enough that df_prior is fit as scalar
+        # np.inf (no evidence of a finite prior -- exactly what happens
+        # when all genes share close to the same true variance, as here),
+        # `~` on the resulting native Python bool inverted it as an int
+        # (~True == -2) instead of negating it, which then got used as a
+        # DataFrame column position and raised KeyError: -2.
+        rng = np.random.default_rng(4)
+        samples = [f"s{i}" for i in range(6)]
+        group = ["control"] * 3 + ["treated"] * 3
+        expr = rng.normal(5, 0.1, size=(50, 6))  # tight, uniform noise across all genes
+        expression = pd.DataFrame(expr, index=[f"GENE{i}" for i in range(50)], columns=samples)
+        annotation = _annotation(sample=samples, group=group)
+        result = diffexp.two_group_diffexp(expression, annotation, "sample", "group")
+        assert np.isfinite(result["t"]).all()
+
     def test_group_coef_must_be_in_design(self):
         expression = pd.DataFrame({"s1": [1.0], "s2": [2.0]}, index=["g1"])
         design = pd.DataFrame({"Intercept": [1.0, 1.0]}, index=["s1", "s2"])
@@ -180,43 +198,3 @@ class TestTwoGroupDiffexp:
         )
         result = diffexp.two_group_diffexp(expression, annotation, "sample", "group")
         assert set(result.index) == {"g1", "g2"}
-
-
-class TestPriorVarianceHelpers:
-    def test_trigamma_inverse_round_trips(self):
-        from scipy import special
-
-        for target in (0.01, 0.1, 1.0, 5.0):
-            y = diffexp._trigamma_inverse(target)
-            assert special.polygamma(1, y) == pytest.approx(target, rel=1e-4)
-
-    def test_fit_prior_variance_floors_zero_variances_instead_of_dropping_them(self):
-        # real RNA-seq matrices routinely have genes with sigma2 == 0 exactly
-        # (e.g. a gene reading 0 TPM in every replicate of both groups).
-        # limma floors these to a small fraction of the median rather than
-        # excluding them from the prior fit -- dropping them instead (an
-        # earlier version of this function did) biases s0^2 upward by
-        # excluding precisely the lowest-variance half of genes.
-        rng = np.random.default_rng(3)
-        df_residual = 4
-        nonzero = rng.chisquare(df_residual, size=200) / df_residual * 0.01
-        sigma2 = np.concatenate([nonzero, np.zeros(200)])
-        with pytest.warns(UserWarning, match="zero residual variances"):
-            d0, s0_sq = diffexp._fit_prior_variance(sigma2, df_residual)
-        assert np.isfinite(d0)
-        assert s0_sq < np.median(nonzero) / 100  # pulled down hard by the floored zeros
-
-    def test_fit_prior_variance_warns_when_more_than_half_are_zero(self):
-        sigma2 = np.concatenate([np.array([1.0, 2.0, 3.0]), np.zeros(10)])
-        with pytest.warns(UserWarning, match="more than half"):
-            d0, s0_sq = diffexp._fit_prior_variance(sigma2, df_residual=4)
-        assert np.isfinite(s0_sq)
-
-    def test_fit_prior_variance_shrinks_toward_common_value_when_genes_agree(self):
-        rng = np.random.default_rng(2)
-        # all genes share the same true variance -- observed spread should
-        # be explainable by sampling noise alone, so d0 = inf.
-        df_residual = 6
-        sigma2 = rng.chisquare(df_residual, size=200) / df_residual * 2.0
-        d0, s0_sq = diffexp._fit_prior_variance(sigma2, df_residual)
-        assert s0_sq == pytest.approx(2.0, rel=0.3)
