@@ -132,17 +132,33 @@ def _fit_prior_variance(sigma2: np.ndarray, df_residual: float) -> tuple[float, 
     no larger than sampling noise alone predicts: there's no evidence of a
     finite prior to shrink toward, so every gene's posterior variance is
     just the common prior mean s0^2.
+
+    Genes with zero (or unexpressed-gene near-zero) residual variance are
+    common in real RNA-seq matrices -- e.g. a gene that reads exactly 0 TPM
+    in every replicate of both groups has sigma2 == 0 exactly. limma doesn't
+    drop these from the prior fit (that would bias s0^2 upward by excluding
+    precisely the lowest-variance genes); it floors them at a tiny fraction
+    of the median instead, same as here.
     """
-    sigma2 = sigma2[sigma2 > 0]
+    sigma2 = np.maximum(sigma2, 0)
+    median = np.median(sigma2)
+    if median == 0:
+        warnings.warn("more than half of residual variances are exactly zero -- eBayes moderation is unreliable")
+        median = 1.0
+    elif np.any(sigma2 == 0):
+        warnings.warn("zero residual variances detected -- offset away from zero before fitting the prior")
+    sigma2 = np.maximum(sigma2, 1e-5 * median)
+
     z = np.log(sigma2)
-    e = special.digamma(df_residual / 2) - np.log(df_residual / 2)
-    s0_sq = np.exp(np.mean(z) - e)
+    e = z - special.digamma(df_residual / 2) + np.log(df_residual / 2)
+    e_mean = np.mean(e)
 
     sampling_var = special.polygamma(1, df_residual / 2)  # trigamma(df/2)
-    excess_var = np.var(z, ddof=0) - sampling_var
+    excess_var = np.var(e, ddof=1) - sampling_var
     if excess_var <= 0:
-        return np.inf, s0_sq
+        return np.inf, np.mean(sigma2)  # pooled-variance MLE, matching limma's fitFDist
     d0 = 2 * _trigamma_inverse(excess_var)
+    s0_sq = np.exp(e_mean + special.digamma(d0 / 2) - np.log(d0 / 2))
     return d0, s0_sq
 
 

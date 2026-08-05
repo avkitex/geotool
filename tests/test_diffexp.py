@@ -109,6 +109,24 @@ class TestModeratedTtest:
         null_genes = result.loc[~result.index.isin(true_de_genes)]
         assert (null_genes["adj.P.Val"] < 0.05).mean() < 0.2  # FDR roughly controlled
 
+    def test_handles_zero_variance_genes_without_nan_or_inf(self):
+        # an unexpressed gene (identical value -- e.g. log2(0+1)=0 -- in
+        # every sample of both groups) has sigma2 == 0 exactly; this must
+        # not blow up the fit or poison other genes' results.
+        samples = [f"s{i}" for i in range(6)]
+        group = ["control"] * 3 + ["treated"] * 3
+        expression = pd.DataFrame(
+            {
+                "ZERO_VAR": [0.0] * 6,
+                "NORMAL": [5.0, 5.1, 4.9, 7.0, 7.1, 6.9],
+            },
+            index=samples,
+        ).T
+        annotation = _annotation(sample=samples, group=group)
+        result = diffexp.two_group_diffexp(expression, annotation, "sample", "group")
+        assert np.isfinite(result["t"]).all()
+        assert np.isfinite(result["P.Value"]).all()
+
     def test_group_coef_must_be_in_design(self):
         expression = pd.DataFrame({"s1": [1.0], "s2": [2.0]}, index=["g1"])
         design = pd.DataFrame({"Intercept": [1.0, 1.0]}, index=["s1", "s2"])
@@ -171,6 +189,28 @@ class TestPriorVarianceHelpers:
         for target in (0.01, 0.1, 1.0, 5.0):
             y = diffexp._trigamma_inverse(target)
             assert special.polygamma(1, y) == pytest.approx(target, rel=1e-4)
+
+    def test_fit_prior_variance_floors_zero_variances_instead_of_dropping_them(self):
+        # real RNA-seq matrices routinely have genes with sigma2 == 0 exactly
+        # (e.g. a gene reading 0 TPM in every replicate of both groups).
+        # limma floors these to a small fraction of the median rather than
+        # excluding them from the prior fit -- dropping them instead (an
+        # earlier version of this function did) biases s0^2 upward by
+        # excluding precisely the lowest-variance half of genes.
+        rng = np.random.default_rng(3)
+        df_residual = 4
+        nonzero = rng.chisquare(df_residual, size=200) / df_residual * 0.01
+        sigma2 = np.concatenate([nonzero, np.zeros(200)])
+        with pytest.warns(UserWarning, match="zero residual variances"):
+            d0, s0_sq = diffexp._fit_prior_variance(sigma2, df_residual)
+        assert np.isfinite(d0)
+        assert s0_sq < np.median(nonzero) / 100  # pulled down hard by the floored zeros
+
+    def test_fit_prior_variance_warns_when_more_than_half_are_zero(self):
+        sigma2 = np.concatenate([np.array([1.0, 2.0, 3.0]), np.zeros(10)])
+        with pytest.warns(UserWarning, match="more than half"):
+            d0, s0_sq = diffexp._fit_prior_variance(sigma2, df_residual=4)
+        assert np.isfinite(s0_sq)
 
     def test_fit_prior_variance_shrinks_toward_common_value_when_genes_agree(self):
         rng = np.random.default_rng(2)
