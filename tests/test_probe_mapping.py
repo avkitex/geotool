@@ -426,6 +426,154 @@ def test_check_expression_qc_skips_orientation_check_below_min_rows():
     assert probe_mapping.check_expression_qc(matrix) == []
 
 
+def test_normalize_expression_matrix_applies_log2_when_linear_scale():
+    matrix = pd.DataFrame({"gene_symbol": ["A1BG", "TP53"], "GSM1": [0.0, 16096.1], "GSM2": [1.5, 12677.3]})
+    fixed, notes = probe_mapping.normalize_expression_matrix(matrix)
+    assert len(notes) == 1 and "log2" in notes[0]
+    assert fixed["GSM1"].tolist() == pytest.approx(np.log2(matrix["GSM1"] + 1).tolist())
+    assert probe_mapping.check_expression_qc(fixed) == []
+
+
+def test_normalize_expression_matrix_no_changes_needed_returns_input_unchanged():
+    matrix = pd.DataFrame({"gene_symbol": ["A1BG", "TP53"], "GSM1": [1.0, 4.5], "GSM2": [2.0, 8.8]})
+    fixed, notes = probe_mapping.normalize_expression_matrix(matrix)
+    assert notes == []
+    assert fixed is matrix
+
+
+def test_normalize_expression_matrix_empty_matrix_returns_unchanged():
+    matrix = pd.DataFrame()
+    fixed, notes = probe_mapping.normalize_expression_matrix(matrix)
+    assert notes == []
+    assert fixed is matrix
+
+
+def test_normalize_expression_matrix_skips_log2_when_negative_values_present():
+    """Possible log-ratio data -- log2(negative) is undefined, so this must
+    be left for check_expression_qc's negative-value note instead of guessed
+    at here."""
+    matrix = pd.DataFrame({"gene_symbol": ["A1BG", "TP53"], "GSM1": [-1.2, 16096.1]})
+    fixed, notes = probe_mapping.normalize_expression_matrix(matrix)
+    assert notes == []
+    assert fixed["GSM1"].tolist() == [-1.2, 16096.1]
+
+
+def test_normalize_expression_matrix_drops_entrez_id_kept_alongside_gene_symbol():
+    """This codebase's own multi-platform-merge output: gene_symbol +
+    entrez_id (a *numeric* column) + sample columns -- entrez_id already
+    served its purpose as a merge key and must not be mistaken for a
+    sample."""
+    matrix = pd.DataFrame(
+        {"gene_symbol": ["A1BG", "TP53"], "entrez_id": [1.0, 7157.0], "GSM1": [1.0, 4.5], "GSM2": [2.0, 8.8]}
+    )
+    fixed, notes = probe_mapping.normalize_expression_matrix(matrix)
+    assert list(fixed.columns) == ["gene_symbol", "GSM1", "GSM2"]
+    assert len(notes) == 1 and "entrez_id" in notes[0]
+
+
+def test_normalize_expression_matrix_drops_featurecounts_style_annotation_columns():
+    """Real GSE208732/GSE243584 PDAC RNA-seq shape: several genomic-
+    annotation columns published alongside per-sample counts. Symbol
+    outranks gene_id in _ID_COLUMN_PRIORITY, so it's the one kept."""
+    matrix = pd.DataFrame(
+        {
+            "seqnames": ["chr1", "chr17"],
+            "strand": ["+", "-"],
+            "gene_id": ["ENSG1", "ENSG2"],
+            "Symbol": ["A1BG", "TP53"],
+            "HGNC": ["HGNC:1", "HGNC:2"],
+            "GSM1": [1.0, 4.5],
+            "GSM2": [2.0, 8.8],
+        }
+    )
+    fixed, notes = probe_mapping.normalize_expression_matrix(matrix)
+    assert list(fixed.columns) == ["Symbol", "GSM1", "GSM2"]
+    assert fixed["Symbol"].tolist() == ["A1BG", "TP53"]
+    assert len(notes) == 1 and "4 extra" in notes[0]
+
+
+def test_normalize_expression_matrix_drops_bare_row_number_column():
+    """Real GSE208732/GSE243584 shape: a literal "#" column right after the
+    gene symbol -- numeric, so dtype alone can't distinguish it from a
+    sample, but it's just a row number (1, 2, 3, ...)."""
+    matrix = pd.DataFrame(
+        {"Symbol": ["A1BG", "A1CF"], "#": [1, 2], "GSM1": [1.0, 4.5], "GSM2": [2.0, 8.8]}
+    )
+    fixed, notes = probe_mapping.normalize_expression_matrix(matrix)
+    assert list(fixed.columns) == ["Symbol", "GSM1", "GSM2"]
+    assert len(notes) == 1 and "#" in notes[0]
+
+
+def test_normalize_expression_matrix_refuses_to_gut_a_badly_parsed_file():
+    """Real GSE243850 shape: a two-row-header file ("Raw counts and
+    normalized read count") where pandas' single-row header parse leaves
+    almost every column unrecognized. Dropping "everything unrecognized"
+    here would gut the file down to 1 near-empty column instead of
+    correctly refusing to guess."""
+    columns = ["Unnamed: 0", "Unnamed: 1", "Raw count"] + [f"Unnamed: {i}" for i in range(3, 30)]
+    # object/string-typed, like the real file's mis-parsed header row landing
+    # as data (mixed with numeric rows below it, so pandas infers dtype=object)
+    matrix = pd.DataFrame([["x"] * len(columns), [0] * len(columns)], columns=columns)
+    fixed, notes = probe_mapping.normalize_expression_matrix(matrix)
+    assert len(notes) == 1 and "left unchanged" in notes[0]
+    assert list(fixed.columns) == columns
+
+
+def test_normalize_expression_matrix_recovers_gene_identifier_from_pandas_index():
+    """Real GSE242915 shape: the raw file's header row has one fewer field
+    than its data rows (no column label for the row-name column at all),
+    which makes pandas auto-detect that first field as the DataFrame's
+    index rather than a column. Left alone, every column looks like a
+    sample and the identifier is silently lost -- not "which column is the
+    ID" ambiguity, but no ID column present at all."""
+    matrix = pd.DataFrame(
+        {"pat_01_T": [0, 1], "pat_02_T": [2, 3]}, index=pd.Index(["DDX11L1", "WASH7P"])
+    )
+    fixed, notes = probe_mapping.normalize_expression_matrix(matrix)
+    assert any("pandas index" in n for n in notes)
+    assert list(fixed.columns) == ["gene_id", "pat_01_T", "pat_02_T"]
+    assert fixed["gene_id"].tolist() == ["DDX11L1", "WASH7P"]
+
+
+def test_normalize_expression_matrix_falls_back_to_first_column_when_no_keyword_matches():
+    """An unlabeled index column reads back as e.g. "Unnamed: 0" -- no
+    keyword matches, but positionally it's still the identifier axis."""
+    matrix = pd.DataFrame({"Unnamed: 0": ["A1BG", "TP53"], "GSM1": [1.0, 4.5]})
+    fixed, notes = probe_mapping.normalize_expression_matrix(matrix)
+    assert notes == []
+    assert list(fixed.columns) == ["Unnamed: 0", "GSM1"]
+
+
+def test_normalize_expression_matrix_transposes_samples_in_rows():
+    genes = [f"GENE{i}" for i in range(20)]
+    transposed = pd.DataFrame(
+        np.random.default_rng(0).uniform(0, 10, size=(15, 20)), columns=genes
+    )
+    transposed.insert(0, "sample_id", [f"S{i}" for i in range(15)])
+
+    fixed, notes = probe_mapping.normalize_expression_matrix(transposed)
+    assert len(notes) == 1 and "transposed" in notes[0]
+    assert fixed.shape == (20, 16)  # 20 genes x (1 id column + 15 samples)
+    assert set(fixed["gene_id"]) == set(genes)
+    assert probe_mapping.check_expression_qc(fixed.drop(columns="gene_id")) == []
+
+
+def test_normalize_expression_matrix_handles_all_three_problems_at_once():
+    """Real-world composite: extra annotation columns, transposed, and
+    linear-scale all at once."""
+    genes = [f"GENE{i}" for i in range(20)]
+    rng = np.random.default_rng(1)
+    matrix = pd.DataFrame(rng.integers(0, 100_000, size=(15, 20)), columns=genes)
+    matrix.insert(0, "sample_id", [f"S{i}" for i in range(15)])
+    matrix.insert(1, "batch", ["b1"] * 15)  # non-numeric extra column
+
+    fixed, notes = probe_mapping.normalize_expression_matrix(matrix)
+    assert len(notes) == 3
+    assert fixed.shape == (20, 16)
+    assert "batch" not in fixed.columns
+    assert probe_mapping.check_expression_qc(fixed.drop(columns="gene_id")) == []
+
+
 def test_aggregate_probes_to_genes_log2_transforms_raw_linear_scale_values():
     """Raw, untransformed microarray values (e.g. Affymetrix MAS5-style
     intensities in the hundreds) must come out log2(x + 1)-transformed at

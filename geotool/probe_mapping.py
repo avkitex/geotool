@@ -333,13 +333,84 @@ def maybe_log2_transform(matrix: pd.DataFrame) -> pd.DataFrame:
 # RNA-seq file has no such guarantee).
 _MIN_ROWS_FOR_ORIENTATION_CHECK = 10
 
+# Recognized gene-identifier column names, highest priority first -- used to
+# pick the one column normalize_expression_matrix keeps when a file has more
+# than one identifier-shaped column (e.g. this codebase's own gene_symbol +
+# entrez_id pair after a multi-platform merge, or a submitter's gene_id +
+# Symbol + HGNC). Matched case-insensitively as a substring against the
+# whole column name with separators normalized, so "Gene Symbol" and
+# "gene_symbol" both match "gene_symbol" -- safe here because these are all
+# specific/compound enough that no real gene *value* ever collides with one
+# as a column *name*.
+_ID_COLUMN_SUBSTRING_PRIORITY = [
+    "gene_symbol", "symbol", "gene_id", "geneid", "ensembl", "probe_id", "probeid", "id_ref",
+]
+
+# Shorter, generic identifier-column names that are only safe to match
+# *exactly* (not as a substring): a transposed matrix's gene names can
+# legitimately be column headers like "GENE0".."GENE20000" (this codebase's
+# own placeholder convention, and not unheard of as a real one), and
+# "gene" in _ID_COLUMN_SUBSTRING_PRIORITY would wrongly match every one of
+# those as "the identifier column" instead of letting the orientation check
+# catch the real problem.
+_ID_COLUMN_EXACT_PRIORITY = ["gene", "id", "name"]
+
+# Column names that are recognizable submitter/annotation metadata rather
+# than per-sample expression data -- dropped by normalize_expression_matrix
+# whenever they aren't the one column chosen as the identifier. Covers both
+# alternate identifier columns (a file with both "gene_id" and "Symbol" only
+# needs one) and pure annotation columns from featureCounts/htseq-style
+# files (seqnames/strand/biotype/etc., published alongside per-sample counts
+# in the same table -- live example: GSE208732/GSE243584's PDAC RNA-seq
+# count matrices). Substring-matched against column *names* (not values), so
+# the same "GENE0" collision risk above doesn't apply here.
+_METADATA_COLUMN_KEYWORDS = _ID_COLUMN_SUBSTRING_PRIORITY + [
+    "entrez", "seqnames", "chr", "chromosome", "strand", "start", "end", "width",
+    "biotype", "type_of_gene", "locus", "hgnc", "name", "length", "description", "annotation",
+]
+
+# Bare row-numbering columns -- e.g. a literal "#" column, seen live in
+# GSE208732/GSE243584's PDAC RNA-seq files right after the gene symbol
+# column -- are numeric and match no word-shaped keyword above, but are
+# just as much a non-sample column as any of them. Matched exactly (not as
+# a substring): unlike the keywords above, several of these are short
+# enough that a substring match risks colliding with a real column name.
+_METADATA_COLUMN_EXACT_KEYWORDS = ["#", "index", "no", "no.", "rownum", "row_number", "row_num"]
+
+
+def _normalize_column_name(name) -> str:
+    return re.sub(r"[\s_-]+", "_", str(name).strip().lower())
+
+
+def _pick_identifier_column(columns) -> object:
+    """The one column to keep as this matrix's row identifier: the highest-
+    priority match in _ID_COLUMN_SUBSTRING_PRIORITY (substring), then
+    _ID_COLUMN_EXACT_PRIORITY (exact name only), then the very first column
+    if nothing matches -- covers a plain/unlabeled index column read back
+    as "Unnamed: 0", or any other submitter naming convention not
+    recognized at all. Positionally, whatever's first is still the
+    identifier axis, not a second sample.
+    """
+    normalized = {col: _normalize_column_name(col) for col in columns}
+    for keyword in _ID_COLUMN_SUBSTRING_PRIORITY:
+        for col, norm in normalized.items():
+            if keyword in norm:
+                return col
+    for keyword in _ID_COLUMN_EXACT_PRIORITY:
+        for col, norm in normalized.items():
+            if norm == keyword:
+                return col
+    return columns[0]
+
 
 def check_expression_qc(matrix: pd.DataFrame) -> list[str]:
     """Sanity-check a *final* expression matrix (any numeric orientation) for
-    three easy-to-miss problems, reported rather than auto-fixed here -- this
-    runs on data we didn't produce ourselves too (e.g. an RNA-seq
-    supplementary file downloaded verbatim from the submitter), so silently
-    mutating it isn't our call to make:
+    three easy-to-miss problems. Called after normalize_expression_matrix
+    in every download path, so in practice this mostly catches whatever
+    that function couldn't safely auto-fix (negative values -- see below --
+    are never auto-corrected, since there's no way to tell a mis-transformed
+    matrix apart from a legitimate log-ratio one) or a matrix that never
+    went through normalize_expression_matrix at all:
 
     1. Not log2-transformed -- informational, not necessarily wrong (most
        submitted RNA-seq FPKM/TPM/counts files are legitimately linear-scale)
@@ -383,6 +454,118 @@ def check_expression_qc(matrix: pd.DataFrame) -> list[str]:
         )
 
     return notes
+
+
+def normalize_expression_matrix(matrix: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """The single place every *final* gene-level expression matrix -- any
+    platform, any assay type -- passes through immediately before being
+    written to disk, auto-fixing (not just reporting -- see
+    check_expression_qc for the report-only checks that remain) the three
+    problems real submitter files keep exhibiting:
+
+    1. Extra non-sample columns -- e.g. a featureCounts-style RNA-seq count
+       file's chromosome/strand/biotype annotation columns sitting right
+       alongside per-sample counts, or this codebase's own gene_symbol +
+       entrez_id pair once a multi-platform merge that needed both keys is
+       done with them. Every column matching a known identifier/annotation
+       name (see _METADATA_COLUMN_KEYWORDS) other than the one column
+       _pick_identifier_column chooses is dropped -- a numeric column like
+       "entrez_id" is metadata here too, not a second sample, even though
+       its dtype alone can't tell it apart from a real sample column.
+    2. Transposed orientation (samples as rows, genes as columns) --
+       detected the same way check_expression_qc always has (more sample
+       columns than gene rows, on a whole-transcriptome-sized matrix, see
+       _MIN_ROWS_FOR_ORIENTATION_CHECK), fixed by transposing back.
+    3. Linear-scale (not log2) values -- log2(x + 1), the same
+       maybe_log2_transform already applied at the gene level for
+       microarray data, now applied uniformly to every platform's final
+       matrix here. Skipped if the matrix already has negative values (a
+       real log-ratio dataset, or a previous bad transform) -- log2 of a
+       negative number is undefined, and guessing which case it is isn't
+       safe; check_expression_qc's negative-value note is what surfaces
+       that instead.
+
+    Returns (fixed_matrix, notes) describing what was actually changed --
+    empty if nothing needed fixing. `matrix` is expected to have the row
+    identifier as its first (or otherwise identifiable, see
+    _pick_identifier_column) column, not as a pandas index -- the
+    index=False convention every _write_matrix(..., index=False) call in
+    this codebase already uses -- but a non-default index is recovered into
+    a column first regardless (see below), rather than assumed away.
+    """
+    if matrix.empty:
+        return matrix, []
+
+    notes: list[str] = []
+    # A file whose header row has one fewer field than its data rows (a
+    # common real convention: no header label for the row-name column at
+    # all) makes pandas auto-detect that first field as the index rather
+    # than a column -- live example: GSE242915's raw counts file. Recovered
+    # into a real column so it isn't mistaken for having no identifier
+    # column at all (which would silently make the first *sample* column
+    # look like the identifier instead).
+    if not matrix.index.equals(pd.RangeIndex(len(matrix))):
+        notes.append("gene identifier was a pandas index (no column header for it in the source file) -- recovered as a column")
+        matrix = matrix.reset_index()
+        if matrix.columns[0] == "index":
+            matrix = matrix.rename(columns={"index": "gene_id"})
+    columns = list(matrix.columns)
+    id_col = _pick_identifier_column(columns)
+    normalized_names = {col: _normalize_column_name(col) for col in columns}
+    extra_cols = [
+        col for col in columns
+        if col != id_col
+        and (
+            not pd.api.types.is_numeric_dtype(matrix[col])
+            or any(kw in normalized_names[col] for kw in _METADATA_COLUMN_KEYWORDS)
+            or normalized_names[col] in _METADATA_COLUMN_EXACT_KEYWORDS
+        )
+    ]
+    # Dropping to fewer than 2 remaining sample columns (from more than a
+    # couple of candidates) means something deeper is wrong with how this
+    # file was parsed -- not "a few annotation columns to prune" but likely
+    # a multi-row header pandas read as data (live example: GSE243850's
+    # "Raw counts and normalized read count" file, where the real header
+    # was row 2, not row 1, so almost every column looked unrecognizable
+    # and the sole "identifier" column that survived held row numbers, not
+    # genes). Guessing further here risks silently destroying the file
+    # instead of just failing to improve it, so this bails out with nothing
+    # touched rather than dropping ~everything.
+    if extra_cols and len(columns) > 3 and len(columns) - len(extra_cols) - 1 < 2:
+        notes.append(
+            f"{len(extra_cols)} of {len(columns) - 1} non-identifier columns look like metadata, leaving "
+            "fewer than 2 recognizable sample columns -- matrix left unchanged, may need manual inspection "
+            "(e.g. a multi-row header)"
+        )
+        return matrix, notes
+    if extra_cols:
+        notes.append(f"dropped {len(extra_cols)} extra non-sample column(s): {extra_cols}")
+        matrix = matrix[[id_col] + [c for c in columns if c not in extra_cols and c != id_col]]
+
+    sample_cols = [c for c in matrix.columns if c != id_col]
+    n_rows, n_samples = matrix.shape[0], len(sample_cols)
+    if n_rows >= _MIN_ROWS_FOR_ORIENTATION_CHECK and n_samples > n_rows:
+        notes.append(
+            f"transposed ({n_rows} rows, {n_samples} sample column(s)) -- samples were in rows, "
+            "features in columns; transposed back"
+        )
+        matrix = matrix.set_index(id_col).transpose()
+        matrix.index.name = "gene_id"
+        matrix = matrix.reset_index()
+        id_col = "gene_id"
+        sample_cols = [c for c in matrix.columns if c != id_col]
+
+    sample_values = matrix[sample_cols]
+    if not sample_values.empty and (sample_values.to_numpy() < 0).any():
+        return matrix, notes  # possible log-ratio data -- see check_expression_qc instead
+
+    if needs_log2_transform(sample_values):
+        max_value = sample_values.max(numeric_only=True).max()
+        notes.append(f"linear-scale values (max {max_value:.1f}) -- applied log2(x + 1)")
+        matrix = matrix.copy()
+        matrix[sample_cols] = maybe_log2_transform(sample_values)
+
+    return matrix, notes
 
 
 def build_probe_matrix(gse) -> pd.DataFrame:

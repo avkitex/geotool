@@ -53,6 +53,7 @@ import io
 import json
 import os
 import re
+import shutil
 import tarfile
 import zipfile
 from pathlib import Path
@@ -509,31 +510,64 @@ def _read_dataframe_bytes(data: bytes, name: str) -> pd.DataFrame | None:
         return None
 
 
+def _write_normalized_expression_matrix(df: pd.DataFrame, dest: Path, source: Path | None = None) -> None:
+    """probe_mapping.normalize_expression_matrix (the one place every final
+    expression matrix -- any platform -- gets its orientation/log2-scale/
+    extra-columns problems auto-fixed, not just reported) + _write_matrix,
+    the shared last step for every branch of resolve_primary_expression_matrix.
+
+    `source` is the file `dest` would overwrite, if any (the "already a
+    plain .tsv.gz, no format conversion needed" branch reuses the same
+    path for both). When normalization actually changes something and
+    source == dest, the original is preserved first as
+    "<name>.original.tsv.gz" -- nothing already on disk is silently
+    overwritten without a backup. If nothing needed fixing and there's no
+    new file to create (source == dest), the file is left untouched
+    entirely rather than rewritten with identical content.
+    """
+    fixed, notes = probe_mapping.normalize_expression_matrix(df)
+    for note in notes:
+        print(f"    {dest.name}: {note}")
+    if not notes and source is not None and source == dest:
+        return
+    if notes and source is not None and source == dest:
+        backup = dest.parent / f"{_strip_known_extensions(dest.name)}.original.tsv.gz"
+        if not backup.exists():
+            shutil.copy2(source, backup)
+    _write_matrix(fixed, dest, index=False)
+
+
 def resolve_primary_expression_matrix(
     files: list[Path], out_dir: Path, n_samples: int | None = None
 ) -> tuple[Path, str] | None:
     """Find this RNA-seq cohort's primary expression matrix among its
     downloaded supplementary files -- including inside .zip/.tar/.tar.gz/
     .tgz archives -- and guarantee the result is a plain, gzip-compressed,
-    tab-separated .tsv.gz file, regardless of how the submitter originally
-    published it (Excel, comma-separated, or packed inside an archive
-    alongside unrelated files). Pure format conversion only: rows/columns/
-    values are carried through exactly as submitted -- e.g. a transcript-
-    level file stays transcript-level, not aggregated to genes here (a
-    separate concern).
+    tab-separated .tsv.gz file with genes as rows, samples as columns,
+    log2(x + 1)-scale values, and no extra non-sample columns, regardless of
+    how the submitter originally published it (Excel, comma-separated,
+    packed inside an archive alongside unrelated files, transposed, linear-
+    scale, or decorated with genomic-annotation columns alongside per-sample
+    counts -- see probe_mapping.normalize_expression_matrix, applied to
+    every branch below via _write_normalized_expression_matrix). Row/column
+    *identity* is never changed beyond that -- e.g. a transcript-level file
+    stays transcript-level, not aggregated to genes here (a separate
+    concern).
 
     Returns (path, unit), or None if nothing recognizable was found (mirrors
     select_primary_expression_file). A plain downloaded file that's already
-    an acceptable .tsv/.txt(.gz) is returned as-is, no new file written; an
-    Excel/CSV file, or a member pulled out of an archive, is written as a
-    new "<name>.tsv.gz" in out_dir (which should be the cohort's own
-    expression/ directory) alongside the original download -- nothing
-    already on disk is ever modified or deleted. If a candidate is found but
-    can't actually be parsed/converted, its (extracted, if needed) original
-    file is returned unconverted rather than None -- callers that go on to
-    parse it themselves (check_rnaseq_expression_qc) can still report
-    exactly which file and why, instead of that looking identical to "no
-    candidate found at all".
+    a properly-shaped .tsv/.txt(.gz) is left untouched, no new file written;
+    otherwise (a fix was needed, or the format itself needed converting from
+    Excel/CSV/an archive member) the result is written as a new
+    "<name>.tsv.gz" in out_dir (the cohort's own expression/ directory) --
+    alongside, not over, the original download, which is preserved as
+    "<name>.original.tsv.gz" if a fix meant overwriting its own filename (see
+    _write_normalized_expression_matrix). If a candidate is found but can't
+    actually be parsed/converted, its (extracted, if needed) original file
+    is returned unconverted rather than None -- callers that go on to parse
+    it themselves (check_rnaseq_expression_qc) can still report exactly
+    which file and why, instead of that looking identical to "no candidate
+    found at all".
 
     When no filename carries a recognizable unit keyword and `n_samples` is
     given, falls back to select_primary_expression_file_by_content -- but
@@ -575,6 +609,9 @@ def resolve_primary_expression_matrix(
             dest = out_dir / source_name
             if not dest.exists():
                 dest.write_bytes(data)
+            df = _read_dataframe_bytes(data, source_name)
+            if df is not None:
+                _write_normalized_expression_matrix(df, dest, source=dest)
             return dest, unit
         df = _read_dataframe_bytes(data, source_name)
         if df is None:
@@ -588,16 +625,20 @@ def resolve_primary_expression_matrix(
                 dest.write_bytes(data)
             return dest, unit
         dest = out_dir / f"{_strip_known_extensions(source_name)}.tsv.gz"
-        _write_matrix(df, dest, index=False)
+        _write_normalized_expression_matrix(df, dest, source=None)
         return dest, unit
 
     if not _needs_tsv_conversion(primary.name):
+        df = _load_expression_file_for_qc(primary)
+        if df is None:
+            return primary, unit  # couldn't parse -- leave untouched, same as before
+        _write_normalized_expression_matrix(df, primary, source=primary)
         return primary, unit
     df = _load_expression_file_for_qc(primary)
     if df is None:
         return primary, unit  # couldn't parse/convert -- return the original so the caller can still report it
     dest = out_dir / f"{_strip_known_extensions(primary.name)}.tsv.gz"
-    _write_matrix(df, dest, index=False)
+    _write_normalized_expression_matrix(df, dest, source=None)
     return dest, unit
 
 
@@ -716,7 +757,8 @@ def build_and_map_expression_matrix(gse, out_dir: Path) -> tuple[Path | None, li
     for other in gene_frames[1:]:
         expression = expression.merge(other, on=["gene_symbol", "entrez_id"], how="outer")
 
-    qc_notes = probe_mapping.check_expression_qc(expression)
+    expression, fix_notes = probe_mapping.normalize_expression_matrix(expression)
+    qc_notes = fix_notes + probe_mapping.check_expression_qc(expression)
     expression_path = out_dir / "expression.tsv.gz"
     _write_matrix(expression, expression_path, index=False)
     return expression_path, qc_notes
@@ -797,6 +839,9 @@ def build_and_map_channel_expression_matrices(
         for other in gene_frames[1:]:
             expression = expression.merge(other, on=["gene_symbol", "entrez_id"], how="outer")
 
+        expression, fix_notes = probe_mapping.normalize_expression_matrix(expression)
+        for note in fix_notes:
+            print(f"    channel{channel_num}_expression.tsv.gz: {note}")
         expression_path = out_dir / f"channel{channel_num}_expression.tsv.gz"
         _write_matrix(expression, expression_path, index=False)
         result[channel_num] = expression_path
@@ -924,6 +969,9 @@ def build_and_renormalize_expression_matrix(
     for other in gene_frames[1:]:
         expression = expression.merge(other, on=["gene_symbol", "entrez_id"], how="outer")
 
+    expression, fix_notes = probe_mapping.normalize_expression_matrix(expression)
+    for note in fix_notes:
+        print(f"    expression_rma.tsv.gz: {note}")
     expression_path = out_dir / "expression_rma.tsv.gz"
     _write_matrix(expression, expression_path, index=False)
     return expression_path
