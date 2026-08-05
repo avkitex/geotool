@@ -289,6 +289,23 @@ def _is_data_file(path: Path) -> bool:
 _NON_MATRIX_KEYWORDS = ("diff", "deg", "significance", "clinical", "rmats", "dexseq", "novel_filtered", ".original")
 
 
+def _passes_basic_matrix_filters(name: str) -> bool:
+    """True if `name` isn't disqualified outright as a per-sample fragment, a
+    non-data file, or a derived comparison/analysis output -- the same
+    exclusions _classify_candidate applies, minus the unit-keyword check.
+    Factored out so a candidate with no recognizable unit keyword can still
+    be considered by content (see select_primary_expression_file_by_content)
+    using the exact same disqualification rules, without also matching
+    obviously-wrong files like a splicing-analysis script or a per-sample
+    fragment.
+    """
+    candidate = Path(name)
+    lname = candidate.name.lower()
+    return not (
+        _GSM_NAME_RE.search(candidate.name) or not _is_data_file(candidate) or any(k in lname for k in _NON_MATRIX_KEYWORDS)
+    )
+
+
 def _classify_candidate(name: str) -> tuple[int, str] | None:
     """(rank, unit) if `name` (a filename, or an archive member name -- it
     doesn't need to exist on disk) looks like a plausible primary expression
@@ -297,10 +314,9 @@ def _classify_candidate(name: str) -> tuple[int, str] | None:
     ranked by the exact same rules as plain downloaded files (see
     resolve_primary_expression_matrix).
     """
-    candidate = Path(name)
-    lname = candidate.name.lower()
-    if _GSM_NAME_RE.search(candidate.name) or not _is_data_file(candidate) or any(k in lname for k in _NON_MATRIX_KEYWORDS):
+    if not _passes_basic_matrix_filters(name):
         return None
+    lname = Path(name).name.lower()
     for rank, unit in enumerate(_QUANT_UNIT_PRIORITY):
         if unit in lname:
             return rank, unit
@@ -343,6 +359,82 @@ def _load_expression_file_for_qc(path: Path) -> pd.DataFrame | None:
         return pd.read_csv(path, sep=None, engine="python", compression="infer")
     except Exception:
         return None
+
+
+# A real gene-level (or even transcript-level) expression matrix always has
+# at least this many rows -- live examples run into the tens of thousands
+# (GSE253260: 60671, GSE172356: 45140). A supplementary table/figure excerpt
+# that isn't the real matrix (live example, GSE161706's sole remaining file
+# after excluding script files, "..._Processed_data_for_Table_S3_Figure_6.xlsx")
+# parses to a handful of rows or fewer, so this alone rules those out before
+# the column-count check below even runs.
+_MIN_MATRIX_ROWS = 1000
+
+# How far a candidate's data-column count (assumed one non-numeric gene/probe
+# ID column, so total columns - 1) may be from the cohort's actual sample
+# count and still be treated as its combined matrix. Real submitter matrices
+# routinely drop a handful of samples that failed QC, or add a few
+# replicate/multi-run columns, so exact equality is too strict -- but this
+# must still firmly reject an unrelated table that merely survived the
+# filename exclusions. Live-calibrated against 5 real single-file cases
+# (GSE253260 396 vs 397, GSE310252 118 vs 118, GSE224564 174 vs 175,
+# GSE248014 45 vs 45, GSE172356 62 vs 62) and 2 real multi-file sum cases
+# (GSE293744 12+36=48 vs 48, GSE131050 66+125=191 vs 191).
+def _matches_sample_count(n_cols: int, n_samples: int) -> bool:
+    if n_samples <= 0:
+        return False
+    return abs(n_cols - n_samples) <= max(5, round(0.15 * n_samples))
+
+
+def _content_verified_column_count(path: Path) -> int | None:
+    """Best-effort data-column count (total columns minus one assumed
+    gene/probe-ID column) for content-based verification, or None if the
+    file can't be parsed at all or is implausibly small to be a real
+    expression matrix (_MIN_MATRIX_ROWS) -- e.g. a supplementary table
+    excerpt rather than the whole-cohort matrix.
+    """
+    df = _load_expression_file_for_qc(path)
+    if df is None or df.shape[0] < _MIN_MATRIX_ROWS:
+        return None
+    return max(df.shape[1] - 1, 0)
+
+
+def select_primary_expression_file_by_content(paths: list[Path], n_samples: int) -> tuple[list[Path], str] | None:
+    """Fallback for when select_primary_expression_file finds no filename
+    carrying a recognizable quantification-unit keyword: verify by content
+    instead of guessing from the name. Only ever considers candidates that
+    already pass _passes_basic_matrix_filters (same GSM-name/non-data/
+    derived-comparison exclusions as the filename path), and only accepts
+    one when its (or, for several small files together, their combined)
+    data-column count is close to the cohort's actual sample count
+    (_matches_sample_count) -- there is no real ambiguity left once content
+    corroborates the column count against ground truth, unlike a bare
+    "only one file remains" guess (which live-broke on GSE161706: a sole
+    remaining ..._Table_S3_Figure_6.xlsx that looked like the only option by
+    filename alone, but parses to 0 rows -- not the matrix).
+
+    Returns (paths, "unknown") -- "unknown" because content verification
+    doesn't tell us the quantification unit, only that the shape matches --
+    or None if nothing verifies. Capped at 5 remaining candidates: beyond
+    that, summing an arbitrary subset to hit the sample count by chance
+    becomes a real risk rather than a confident signal.
+    """
+    candidates = [p for p in paths if _passes_basic_matrix_filters(p.name)]
+    if not candidates or len(candidates) > 5:
+        return None
+
+    for path in candidates:
+        n_cols = _content_verified_column_count(path)
+        if n_cols is not None and _matches_sample_count(n_cols, n_samples):
+            return [path], "unknown"
+
+    counts = [(path, _content_verified_column_count(path)) for path in candidates]
+    if len(counts) > 1 and all(n is not None for _, n in counts):
+        total = sum(n for _, n in counts)
+        if _matches_sample_count(total, n_samples):
+            return [path for path, _ in counts], "unknown"
+
+    return None
 
 
 # Submitters routinely bundle a series' supplementary files (or even the one
@@ -417,7 +509,9 @@ def _read_dataframe_bytes(data: bytes, name: str) -> pd.DataFrame | None:
         return None
 
 
-def resolve_primary_expression_matrix(files: list[Path], out_dir: Path) -> tuple[Path, str] | None:
+def resolve_primary_expression_matrix(
+    files: list[Path], out_dir: Path, n_samples: int | None = None
+) -> tuple[Path, str] | None:
     """Find this RNA-seq cohort's primary expression matrix among its
     downloaded supplementary files -- including inside .zip/.tar/.tar.gz/
     .tgz archives -- and guarantee the result is a plain, gzip-compressed,
@@ -440,6 +534,15 @@ def resolve_primary_expression_matrix(files: list[Path], out_dir: Path) -> tuple
     parse it themselves (check_rnaseq_expression_qc) can still report
     exactly which file and why, instead of that looking identical to "no
     candidate found at all".
+
+    When no filename carries a recognizable unit keyword and `n_samples` is
+    given, falls back to select_primary_expression_file_by_content -- but
+    only its single-candidate result; a multi-file sum match is reported by
+    check_rnaseq_expression_qc as a QC note instead of picked here, since
+    "the primary file" is a one-file concept and no single one of those
+    files is the whole matrix on its own. Content verification isn't
+    attempted for archive members (out of scope for now -- plain downloaded
+    files cover every real case seen so far).
     """
     candidates = list(files)
     archive_sources: dict[str, tuple[Path, str]] = {}  # virtual name -> (archive path, member name)
@@ -454,6 +557,10 @@ def resolve_primary_expression_matrix(files: list[Path], out_dir: Path) -> tuple
             archive_sources[virtual_name] = (path, member_name)
 
     picked = select_primary_expression_file(candidates)
+    if picked is None and n_samples is not None:
+        by_content = select_primary_expression_file_by_content(candidates, n_samples)
+        if by_content is not None and len(by_content[0]) == 1:
+            picked = by_content[0][0], by_content[1]
     if picked is None:
         return None
     primary, unit = picked
@@ -494,17 +601,37 @@ def resolve_primary_expression_matrix(files: list[Path], out_dir: Path) -> tuple
     return dest, unit
 
 
-def check_rnaseq_expression_qc(paths: list[Path], out_dir: Path) -> tuple[Path | None, str | None, list[str]]:
+def check_rnaseq_expression_qc(
+    paths: list[Path], out_dir: Path, n_samples: int | None = None
+) -> tuple[Path | None, str | None, list[str]]:
     """resolve_primary_expression_matrix + probe_mapping.check_expression_qc
     on the resulting canonical .tsv.gz, for the common (one series- or
     sample-level matrix per series) case. Returns (primary_path, unit,
     qc_notes) -- primary_path/unit are None if nothing recognizable was
     found; qc_notes is empty if the file couldn't be parsed either (noted as
     its own entry) or nothing stood out.
+
+    When resolve_primary_expression_matrix can't name a single primary file
+    but `n_samples` is given, checks whether several remaining candidates'
+    combined column count matches it (select_primary_expression_file_by_
+    content) -- live example, GSE293744's two files (12 + 36 = 48, matching
+    its 48 samples exactly) and GSE131050's two (66 + 125 = 191, matching
+    its 191). Reported as a QC note pointing at the files rather than picked
+    as "the" primary, since no single one of them is the whole matrix.
     """
-    resolved = resolve_primary_expression_matrix(paths, out_dir)
+    resolved = resolve_primary_expression_matrix(paths, out_dir, n_samples=n_samples)
     if resolved is None:
-        return None, None, []
+        notes = []
+        if n_samples is not None:
+            by_content = select_primary_expression_file_by_content(paths, n_samples)
+            if by_content is not None and len(by_content[0]) > 1:
+                names = ", ".join(p.name for p in by_content[0])
+                notes.append(
+                    f"no single combined matrix, but {len(by_content[0])} files together "
+                    f"({names}) sum to a column count matching this cohort's {n_samples} samples "
+                    "-- likely a legitimate multi-part matrix, see each file directly"
+                )
+        return None, None, notes
     primary_path, unit = resolved
 
     matrix = _load_expression_file_for_qc(primary_path)
@@ -978,7 +1105,9 @@ def download_cohort(
         if not files:
             print(f"  {gse_id}: no supplementary expression files found")
         else:
-            primary_path, primary_unit, rnaseq_qc_notes = check_rnaseq_expression_qc(files, out_dir / "expression")
+            primary_path, primary_unit, rnaseq_qc_notes = check_rnaseq_expression_qc(
+                files, out_dir / "expression", n_samples=len(gse.gsms)
+            )
             if primary_path is not None:
                 result["primary_expression_file"] = str(primary_path)
                 result["primary_expression_unit"] = primary_unit
