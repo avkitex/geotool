@@ -86,8 +86,8 @@ _LOG2_ALREADY_TRANSFORMED_MAX = 50
 
 PROBE_ID_COL = "ID"
 
-_GENE_SYMBOL_COLUMNS = ["Gene Symbol", "GENE_SYMBOL", "Symbol", "gene_symbol"]
-_ENTREZ_ID_COLUMNS = ["ENTREZ_GENE_ID", "Entrez_Gene_ID", "GENE_ID", "entrez_gene_id"]
+_GENE_SYMBOL_COLUMNS = ["Gene Symbol", "GENE_SYMBOL", "Symbol", "gene_symbol", "GeneSymbol"]
+_ENTREZ_ID_COLUMNS = ["ENTREZ_GENE_ID", "Entrez_Gene_ID", "GENE_ID", "entrez_gene_id", "EntrezGeneID"]
 
 _FIELD_SEP_RE = re.compile(r"\s*//\s*")
 _ENSEMBL_GENE_ID_RE = re.compile(r"^ENSG\d+$")

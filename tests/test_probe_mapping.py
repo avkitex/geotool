@@ -42,6 +42,22 @@ def test_parse_direct_columns_returns_none_when_no_known_columns():
     assert probe_mapping.parse_direct_columns(df) is None
 
 
+def test_parse_direct_columns_recognizes_camelcase_genesymbol():
+    """Real GPL15048 shape (GSE57495): columns are "GeneSymbol"/"EntrezGeneID",
+    camelCase with no space/underscore -- distinct from every other known
+    variant, and previously unrecognized, leaving GSE57495 with a completely
+    empty expression.tsv.gz despite real, populated annotation data."""
+    df = pd.DataFrame([
+        {"ID": "merck2-A18658_at", "GeneSymbol": "INSR", "EntrezGeneID": "3643"},
+        {"ID": "AFFX-BioB-3_at", "GeneSymbol": np.nan, "EntrezGeneID": np.nan},
+    ])
+    result = probe_mapping.parse_direct_columns(df)
+    assert result is not None
+    row0 = result[result["probe_id"] == "merck2-A18658_at"].iloc[0]
+    assert row0["gene_symbol"] == "INSR"
+    assert row0["entrez_id"] == "3643"
+
+
 def test_parse_gene_assignment_extracts_first_valid_symbol_and_entrez():
     symbol, entrez = probe_mapping.parse_gene_assignment(GPL17586_GENE_ASSIGNMENT)
     assert symbol == "DDX11L1"
