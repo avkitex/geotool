@@ -1,12 +1,15 @@
 """limma-style two-group differential expression with covariate control.
 
-Bioconductor's limma isn't available in this environment (no R, no rpy2),
-so this reimplements its core algorithm directly in Python: an ordinary
-linear model fit per gene against a design matrix (Smyth 2004's lmFit),
-followed by empirical-Bayes shrinkage of the per-gene residual variances
-toward a common prior before testing (squeezeVar / eBayes). Design-matrix
-construction and the moment-based prior-variance estimator follow the same
-formulas as limma's own fitFDist/squeezeVar.
+The actual model fit (Smyth 2004's lmFit + empirical-Bayes moderation of
+the per-gene residual variances, i.e. squeezeVar/eBayes) is delegated to
+the vendored InMoose port of limma (geotool/_vendor/inmoose -- see the
+README there for why it's vendored rather than a normal pip dependency).
+InMoose is validated against real R limma (Pearson r = 1.0, differences at
+floating-point noise level); this module previously reimplemented the
+algorithm by hand, which was also checked against real R limma directly
+and matched after fixing two bugs (see git history) -- InMoose is used now
+because it's the actual upstream implementation, not a second
+reimplementation to keep in sync with it.
 
 Intended use: one cohort (one expression matrix, on an additive scale like
 log2(TPM + 1)) at a time, comparing exactly two levels of some group column
@@ -22,8 +25,8 @@ import warnings
 
 import numpy as np
 import pandas as pd
-from scipy import special, stats
-from scipy.optimize import brentq
+
+from ._vendor.inmoose.limma import eBayes, lmFit, topTable
 
 
 def build_design_matrix(
@@ -96,61 +99,11 @@ def build_design_matrix(
     return design, group_coef
 
 
-def _bh_adjust(p_values: np.ndarray) -> np.ndarray:
-    n = len(p_values)
-    order = np.argsort(p_values)
-    ranked = p_values[order]
-    adjusted = ranked * n / (np.arange(n) + 1)
-    adjusted = np.minimum.accumulate(adjusted[::-1])[::-1]
-    adjusted = np.clip(adjusted, 0, 1)
-    out = np.empty(n)
-    out[order] = adjusted
-    return out
-
-
-def _trigamma_inverse(x: float) -> float:
-    """Solve trigamma(y) = x for y > 0. trigamma (scipy's polygamma(1, ·))
-    is strictly decreasing on (0, inf), so a bracketing root-finder is both
-    simple and robust here -- this is only ever called once per analysis
-    (fitting the prior variance), so its cost is irrelevant.
-    """
-    if x <= 0:
-        raise ValueError("trigamma inverse is undefined for x <= 0")
-    lo, hi = 1e-8, 1e6
-    while special.polygamma(1, hi) > x:
-        hi *= 10
-    return brentq(lambda y: special.polygamma(1, y) - x, lo, hi)
-
-
-def _fit_prior_variance(sigma2: np.ndarray, df_residual: float) -> tuple[float, float]:
-    """Method-of-moments estimate of the (d0, s0^2) scaled-inverse-chi-square
-    prior on the per-gene residual variances -- limma's squeezeVar/fitFDist,
-    specialized to the common case here where every gene shares the same
-    residual df (one design matrix fit to every gene).
-
-    Returns d0 = inf when the observed spread of log(sigma2) across genes is
-    no larger than sampling noise alone predicts: there's no evidence of a
-    finite prior to shrink toward, so every gene's posterior variance is
-    just the common prior mean s0^2.
-    """
-    sigma2 = sigma2[sigma2 > 0]
-    z = np.log(sigma2)
-    e = special.digamma(df_residual / 2) - np.log(df_residual / 2)
-    s0_sq = np.exp(np.mean(z) - e)
-
-    sampling_var = special.polygamma(1, df_residual / 2)  # trigamma(df/2)
-    excess_var = np.var(z, ddof=0) - sampling_var
-    if excess_var <= 0:
-        return np.inf, s0_sq
-    d0 = 2 * _trigamma_inverse(excess_var)
-    return d0, s0_sq
-
-
 def moderated_ttest(expression: pd.DataFrame, design: pd.DataFrame, coef: str) -> pd.DataFrame:
-    """Fit `expression = design @ beta + eps` independently per gene (row),
-    then apply empirical-Bayes moderation (Smyth 2004) to shrink the
-    per-gene residual variances toward a common prior before testing
-    `coef`. Returns a limma topTable-style frame (logFC, AveExpr, t,
+    """Fit `expression = design @ beta + eps` independently per gene (row)
+    via InMoose's lmFit, then apply its eBayes empirical-Bayes moderation to
+    shrink the per-gene residual variances toward a common prior before
+    testing `coef`. Returns a limma topTable-style frame (logFC, AveExpr, t,
     P.Value, adj.P.Val), sorted by P.Value.
 
     `expression` must already be on an additive scale (e.g. log2(TPM + 1)),
@@ -165,51 +118,30 @@ def moderated_ttest(expression: pd.DataFrame, design: pd.DataFrame, coef: str) -
     missing = set(design.index) - set(expression.columns)
     if missing:
         raise ValueError(f"{len(missing)} sample(s) in design have no matching expression column: {sorted(missing)[:5]}")
-
-    samples = design.index
-    expr = expression.loc[:, samples]
-
-    X = design.to_numpy(dtype=float)
-    Y = expr.to_numpy(dtype=float)  # genes x samples
-    n, p = X.shape
-    df_residual = n - np.linalg.matrix_rank(X)
+    df_residual = len(design.index) - np.linalg.matrix_rank(design.to_numpy(dtype=float))
     if df_residual < 1:
         raise ValueError("design matrix has no residual degrees of freedom -- too many covariates for the number of samples")
 
-    XtX_inv = np.linalg.pinv(X.T @ X)
-    beta = (XtX_inv @ X.T @ Y.T).T  # genes x p
-    resid = Y - beta @ X.T
-    sigma2 = np.sum(resid ** 2, axis=1) / df_residual
+    expr = expression.loc[:, design.index]
+    fit = eBayes(lmFit(expr, design))
 
-    coef_idx = list(design.columns).index(coef)
-    se_unscaled = np.sqrt(XtX_inv[coef_idx, coef_idx])
+    # lmFit wraps a bare DataFrame in patsy.DesignMatrix() without attaching
+    # column-name metadata, so fit.coefficients ends up labeled "column0",
+    # "column1", ... in design-column order rather than keeping `design`'s
+    # own names -- look the real coefficient up by position instead.
+    coef_label = fit.coefficients.columns[list(design.columns).index(coef)]
+    top = topTable(fit, coef=coef_label, number=expr.shape[0], sort_by="P", adjust_method="fdr_bh")
 
-    d0, s0_sq = _fit_prior_variance(sigma2, df_residual)
-    if np.isinf(d0):
-        sigma2_post = np.full_like(sigma2, s0_sq)
-        df_post = np.inf
-    else:
-        sigma2_post = (d0 * s0_sq + df_residual * sigma2) / (d0 + df_residual)
-        df_post = d0 + df_residual
-
-    se = se_unscaled * np.sqrt(sigma2_post)
-    t_stat = beta[:, coef_idx] / se
-    if np.isinf(df_post):
-        p_value = 2 * stats.norm.sf(np.abs(t_stat))
-    else:
-        p_value = 2 * stats.t.sf(np.abs(t_stat), df_post)
-
-    result = pd.DataFrame(
+    return pd.DataFrame(
         {
-            "logFC": beta[:, coef_idx],
-            "AveExpr": Y.mean(axis=1),
-            "t": t_stat,
-            "P.Value": p_value,
+            "logFC": top["log2FoldChange"],
+            "AveExpr": top["AveExpr"],
+            "t": top["stat"],
+            "P.Value": top["pvalue"],
+            "adj.P.Val": top["adj_pvalue"],
         },
-        index=expression.index,
+        index=top.index,
     )
-    result["adj.P.Val"] = _bh_adjust(result["P.Value"].to_numpy())
-    return result.sort_values("P.Value")
 
 
 def two_group_diffexp(

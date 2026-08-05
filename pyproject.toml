@@ -12,7 +12,13 @@ dependencies = [
     "tabulate>=0.9",
     "anthropic>=0.69",
     "pydantic>=2.0",
-    "scipy>=1.10",
+    # required by geotool/_vendor/inmoose (vendored subset of InMoose's
+    # limma port -- see geotool/_vendor/inmoose/README.md), which
+    # geotool.diffexp delegates to.
+    "scipy>=1.16",
+    "patsy>=1.0",
+    "statsmodels>=0.14.5",
+    "matplotlib>=3.7",
 ]
 
 [project.optional-dependencies]
@@ -22,7 +28,6 @@ dev = [
 ]
 notebook = [
     "jupyter>=1.0",
-    "matplotlib>=3.7",
 ]
 
 [project.scripts]

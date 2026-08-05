@@ -109,6 +109,42 @@ class TestModeratedTtest:
         null_genes = result.loc[~result.index.isin(true_de_genes)]
         assert (null_genes["adj.P.Val"] < 0.05).mean() < 0.2  # FDR roughly controlled
 
+    def test_handles_zero_variance_genes_without_nan_or_inf(self):
+        # an unexpressed gene (identical value -- e.g. log2(0+1)=0 -- in
+        # every sample of both groups) has sigma2 == 0 exactly; this must
+        # not blow up the fit or poison other genes' results.
+        samples = [f"s{i}" for i in range(6)]
+        group = ["control"] * 3 + ["treated"] * 3
+        expression = pd.DataFrame(
+            {
+                "ZERO_VAR": [0.0] * 6,
+                "NORMAL": [5.0, 5.1, 4.9, 7.0, 7.1, 6.9],
+            },
+            index=samples,
+        ).T
+        annotation = _annotation(sample=samples, group=group)
+        result = diffexp.two_group_diffexp(expression, annotation, "sample", "group")
+        assert np.isfinite(result["t"]).all()
+        assert np.isfinite(result["P.Value"]).all()
+
+    def test_uniform_gene_variance_does_not_crash_ebayes(self):
+        # regression test for a real bug in vendored InMoose (geotool/
+        # _vendor/inmoose/limma/ebayes.py): when every gene's residual
+        # variance agrees closely enough that df_prior is fit as scalar
+        # np.inf (no evidence of a finite prior -- exactly what happens
+        # when all genes share close to the same true variance, as here),
+        # `~` on the resulting native Python bool inverted it as an int
+        # (~True == -2) instead of negating it, which then got used as a
+        # DataFrame column position and raised KeyError: -2.
+        rng = np.random.default_rng(4)
+        samples = [f"s{i}" for i in range(6)]
+        group = ["control"] * 3 + ["treated"] * 3
+        expr = rng.normal(5, 0.1, size=(50, 6))  # tight, uniform noise across all genes
+        expression = pd.DataFrame(expr, index=[f"GENE{i}" for i in range(50)], columns=samples)
+        annotation = _annotation(sample=samples, group=group)
+        result = diffexp.two_group_diffexp(expression, annotation, "sample", "group")
+        assert np.isfinite(result["t"]).all()
+
     def test_group_coef_must_be_in_design(self):
         expression = pd.DataFrame({"s1": [1.0], "s2": [2.0]}, index=["g1"])
         design = pd.DataFrame({"Intercept": [1.0, 1.0]}, index=["s1", "s2"])
@@ -162,21 +198,3 @@ class TestTwoGroupDiffexp:
         )
         result = diffexp.two_group_diffexp(expression, annotation, "sample", "group")
         assert set(result.index) == {"g1", "g2"}
-
-
-class TestPriorVarianceHelpers:
-    def test_trigamma_inverse_round_trips(self):
-        from scipy import special
-
-        for target in (0.01, 0.1, 1.0, 5.0):
-            y = diffexp._trigamma_inverse(target)
-            assert special.polygamma(1, y) == pytest.approx(target, rel=1e-4)
-
-    def test_fit_prior_variance_shrinks_toward_common_value_when_genes_agree(self):
-        rng = np.random.default_rng(2)
-        # all genes share the same true variance -- observed spread should
-        # be explainable by sampling noise alone, so d0 = inf.
-        df_residual = 6
-        sigma2 = rng.chisquare(df_residual, size=200) / df_residual * 2.0
-        d0, s0_sq = diffexp._fit_prior_variance(sigma2, df_residual)
-        assert s0_sq == pytest.approx(2.0, rel=0.3)
