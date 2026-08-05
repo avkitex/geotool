@@ -11,6 +11,10 @@ GEO_CACHE_DIR = DATA_DIR / "geo_cache"
 REPORTS_DIR = DATA_DIR / "reports"
 SERIES_DIR = DATA_DIR / "series"
 PLATFORMS_DIR = DATA_DIR / "platforms"
+# GENCODE transcript/gene -> HUGO symbol reference tables (see
+# data/references/build_gencode_reference.py) -- not created by ensure_dirs,
+# since these are curated inputs, not an output directory geotool writes to.
+REFERENCES_DIR = DATA_DIR / "references"
 
 NCBI_EMAIL = os.environ.get("GEOTOOL_NCBI_EMAIL", "kit.iz.179@gmail.com")
 NCBI_API_KEY = os.environ.get("GEOTOOL_NCBI_API_KEY")  # None -> 3 req/s throttle

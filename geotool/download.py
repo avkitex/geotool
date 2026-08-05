@@ -271,8 +271,13 @@ def _is_data_file(path: Path) -> bool:
 # GSE194362: "..._snp_counts_significance.csv.gz" matches "count" but is a
 # differential-significance table, not a per-gene-per-sample matrix (same
 # false-positive risk already handled for GSE163305's "_GSK_vs_DMSO_D6.csv.gz"
-# -- that one just didn't happen to also contain a unit keyword).
-_NON_MATRIX_KEYWORDS = ("diff", "deg", "significance", "clinical", "rmats", "dexseq", "novel_filtered")
+# -- that one just didn't happen to also contain a unit keyword). ".original"
+# is a generic backup-file marker (e.g. "<name>.original.tsv.gz", written
+# when replacing a primary file in place elsewhere -- see
+# gene_symbol_mapping) -- without excluding it, a backup sitting next to the
+# real file it was copied from is an equally-ranked, filesystem-order-
+# dependent tie for the same unit, live-verified to nondeterministically win.
+_NON_MATRIX_KEYWORDS = ("diff", "deg", "significance", "clinical", "rmats", "dexseq", "novel_filtered", ".original")
 
 
 def _classify_candidate(name: str) -> tuple[int, str] | None:
