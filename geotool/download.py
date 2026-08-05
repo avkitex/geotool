@@ -61,7 +61,16 @@ from urllib.parse import urlparse
 import pandas as pd
 import requests
 
-from geotool import annotate, clinical_annotate, config, geo_fetch, platform_classify, probe_mapping, renormalize
+from geotool import (
+    annotate,
+    clinical_annotate,
+    companion_platforms,
+    config,
+    geo_fetch,
+    platform_classify,
+    probe_mapping,
+    renormalize,
+)
 
 _SKIP_EXTENSIONS = (
     ".bam", ".bai", ".fastq", ".fastq.gz", ".fq", ".fq.gz",
@@ -506,6 +515,18 @@ def check_rnaseq_expression_qc(paths: list[Path], out_dir: Path) -> tuple[Path |
     return primary_path, unit, [f"{primary_path.name}: {note}" for note in notes]
 
 
+def _combined_probe_gene_map(gpl_a: str, gpl_b: str) -> pd.DataFrame:
+    """Union of two platforms' probe->gene maps, for a companion-chip pair
+    whose combined sample column carries probes from both. The tiny handful
+    of probe IDs both chips happen to share (see companion_platforms) keep
+    gpl_a's mapping, matching combine_paired_probe_columns's own tie-break.
+    """
+    return pd.concat(
+        [probe_mapping.get_or_build_probe_gene_map(gpl_a), probe_mapping.get_or_build_probe_gene_map(gpl_b)],
+        ignore_index=True,
+    ).drop_duplicates(subset="probe_id", keep="first")
+
+
 def build_and_map_expression_matrix(gse, out_dir: Path) -> tuple[Path | None, list[str]]:
     """Probe matrix (raw) + gene-level matrix (mapped via probe_mapping.py).
 
@@ -519,11 +540,38 @@ def build_and_map_expression_matrix(gse, out_dir: Path) -> tuple[Path | None, li
         return None, []
     _write_matrix(probe_matrix, out_dir / "probe_matrix.tsv.gz")
 
+    # A companion-chip pair (see companion_platforms.py -- e.g. GPL96+GPL97,
+    # the two halves of the Affymetrix HG-U133 Set) means two GSM records
+    # are actually one biological sample split across two arrays; combine
+    # each matched pair's columns before any gene mapping happens, so the
+    # rest of this function (and every downstream consumer) sees one sample,
+    # not two.
+    pairings = companion_platforms.detect_pairings(gse)
+    flat_pairing = {gsm_a: gsm_b for pairing in pairings.values() for gsm_a, gsm_b in pairing.items()}
+    if flat_pairing:
+        pair_desc = ", ".join(f"{gpl_a}+{gpl_b}" for gpl_a, gpl_b in pairings)
+        print(f"    combining {len(flat_pairing)} companion-chip sample pair(s) ({pair_desc})")
+        probe_matrix = companion_platforms.combine_paired_probe_columns(probe_matrix, flat_pairing)
+
     # Usually one platform per series; handle the rare multi-platform case by
     # mapping+aggregating each platform's samples separately, then combining.
-    platform_ids = sorted({p for gsm in gse.gsms.values() for p in gsm.metadata.get("platform_id", [])})
+    # Each companion-chip pair is its own group spanning both platforms'
+    # probe->gene maps; every other platform is its own singleton group.
+    paired_gpl_ids = {gpl for pair in pairings for gpl in pair}
+    singleton_gpl_ids = sorted(
+        {p for gsm in gse.gsms.values() for p in gsm.metadata.get("platform_id", [])} - paired_gpl_ids
+    )
     gene_frames = []
-    for gpl_id in platform_ids:
+    for (gpl_a, gpl_b), pairing in pairings.items():
+        combined_cols = [c for c in (f"{a}+{b}" for a, b in pairing.items()) if c in probe_matrix.columns]
+        if not combined_cols:
+            continue
+        gene_frames.append(
+            probe_mapping.aggregate_probes_to_genes(
+                probe_matrix[combined_cols], _combined_probe_gene_map(gpl_a, gpl_b)
+            )
+        )
+    for gpl_id in singleton_gpl_ids:
         sample_cols = [
             gsm_id for gsm_id, gsm in gse.gsms.items() if gpl_id in gsm.metadata.get("platform_id", [])
         ]
@@ -684,7 +732,7 @@ def build_and_renormalize_expression_matrix(
         print("    --rma requested but no CEL supplementary files found")
         return None
 
-    gene_frames = []
+    probe_matrices: dict[str, pd.DataFrame] = {}
     for gpl_id in sorted(affy_gpl_ids):
         platform_cel_files = {
             gsm_id: path
@@ -699,8 +747,7 @@ def build_and_renormalize_expression_matrix(
             print(f"    RMA skipped for {gpl_id}: {exc}")
             continue
         _write_matrix(probe_matrix, out_dir / f"probe_matrix_rma_{gpl_id}.tsv.gz")
-        probe_gene_map = probe_mapping.get_or_build_probe_gene_map(gpl_id)
-        gene_frames.append(probe_mapping.aggregate_probes_to_genes(probe_matrix, probe_gene_map))
+        probe_matrices[gpl_id] = probe_matrix
 
         # CEL files are only useful up to a successful RMA run -- they're raw
         # data (hundreds of MB to GBs across a series) that's fully captured
@@ -712,6 +759,36 @@ def build_and_renormalize_expression_matrix(
     cel_dir = out_dir / "cel"
     if cel_dir.is_dir() and not any(cel_dir.iterdir()):
         cel_dir.rmdir()
+
+    if not probe_matrices:
+        return None
+
+    # Same companion-chip combination as build_and_map_expression_matrix,
+    # restricted to pairs where RMA actually succeeded for both halves --
+    # each platform here got its own separately-normalized probe matrix
+    # (RMA runs per chip type), so the pair's two matrices are concatenated
+    # column-wise first (aligning their almost-disjoint probe rows) before
+    # reusing the same combine/dedup helper.
+    pairings = {
+        pair: pairing
+        for pair, pairing in companion_platforms.detect_pairings(gse).items()
+        if pair[0] in probe_matrices and pair[1] in probe_matrices
+    }
+    paired_gpl_ids = {gpl for pair in pairings for gpl in pair}
+
+    gene_frames = []
+    for (gpl_a, gpl_b), pairing in pairings.items():
+        print(f"    combining {len(pairing)} companion-chip sample pair(s) ({gpl_a}+{gpl_b})")
+        merged_probes = pd.concat([probe_matrices[gpl_a], probe_matrices[gpl_b]], axis=1)
+        combined_probes = companion_platforms.combine_paired_probe_columns(merged_probes, pairing)
+        gene_frames.append(
+            probe_mapping.aggregate_probes_to_genes(combined_probes, _combined_probe_gene_map(gpl_a, gpl_b))
+        )
+    for gpl_id, probe_matrix in probe_matrices.items():
+        if gpl_id in paired_gpl_ids:
+            continue
+        probe_gene_map = probe_mapping.get_or_build_probe_gene_map(gpl_id)
+        gene_frames.append(probe_mapping.aggregate_probes_to_genes(probe_matrix, probe_gene_map))
 
     if not gene_frames:
         return None
@@ -876,6 +953,15 @@ def download_cohort(
     srow = annotate.series_row(gse)
     samples = annotate.samples_table(gse)
     _persist_series_annotation(out_dir, srow, samples)
+
+    # samples.tsv above stays a faithful one-row-per-GSM record of what GEO
+    # actually published; annotation.tsv (built from `samples` below) is the
+    # "ready to use" view, so companion-chip pairs (see companion_platforms.py)
+    # collapse to one row here -- otherwise every downstream sample-level
+    # analysis double-counts them.
+    pairings = companion_platforms.detect_pairings(gse)
+    if pairings:
+        samples = companion_platforms.collapse_paired_samples(samples, pairings)
 
     assay_types = {p["assay_type"] for p in platform_details}
 
