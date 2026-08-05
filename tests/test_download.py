@@ -5,6 +5,7 @@ import tarfile
 import zipfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 import requests
@@ -239,7 +240,11 @@ def test_check_rnaseq_expression_qc_flags_linear_scale_fpkm_matrix(tmp_path):
     """Real GSE163305 FPKM matrix shape: nonnegative, max value in the
     thousands. Source is .csv.gz (comma-separated), which needs converting
     to the guaranteed final .tsv.gz format -- see resolve_primary_expression_
-    matrix's dedicated tests for that conversion behavior in isolation."""
+    matrix's dedicated tests for that conversion behavior in isolation.
+    resolve_primary_expression_matrix now auto-fixes linear-scale values
+    (probe_mapping.normalize_expression_matrix) rather than just flagging
+    them, so by the time check_expression_qc runs on the written file
+    there's nothing left to report."""
     path = tmp_path / "GSE163305_FPKM_6D_GSK6_DMSO.csv.gz"
     pd.DataFrame(
         {"GSK6D_0": [0.0, 16096.1], "DMSO6D_0": [0.0, 12677.3]}, index=["XLOC_1", "XLOC_2"]
@@ -249,9 +254,9 @@ def test_check_rnaseq_expression_qc_flags_linear_scale_fpkm_matrix(tmp_path):
 
     assert primary_path == tmp_path / "GSE163305_FPKM_6D_GSK6_DMSO.tsv.gz"
     assert unit == "fpkm"
-    assert len(notes) == 1
-    assert primary_path.name in notes[0]
-    assert "not log2-transformed" in notes[0]
+    assert notes == []
+    written = pd.read_csv(primary_path, sep="\t", compression="gzip")
+    assert written["GSK6D_0"].max() == pytest.approx(np.log2(16096.1 + 1), abs=1e-3)
 
 
 def test_check_rnaseq_expression_qc_flags_negative_values(tmp_path):
@@ -290,7 +295,8 @@ def test_check_rnaseq_expression_qc_reads_xlsx_files(tmp_path):
     """Real shape: several PRMT5/MTAP cohorts (e.g. GSE310927, GSE277490)
     publish their combined matrix as an .xlsx file rather than a
     delimited/gzipped text file -- converted to .tsv.gz, per the guaranteed
-    final format."""
+    final format. Linear-scale values get auto-fixed (see the .csv.gz test
+    above), so there's nothing left for check_expression_qc to flag."""
     path = tmp_path / "GSE310927_L3.6_EPZ_Prex_Combo_CPM.xlsx"
     pd.DataFrame({"GSM1": [0.0, 999.0], "GSM2": [1.0, 500.0]}, index=["GENE1", "GENE2"]).to_excel(path)
 
@@ -298,8 +304,9 @@ def test_check_rnaseq_expression_qc_reads_xlsx_files(tmp_path):
 
     assert primary_path == tmp_path / "GSE310927_L3.6_EPZ_Prex_Combo_CPM.tsv.gz"
     assert unit == "cpm"
-    assert len(notes) == 1
-    assert "not log2-transformed" in notes[0]
+    assert notes == []
+    written = pd.read_csv(primary_path, sep="\t", compression="gzip")
+    assert written["GSM1"].max() == pytest.approx(np.log2(999.0 + 1), abs=1e-3)
 
 
 # --- select_primary_expression_file_by_content: content-based fallback for a
@@ -564,9 +571,13 @@ def test_build_and_map_expression_matrix_writes_both_files(monkeypatch, tmp_path
 
     assert (tmp_path / "probe_matrix.tsv.gz").exists()
     assert expr_path == tmp_path / "expression.tsv.gz"
-    assert qc_notes == []
+    # entrez_id already did its job as a multi-platform merge key (see
+    # normalize_expression_matrix) -- dropped from the persisted file so it
+    # can't be mistaken for a sample column by anything reading it back.
+    assert len(qc_notes) == 1 and "entrez_id" in qc_notes[0]
     genes = pd.read_csv(expr_path, sep="\t")
     assert set(genes["gene_symbol"]) == {"DDR1", "RFC2"}
+    assert "entrez_id" not in genes.columns
 
 
 def make_agilent_two_channel_gse():
@@ -811,8 +822,13 @@ def test_download_cohort_routes_rnaseq_and_writes_annotation(monkeypatch, tmp_pa
 
 
 def test_download_cohort_reports_rnaseq_expression_qc_and_reuses_from_cache(monkeypatch, tmp_path):
-    """Real GSE163305 shape: an FPKM matrix (linear-scale, so flagged) is the
-    only genuine expression file among its supplementary files."""
+    """Real GSE163305 shape: an FPKM matrix (linear-scale) is the only
+    genuine expression file among its supplementary files.
+    resolve_primary_expression_matrix now auto-fixes linear-scale values
+    (probe_mapping.normalize_expression_matrix) rather than just flagging
+    them, so this ends up with a clean "ok" status once written -- see
+    test_check_rnaseq_expression_qc_flags_linear_scale_fpkm_matrix for the
+    same fix in isolation."""
     gse = make_rnaseq_gse()
     gse.metadata["supplementary_file"].append("ftp://example.com/GSE_RNASEQ_notes.txt")
     monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)
@@ -838,18 +854,19 @@ def test_download_cohort_reports_rnaseq_expression_qc_and_reuses_from_cache(monk
 
     assert result["primary_expression_unit"] == "count"
     assert result["primary_expression_file"] == str(tmp_path / "GSE_RNASEQ_QC" / "expression" / "GSE_RNASEQ_counts.tsv.gz")
-    assert result["expression_qc_notes"] == ["GSE_RNASEQ_counts.tsv.gz: linear-scale, not log2-transformed (max value 16096.1)"]
-    assert result["expression_status"] == clinical_annotate.EXPRESSION_STATUS_NOT_LOG2_TRANSFORMED
-    assert (tmp_path / "GSE_RNASEQ_QC" / "expression_qc.json").exists()
+    assert "expression_qc_notes" not in result  # nothing left to report -- already fixed
+    assert result["expression_status"] == clinical_annotate.EXPRESSION_STATUS_OK
+
+    written = pd.read_csv(result["primary_expression_file"], sep="\t", compression="gzip")
+    assert written["GSM1"].max() == pytest.approx(np.log2(16096.1 + 1), abs=1e-3)
 
     annotation = pd.read_csv(tmp_path / "GSE_RNASEQ_QC" / "annotation.tsv", sep="\t")
-    assert (annotation["expression_status"] == clinical_annotate.EXPRESSION_STATUS_NOT_LOG2_TRANSFORMED).all()
+    assert (annotation["expression_status"] == clinical_annotate.EXPRESSION_STATUS_OK).all()
 
     monkeypatch.setattr(download.geo_fetch, "fetch_series", _raise)
     cached = download.download_cohort("GSE_RNASEQ_QC", series_dir=tmp_path)
     assert cached["primary_expression_file"] == result["primary_expression_file"]
     assert cached["primary_expression_unit"] == result["primary_expression_unit"]
-    assert cached["expression_qc_notes"] == result["expression_qc_notes"]
     assert cached["expression_status"] == result["expression_status"]
 
 
