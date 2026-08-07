@@ -56,6 +56,7 @@ import re
 import shutil
 import tarfile
 import zipfile
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -67,6 +68,7 @@ from geotool import (
     clinical_annotate,
     companion_platforms,
     config,
+    gene_symbol_mapping,
     geo_fetch,
     platform_classify,
     probe_mapping,
@@ -326,6 +328,16 @@ def _is_data_file(path: Path) -> bool:
 # gene_symbol_mapping) -- without excluding it, a backup sitting next to the
 # real file it was copied from is an equally-ranked, filesystem-order-
 # dependent tie for the same unit, live-verified to nondeterministically win.
+#
+# Deliberately does NOT include filename hints like "maf"/"peak"/"mutation"
+# for the non-expression genomic file types
+# _looks_like_non_expression_genomic_file rejects by content below (variant
+# calls, peak calls, copy-number segments/calls) -- those substrings collide
+# with real content too often to use as a blind filename exclusion (e.g.
+# "maf" inside a real "..._MAFB_knockdown_counts.tsv.gz", or "mutation"
+# inside a real "..._KRAS_mutation_status_counts.tsv.gz" -- neither is a MAF
+# file). The content check doesn't have that false-positive risk: it
+# requires several real column names to match, not a filename substring.
 _NON_MATRIX_KEYWORDS = ("diff", "deg", "significance", "clinical", "rmats", "dexseq", "novel_filtered", ".original")
 
 
@@ -435,15 +447,72 @@ def _matches_sample_count(n_cols: int, n_samples: int) -> bool:
     return abs(n_cols - n_samples) <= max(5, round(0.15 * n_samples))
 
 
+# Column-name vocabulary for genomic-interval/variant file formats a
+# submitter might publish under a misleadingly generic .tsv/.txt/.csv
+# extension, bypassing the extension-based _is_data_file filter entirely --
+# live example: GSE236496's ChIP-seq peak calls, "Peak_calls.tsv.gz"
+# (chr/start/ned/state/gene_chr/gene_start/gene_end/gene_id/gene_name/strand
+# columns, 26523 rows -- none of them real per-sample expression values, but
+# a column count that happened to land within _matches_sample_count's
+# tolerance of that cohort's sample count anyway). Checked by
+# _looks_like_non_expression_genomic_file below, independently of (and
+# before) the gene-identity check that follows it: MAF and gene-level CNA/
+# GISTIC output routinely *do* carry a real Hugo_Symbol/Gene Symbol column,
+# so gene-identity verification alone would wrongly accept them as a real
+# expression matrix. Each set is its own signature (not merged into one big
+# set) since a gene-level-aggregated MAF derivative could plausibly carry
+# the MAF-specific columns without any chr/start/end at all.
+_BED_LIKE_COLUMN_KEYWORDS = frozenset({"chr", "chrom", "chromosome", "start", "end", "pos", "position", "strand"})
+_VCF_COLUMN_KEYWORDS = frozenset({"ref", "alt", "qual", "filter", "info", "format"})
+_MAF_COLUMN_KEYWORDS = frozenset({
+    "hugo_symbol", "variant_classification", "variant_type", "reference_allele",
+    "tumor_seq_allele1", "tumor_seq_allele2", "tumor_sample_barcode", "ncbi_build",
+})
+_NON_EXPRESSION_GENOMIC_SIGNATURES = (_BED_LIKE_COLUMN_KEYWORDS, _VCF_COLUMN_KEYWORDS, _MAF_COLUMN_KEYWORDS)
+
+# One or two incidental hits (e.g. a real matrix that happens to have a
+# "start" column, or a submitter naming one sample "REF") shouldn't be
+# enough to reject a real matrix -- several matches from the *same*
+# signature is a real fingerprint, not noise.
+_MIN_SIGNATURE_KEYWORD_MATCHES = 3
+
+
+def _looks_like_non_expression_genomic_file(columns) -> bool:
+    normalized = {probe_mapping._normalize_column_name(c) for c in columns}
+    return any(len(normalized & signature) >= _MIN_SIGNATURE_KEYWORD_MATCHES for signature in _NON_EXPRESSION_GENOMIC_SIGNATURES)
+
+
+@lru_cache(maxsize=1)
+def _default_gene_reference() -> gene_symbol_mapping.GencodeReference:
+    """Loaded once per process and reused -- the GENCODE v50 reference
+    tables are ~tens of thousands of rows each, and content verification
+    may check several candidate files per cohort across many cohorts in one
+    run.
+    """
+    return gene_symbol_mapping.load_gencode_reference("50")
+
+
 def _content_verified_column_count(path: Path) -> int | None:
     """Best-effort data-column count (total columns minus one assumed
     gene/probe-ID column) for content-based verification, or None if the
-    file can't be parsed at all or is implausibly small to be a real
-    expression matrix (_MIN_MATRIX_ROWS) -- e.g. a supplementary table
-    excerpt rather than the whole-cohort matrix.
+    file can't be parsed at all, is implausibly small to be a real
+    expression matrix (_MIN_MATRIX_ROWS -- e.g. a supplementary table
+    excerpt rather than the whole-cohort matrix), matches a known non-
+    expression genomic file signature (_looks_like_non_expression_genomic_
+    file -- peak calls, variant calls, mutation annotation), or has no
+    column/index that verifies as a real gene/transcript identifier against
+    the GENCODE reference (gene_symbol_mapping.locate_identifier_axis) --
+    a shape-only match (right column count) is not enough on its own; a
+    real gene axis is unambiguous ground truth a shape heuristic can't
+    fake, whereas a submitter's own column naming for *samples* is too
+    inconsistent to verify the same way (see _matches_sample_count instead).
     """
     df = _load_expression_file_for_qc(path)
     if df is None or df.shape[0] < _MIN_MATRIX_ROWS:
+        return None
+    if _looks_like_non_expression_genomic_file(df.columns):
+        return None
+    if gene_symbol_mapping.locate_identifier_axis(df, _default_gene_reference()) is None:
         return None
     return max(df.shape[1] - 1, 0)
 
@@ -453,14 +522,18 @@ def select_primary_expression_file_by_content(paths: list[Path], n_samples: int)
     carrying a recognizable quantification-unit keyword: verify by content
     instead of guessing from the name. Only ever considers candidates that
     already pass _passes_basic_matrix_filters (same GSM-name/non-data/
-    derived-comparison exclusions as the filename path), and only accepts
-    one when its (or, for several small files together, their combined)
-    data-column count is close to the cohort's actual sample count
-    (_matches_sample_count) -- there is no real ambiguity left once content
-    corroborates the column count against ground truth, unlike a bare
-    "only one file remains" guess (which live-broke on GSE161706: a sole
-    remaining ..._Table_S3_Figure_6.xlsx that looked like the only option by
-    filename alone, but parses to 0 rows -- not the matrix).
+    derived-comparison exclusions as the filename path) *and*
+    _content_verified_column_count's own content checks (real gene/
+    transcript identifier axis via the GENCODE reference, no genomic-
+    interval/variant-format column signature -- see that function), and only
+    accepts one when its (or, for several small files together, their
+    combined) data-column count is close to the cohort's actual sample count
+    (_matches_sample_count) -- shape alone is not enough (live-broke on
+    GSE236496: a ChIP-seq peak-calls table whose column count happened to
+    match by chance) and neither is "only one file remains" alone (live-broke
+    on GSE161706: a sole remaining ..._Table_S3_Figure_6.xlsx that looked
+    like the only option by filename alone, but parses to 0 rows -- not the
+    matrix).
 
     Returns (paths, "unknown") -- "unknown" because content verification
     doesn't tell us the quantification unit, only that the shape matches --
