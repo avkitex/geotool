@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 import requests
 
-from geotool import clinical_annotate, config, download
+from geotool import clinical_annotate, config, download, gene_symbol_mapping
 
 
 def _big_gene_index(n: int = config.MIN_EXPECTED_RNASEQ_GENE_COUNT) -> list[str]:
@@ -18,6 +18,22 @@ def _big_gene_index(n: int = config.MIN_EXPECTED_RNASEQ_GENE_COUNT) -> list[str]
     incidentally trip probe_mapping.check_gene_count's truncated-gene-list
     heuristic when that's not what the test is exercising."""
     return [f"GENE{i}" for i in range(n)]
+
+
+@pytest.fixture(autouse=True)
+def _fake_gene_reference(monkeypatch):
+    """_content_verified_column_count's gene-identity check needs a real
+    gene_symbol_mapping.GencodeReference; tests use synthetic "GENE{i}"
+    identifiers (see _big_gene_index/_big_matrix_dataframe) rather than
+    depending on the real, multi-MB-on-disk GENCODE tables -- this
+    autouse fixture recognizes that exact convention (well beyond any
+    n_genes used in this file) so every test gets it for free instead of
+    each one loading/mocking a reference individually. A test exercising
+    the negative case (a genuinely non-gene identifier axis) still gets a
+    real rejection: this reference simply doesn't know that axis either."""
+    known = frozenset(f"GENE{i}" for i in range(config.MIN_EXPECTED_RNASEQ_GENE_COUNT * 2))
+    reference = gene_symbol_mapping.GencodeReference("test", {}, {}, {}, known)
+    monkeypatch.setattr(download, "_default_gene_reference", lambda: reference)
 
 
 class FakeGSM:
@@ -454,6 +470,77 @@ def test_select_primary_expression_file_by_content_gives_up_beyond_five_candidat
     to hit the target by chance becomes a real risk rather than a signal."""
     paths = [Path(f"GSE1_batch{i}.tsv.gz") for i in range(6)]
     assert download.select_primary_expression_file_by_content(paths, n_samples=48) is None
+
+
+# --- _content_verified_column_count: gene-identity + non-expression-genomic-
+# file rejection, on top of the shape checks above ---
+
+def test_content_verified_column_count_rejects_non_gene_identifier_axis(tmp_path):
+    """Real GSE236496 shape: a ChIP-Seq peak-calls table (chr/start/ned/
+    state/gene_chr/gene_start/gene_end/gene_id/gene_name/strand columns,
+    thousands of rows) whose column count happened to fall within
+    _matches_sample_count's tolerance of that cohort's real sample count --
+    shape alone would have wrongly accepted it; its identifier axis (here,
+    'chr') was never a real gene/transcript in the first place."""
+    path = tmp_path / "GSE236496_Peak_calls.tsv.gz"
+    n_rows = 2000
+    pd.DataFrame({
+        "chr": [f"chr{(i % 24) + 1}" for i in range(n_rows)],
+        "start": range(n_rows),
+        "end": range(1, n_rows + 1),
+        "gene_id": [f"ENSG{i:011d}" for i in range(n_rows)],
+        "gene_name": [f"GENE{i}" for i in range(n_rows)],
+        "strand": ["+"] * n_rows,
+    }).to_csv(path, sep="\t", index=False, compression="gzip")
+
+    assert download._content_verified_column_count(path) is None
+
+
+def test_content_verified_column_count_rejects_maf_shaped_file_despite_real_gene_symbols(tmp_path):
+    """The harder case a gene-identity check alone can't catch: a MAF
+    (Mutation Annotation Format) file's Hugo_Symbol column carries real
+    HUGO gene symbols, so it would pass gene-identity verification on its
+    own -- it's the MAF-specific column vocabulary (Variant_Classification,
+    Tumor_Sample_Barcode, ...) that must independently reject it."""
+    path = tmp_path / "GSE1_mutations.tsv.gz"
+    n_rows = 2000
+    pd.DataFrame({
+        "Hugo_Symbol": [f"GENE{i}" for i in range(n_rows)],
+        "Chromosome": [f"chr{(i % 24) + 1}" for i in range(n_rows)],
+        "Start_Position": range(n_rows),
+        "End_Position": range(1, n_rows + 1),
+        "Variant_Classification": ["Missense_Mutation"] * n_rows,
+        "Variant_Type": ["SNP"] * n_rows,
+        "Reference_Allele": ["A"] * n_rows,
+        "Tumor_Seq_Allele1": ["A"] * n_rows,
+        "Tumor_Seq_Allele2": ["T"] * n_rows,
+        "Tumor_Sample_Barcode": [f"Sample{i % 20}" for i in range(n_rows)],
+    }).to_csv(path, sep="\t", index=False, compression="gzip")
+
+    assert download._content_verified_column_count(path) is None
+
+
+def test_content_verified_column_count_accepts_real_gene_matrix_with_incidental_start_column(tmp_path):
+    """A real gene expression matrix that happens to have one column named
+    like a BED/VCF field (e.g. a sample literally named "start") must not
+    be rejected -- _MIN_SIGNATURE_KEYWORD_MATCHES requires several matching
+    columns from the same signature, not just one incidental hit."""
+    path = tmp_path / "GSE1_counts.tsv.gz"
+    _big_matrix_dataframe(1200, 5).rename(columns={"GSM0": "start"}).to_csv(path, sep="\t", compression="gzip")
+
+    assert download._content_verified_column_count(path) == 5
+
+
+def test_looks_like_non_expression_genomic_file_detects_each_signature():
+    assert download._looks_like_non_expression_genomic_file(["chr", "start", "end", "gene_id"])
+    assert download._looks_like_non_expression_genomic_file(["#CHROM", "POS", "REF", "ALT", "QUAL", "FILTER"])
+    assert download._looks_like_non_expression_genomic_file(
+        ["Hugo_Symbol", "Variant_Classification", "Tumor_Sample_Barcode"]
+    )
+
+
+def test_looks_like_non_expression_genomic_file_ignores_incidental_single_match():
+    assert not download._looks_like_non_expression_genomic_file(["gene_id", "start", "SAMPLE1", "SAMPLE2"])
 
 
 def test_check_rnaseq_expression_qc_uses_content_verification_when_no_unit_keyword(tmp_path):
