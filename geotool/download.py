@@ -810,7 +810,14 @@ def check_rnaseq_expression_qc(
     gene_count_notes = probe_mapping.check_gene_count(matrix)
     if gene_count_notes and ".truncated" not in primary_path.name:
         renamed = primary_path.parent / f"{_strip_known_extensions(primary_path.name)}.truncated.tsv.gz"
-        primary_path.rename(renamed)
+        # Path.rename() only overwrites an existing destination on POSIX --
+        # on Windows it raises FileExistsError instead (live-broke a repeat
+        # --force run on GSE197728: the .truncated.tsv.gz from an earlier
+        # run was already sitting there). Path.replace() overwrites
+        # unconditionally on both, and the content is identical either way
+        # (same primary file, same truncation verdict), so silently
+        # replacing it is correct, not a data-loss risk.
+        primary_path.replace(renamed)
         primary_path = renamed
 
     notes = probe_mapping.check_expression_qc(matrix) + gene_count_notes
