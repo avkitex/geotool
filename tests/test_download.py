@@ -319,6 +319,34 @@ def test_check_rnaseq_expression_qc_returns_nothing_when_no_matrix_file(tmp_path
     assert notes == []
 
 
+def test_check_rnaseq_expression_qc_skips_featurecounts_comment_line(tmp_path):
+    """Real GSE264630 shape: featureCounts writes a leading '# Program:
+    featureCounts ...' line before the real header row. Without skipping it,
+    that comment line is read as the header, and the real header row
+    (Geneid, Chr, Start, ..., sample columns) is misread as a data row --
+    silently destroying every column name and shifting every value down one
+    row. Live-verified: this corrupted a real cohort's primary file in place
+    before comment="#" was added to _load_expression_file_for_qc."""
+    path = tmp_path / "GSE264630_counts.txt.gz"
+    genes = _big_gene_index()
+    lines = ['# Program:featureCounts v2.0.1; Command:"featureCounts" "-a" "ref.gtf" "-o" "counts.txt" ...']
+    lines.append("Geneid\tChr\tStart\tEnd\tStrand\tLength\tGSM1\tGSM2")
+    for i, gene in enumerate(genes):
+        lines.append(f"{gene}\t1\t{i}\t{i + 1}\t+\t100\t{i}\t{i * 2}")
+    with gzip.open(path, "wt") as f:
+        f.write("\n".join(lines) + "\n")
+
+    primary_path, unit, notes = download.check_rnaseq_expression_qc([path], tmp_path)
+
+    assert unit == "count"
+    written = pd.read_csv(primary_path, sep="\t")
+    assert list(written.columns) == ["Geneid", "GSM1", "GSM2"]
+    assert written["Geneid"].tolist() == genes
+    # values are log2(x + 1)-transformed by normalize_expression_matrix -- the
+    # point of this test is the columns/rows survived intact, not the scale.
+    assert written["GSM1"].iloc[10] == pytest.approx(np.log2(10 + 1), abs=1e-3)
+
+
 def test_check_rnaseq_expression_qc_notes_unparseable_file(tmp_path):
     path = tmp_path / "broken_tpm.csv.gz"
     path.write_bytes(b"not actually gzip-compressed data")
@@ -1324,4 +1352,50 @@ def test_resolve_download_targets_returns_cached_id_with_zero_fetches(monkeypatc
 
 def test_resolve_download_targets_expands_uncached_superseries(monkeypatch, tmp_path):
     monkeypatch.setattr(download.geo_fetch, "resolve_leaf_series_ids", lambda gse_id: ["GSE101", "GSE102"])
+    monkeypatch.setattr(
+        download.geo_fetch, "find_superseries_orphans",
+        lambda gse_id, leaf_ids: {"orphaned_gsm_ids": [], "orphaned_supplementary_files": []},
+    )
     assert download.resolve_download_targets("GSE100", series_dir=tmp_path) == ["GSE101", "GSE102"]
+
+
+def test_resolve_download_targets_writes_superseries_marker_with_orphans(monkeypatch, tmp_path):
+    """The marker records the subseries it expanded to plus
+    find_superseries_orphans' result, so both survive past this one CLI run
+    -- see build_prmt5_cohort_annotations.py's use of it, and _cached_result's
+    guard below."""
+    monkeypatch.setattr(download.geo_fetch, "resolve_leaf_series_ids", lambda gse_id: ["GSE101", "GSE102"])
+    monkeypatch.setattr(
+        download.geo_fetch, "find_superseries_orphans",
+        lambda gse_id, leaf_ids: {"orphaned_gsm_ids": ["GSM_X"], "orphaned_supplementary_files": []},
+    )
+
+    download.resolve_download_targets("GSE100", series_dir=tmp_path)
+
+    marker = json.loads((tmp_path / "GSE100" / "superseries.json").read_text())
+    assert marker == {
+        "subseries": ["GSE101", "GSE102"],
+        "orphaned_gsm_ids": ["GSM_X"],
+        "orphaned_supplementary_files": [],
+    }
+
+
+def test_resolve_download_targets_does_not_write_marker_for_non_superseries(monkeypatch, tmp_path):
+    monkeypatch.setattr(download.geo_fetch, "resolve_leaf_series_ids", lambda gse_id: [gse_id])
+    download.resolve_download_targets("GSE1", series_dir=tmp_path)
+    assert not (tmp_path / "GSE1" / "superseries.json").exists()
+
+
+def test_cached_result_ignores_stale_annotation_when_superseries_marker_exists(tmp_path):
+    """A GSE id can end up with a real annotation.tsv/series.tsv left over
+    from before it was ever recognized as a SuperSeries (a real, live
+    situation: GSE236500 already had stale output from an earlier, unrelated
+    run). Once superseries.json exists, that stale pair must never be
+    trusted as "already downloaded" again, even without --force."""
+    out_dir = tmp_path / "GSE236500"
+    out_dir.mkdir()
+    pd.DataFrame([{"platform_details": "[]"}]).to_csv(out_dir / "series.tsv", sep="\t", index=False)
+    pd.DataFrame([{"gsm_id": "GSM1"}]).to_csv(out_dir / "annotation.tsv", sep="\t", index=False)
+    (out_dir / "superseries.json").write_text(json.dumps({"subseries": ["GSE236496"]}))
+
+    assert download._cached_result("GSE236500", out_dir) is None
