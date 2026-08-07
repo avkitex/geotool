@@ -146,6 +146,49 @@ def _load_expression_qc(out_dir: Path) -> dict | None:
         return json.load(f)
 
 
+def _write_superseries_marker(out_dir: Path, subseries: list[str], orphans: dict) -> None:
+    """Sidecar recording that this GSE id is a SuperSeries, not a
+    downloadable cohort in its own right -- download_cohort is never called
+    on it (see resolve_download_targets), so its own data/series/<gse_id>/
+    would otherwise contain nothing but whatever series.tsv/annotation.tsv
+    happen to already be sitting there (e.g. stale output from a much
+    earlier, unrelated run, before this id was ever recognized as a
+    SuperSeries), with no way for anything reading that directory to tell
+    the difference from a real, freshly-downloaded cohort. Rewritten on
+    every call (even without force=True -- this is free, cache-hit metadata,
+    not a real download), so its mtime/content are always current regardless
+    of anything else already on disk here.
+
+    Also carries find_superseries_orphans' result, so a SuperSeries record
+    that (unusually) carries its own supplementary files or samples not
+    present in any subseries isn't silently lost -- flagged here for a human
+    to look at, not guessed at further. orphaned_supplementary_files is
+    already diffed against every leaf's own covered URLs (series- and
+    sample-level both -- see all_supplementary_file_urls), so a file
+    published on both the parent and a subseries is never double-counted
+    here as "extra".
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"subseries": subseries, **orphans}
+    with open(out_dir / "superseries.json", "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    if orphans["orphaned_gsm_ids"] or orphans["orphaned_supplementary_files"]:
+        print(
+            f"  {out_dir.name}: WARNING -- SuperSeries record itself carries data not in any "
+            f"subseries ({len(orphans['orphaned_gsm_ids'])} orphaned sample(s), "
+            f"{len(orphans['orphaned_supplementary_files'])} orphaned supplementary file(s)) -- see "
+            f"{out_dir / 'superseries.json'}"
+        )
+
+
+def _load_superseries_marker(out_dir: Path) -> dict | None:
+    path = out_dir / "superseries.json"
+    if not path.exists():
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def _write_matrix(df: pd.DataFrame, path: Path, index: bool = True) -> None:
     """Write a probe/gene x sample matrix as gzip-compressed TSV.
 
@@ -219,11 +262,7 @@ def download_rnaseq_files(gse, out_dir: Path) -> list[Path]:
     """Download the series'/samples' supplementary expression files verbatim --
     no parsing or reshaping. Raw-data extensions (FASTQ/BAM/CEL/...) are skipped.
     """
-    urls = set(gse.metadata.get("supplementary_file", []))
-    for gsm in gse.gsms.values():
-        for key, values in gsm.metadata.items():
-            if key.startswith("supplementary_file"):
-                urls.update(values)
+    urls = geo_fetch.all_supplementary_file_urls(gse)
 
     expr_dir = out_dir / "expression"
     downloaded = []
@@ -348,16 +387,25 @@ def select_primary_expression_file(paths: list[Path]) -> tuple[Path, str] | None
 
 
 def _load_expression_file_for_qc(path: Path) -> pd.DataFrame | None:
-    """Best-effort read of an arbitrary submitter supplementary file for QC
-    purposes only -- format/delimiter varies a lot across submitters, so
-    this sniffs rather than assumes, and returns None (not raised) on
-    anything it can't parse. Never used for anything but check_expression_qc:
-    a QC nice-to-have must never be able to fail a real download.
+    """Best-effort read of an arbitrary submitter supplementary file --
+    format/delimiter varies a lot across submitters, so this sniffs rather
+    than assumes, and returns None (not raised) on anything it can't parse.
+    Despite the name, this is no longer QC-only: resolve_primary_expression_
+    matrix's normalize_expression_matrix path reads the chosen primary file
+    through here too, and can end up *writing* the result back over the
+    original (see _write_normalized_expression_matrix) -- so a parse mistake
+    here doesn't just mis-report QC, it can corrupt the file on disk.
+
+    comment="#" skips featureCounts' leading "# Program:featureCounts ..."
+    metadata line (live example: GSE264630's count files) -- without it, that
+    line gets read as the header row, shifting the real header (gene id,
+    Chr, Start, ..., sample columns) down into what looks like a data row,
+    and every real column name is lost.
     """
     try:
         if path.name.lower().endswith((".xlsx", ".xls")):
             return pd.read_excel(path)
-        return pd.read_csv(path, sep=None, engine="python", compression="infer")
+        return pd.read_csv(path, sep=None, engine="python", compression="infer", comment="#")
     except Exception:
         return None
 
@@ -1000,6 +1048,12 @@ def _cached_result(gse_id: str, out_dir: Path) -> tuple[dict, list[dict]] | None
     series_path = out_dir / "series.tsv"
     if not annotation_path.exists() or not series_path.exists():
         return None
+    if (out_dir / "superseries.json").exists():
+        # download_cohort is never called on a SuperSeries id itself (see
+        # resolve_download_targets) -- if this marker exists, whatever
+        # annotation.tsv/series.tsv also happen to be sitting here predate
+        # that detection and must not be trusted as "already downloaded".
+        return None
 
     srow = pd.read_csv(series_path, sep="\t").iloc[0].to_dict()
     platform_details = json.loads(srow.get("platform_details") or "[]")
@@ -1093,11 +1147,20 @@ def resolve_download_targets(gse_id: str, series_dir: Path | None = None, force:
     for the common (non-SuperSeries) case. Otherwise defers to
     geo_fetch.resolve_leaf_series_ids to detect and expand a SuperSeries into its
     subseries, so each gets its own independent download and eligibility check rather
-    than being blended into one incoherent series.
+    than being blended into one incoherent series. When gse_id turns out to be a
+    SuperSeries, also writes a data/series/<gse_id>/superseries.json marker (see
+    _write_superseries_marker) -- both so nothing downstream mistakes whatever's in
+    that directory for a real cohort, and so the subseries it expanded to are
+    recorded somewhere durable rather than only ever printed once by the CLI.
     """
-    if not force and _cached_result(gse_id, _series_dir(gse_id, series_dir)) is not None:
+    out_dir = _series_dir(gse_id, series_dir)
+    if not force and _cached_result(gse_id, out_dir) is not None:
         return [gse_id]
-    return geo_fetch.resolve_leaf_series_ids(gse_id)
+    leaf_ids = geo_fetch.resolve_leaf_series_ids(gse_id)
+    if leaf_ids != [gse_id]:
+        orphans = geo_fetch.find_superseries_orphans(gse_id, leaf_ids)
+        _write_superseries_marker(out_dir, leaf_ids, orphans)
+    return leaf_ids
 
 
 def download_cohort(
