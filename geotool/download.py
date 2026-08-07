@@ -645,12 +645,12 @@ def resolve_primary_expression_matrix(
 def check_rnaseq_expression_qc(
     paths: list[Path], out_dir: Path, n_samples: int | None = None
 ) -> tuple[Path | None, str | None, list[str]]:
-    """resolve_primary_expression_matrix + probe_mapping.check_expression_qc
-    on the resulting canonical .tsv.gz, for the common (one series- or
-    sample-level matrix per series) case. Returns (primary_path, unit,
-    qc_notes) -- primary_path/unit are None if nothing recognizable was
-    found; qc_notes is empty if the file couldn't be parsed either (noted as
-    its own entry) or nothing stood out.
+    """resolve_primary_expression_matrix + probe_mapping.check_expression_qc/
+    check_gene_count on the resulting canonical .tsv.gz, for the common (one
+    series- or sample-level matrix per series) case. Returns (primary_path,
+    unit, qc_notes) -- primary_path/unit are None if nothing recognizable
+    was found; qc_notes is empty if the file couldn't be parsed either
+    (noted as its own entry) or nothing stood out.
 
     When resolve_primary_expression_matrix can't name a single primary file
     but `n_samples` is given, checks whether several remaining candidates'
@@ -659,6 +659,13 @@ def check_rnaseq_expression_qc(
     its 48 samples exactly) and GSE131050's two (66 + 125 = 191, matching
     its 191). Reported as a QC note pointing at the files rather than picked
     as "the" primary, since no single one of them is the whole matrix.
+
+    A gene count below config.MIN_EXPECTED_RNASEQ_GENE_COUNT (see
+    probe_mapping.check_gene_count) additionally renames primary_path to
+    "<name>.truncated.tsv.gz" -- there's nothing to auto-fix (genes that
+    were never published can't be recovered), so unlike
+    normalize_expression_matrix's fixes this is a visible marker on the
+    file itself rather than a silent correction.
     """
     resolved = resolve_primary_expression_matrix(paths, out_dir, n_samples=n_samples)
     if resolved is None:
@@ -679,7 +686,13 @@ def check_rnaseq_expression_qc(
     if matrix is None:
         return primary_path, unit, [f"{primary_path.name}: could not parse for QC"]
 
-    notes = probe_mapping.check_expression_qc(matrix)
+    gene_count_notes = probe_mapping.check_gene_count(matrix)
+    if gene_count_notes and ".truncated" not in primary_path.name:
+        renamed = primary_path.parent / f"{_strip_known_extensions(primary_path.name)}.truncated.tsv.gz"
+        primary_path.rename(renamed)
+        primary_path = renamed
+
+    notes = probe_mapping.check_expression_qc(matrix) + gene_count_notes
     return primary_path, unit, [f"{primary_path.name}: {note}" for note in notes]
 
 

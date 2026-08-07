@@ -36,6 +36,13 @@ COVERAGE_THRESHOLD = int(os.environ.get("GEOTOOL_COVERAGE_THRESHOLD", "12000"))
 # informational "full_transcriptome" vs "limited" label, not a hard gate.
 MIN_ARRAY_PROBE_COUNT = int(os.environ.get("GEOTOOL_MIN_ARRAY_PROBE_COUNT", "8000"))
 
+# A real full-transcriptome bulk RNA-seq gene-level table has tens of thousands of rows.
+# Fewer than this strongly suggests the submitter only published a filtered subset (live
+# example: GSE197728's supplementary table, which only reports genes with FPKM > 10 --
+# 7833 rows, not a whole transcriptome) rather than every gene actually measured. RNA-seq
+# only -- unlike COVERAGE_THRESHOLD above, this isn't a microarray platform-density check.
+MIN_EXPECTED_RNASEQ_GENE_COUNT = int(os.environ.get("GEOTOOL_MIN_EXPECTED_RNASEQ_GENE_COUNT", "16000"))
+
 
 def ensure_dirs() -> None:
     for d in (GEO_CACHE_DIR, REPORTS_DIR, SERIES_DIR, PLATFORMS_DIR):

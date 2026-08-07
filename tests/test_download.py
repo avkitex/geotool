@@ -10,7 +10,14 @@ import pandas as pd
 import pytest
 import requests
 
-from geotool import clinical_annotate, download
+from geotool import clinical_annotate, config, download
+
+
+def _big_gene_index(n: int = config.MIN_EXPECTED_RNASEQ_GENE_COUNT) -> list[str]:
+    """Enough rows that a test's small handful of real values don't
+    incidentally trip probe_mapping.check_gene_count's truncated-gene-list
+    heuristic when that's not what the test is exercising."""
+    return [f"GENE{i}" for i in range(n)]
 
 
 class FakeGSM:
@@ -246,8 +253,10 @@ def test_check_rnaseq_expression_qc_flags_linear_scale_fpkm_matrix(tmp_path):
     them, so by the time check_expression_qc runs on the written file
     there's nothing left to report."""
     path = tmp_path / "GSE163305_FPKM_6D_GSK6_DMSO.csv.gz"
+    genes = _big_gene_index()
+    filler = [0.0] * (len(genes) - 2)
     pd.DataFrame(
-        {"GSK6D_0": [0.0, 16096.1], "DMSO6D_0": [0.0, 12677.3]}, index=["XLOC_1", "XLOC_2"]
+        {"GSK6D_0": [0.0, 16096.1] + filler, "DMSO6D_0": [0.0, 12677.3] + filler}, index=genes
     ).to_csv(path, compression="gzip")
 
     primary_path, unit, notes = download.check_rnaseq_expression_qc([path], tmp_path)
@@ -263,13 +272,43 @@ def test_check_rnaseq_expression_qc_flags_negative_values(tmp_path):
     """The RNA-seq-specific risk called out by design: log2(x) applied
     without a +1 pseudocount goes negative for x in (0, 1)."""
     path = tmp_path / "GSE1_TPM.csv.gz"
-    pd.DataFrame({"GSM1": [-1.2, 3.0]}, index=["GENE1", "GENE2"]).to_csv(path, compression="gzip")
+    genes = _big_gene_index()
+    pd.DataFrame({"GSM1": [-1.2, 3.0] + [0.0] * (len(genes) - 2)}, index=genes).to_csv(path, compression="gzip")
 
     primary_path, unit, notes = download.check_rnaseq_expression_qc([path], tmp_path)
 
     assert unit == "tpm"
     assert len(notes) == 1
     assert "negative value" in notes[0]
+
+
+def test_check_rnaseq_expression_qc_marks_truncated_gene_list(tmp_path):
+    """Real GSE197728 shape: only genes with FPKM > 10 were reported (7833
+    rows there; a small count here for a fast test) -- the primary file
+    gets renamed with a ".truncated" marker since there's no way to
+    auto-fix genes that were never published."""
+    path = tmp_path / "GSE197728_counts.csv.gz"
+    genes = [f"GENE{i}" for i in range(100)]
+    pd.DataFrame({"GSM1": range(100), "GSM2": range(100)}, index=genes).to_csv(path, compression="gzip")
+
+    primary_path, unit, notes = download.check_rnaseq_expression_qc([path], tmp_path)
+
+    assert primary_path == tmp_path / "GSE197728_counts.truncated.tsv.gz"
+    assert primary_path.exists()
+    assert not (tmp_path / "GSE197728_counts.tsv.gz").exists()
+    assert len(notes) == 1
+    assert "only 100 genes" in notes[0] and "filtered/truncated" in notes[0]
+
+
+def test_check_rnaseq_expression_qc_does_not_double_mark_already_truncated_file(tmp_path):
+    path = tmp_path / "GSE1_counts.truncated.tsv.gz"
+    genes = [f"GENE{i}" for i in range(100)]
+    pd.DataFrame({"GSM1": range(100)}, index=genes).to_csv(path, sep="\t", compression="gzip")
+
+    primary_path, unit, notes = download.check_rnaseq_expression_qc([path], tmp_path)
+
+    assert primary_path == path  # not renamed again to ".truncated.truncated.tsv.gz"
+    assert len(notes) == 1
 
 
 def test_check_rnaseq_expression_qc_returns_nothing_when_no_matrix_file(tmp_path):
@@ -298,7 +337,11 @@ def test_check_rnaseq_expression_qc_reads_xlsx_files(tmp_path):
     final format. Linear-scale values get auto-fixed (see the .csv.gz test
     above), so there's nothing left for check_expression_qc to flag."""
     path = tmp_path / "GSE310927_L3.6_EPZ_Prex_Combo_CPM.xlsx"
-    pd.DataFrame({"GSM1": [0.0, 999.0], "GSM2": [1.0, 500.0]}, index=["GENE1", "GENE2"]).to_excel(path)
+    genes = _big_gene_index()
+    filler = [0.0] * (len(genes) - 2)
+    pd.DataFrame(
+        {"GSM1": [0.0, 999.0] + filler, "GSM2": [1.0, 500.0] + filler}, index=genes
+    ).to_excel(path)
 
     primary_path, unit, notes = download.check_rnaseq_expression_qc([path], tmp_path)
 
@@ -390,7 +433,7 @@ def test_check_rnaseq_expression_qc_uses_content_verification_when_no_unit_keywo
     real matrix by content when resolve_primary_expression_matrix's
     filename-only path finds nothing, given n_samples."""
     path = tmp_path / "GSE172356_PDA_gene_expression_matrix.txt.gz"
-    _big_matrix_dataframe(1200, 62).to_csv(path, sep="\t", compression="gzip")
+    _big_matrix_dataframe(config.MIN_EXPECTED_RNASEQ_GENE_COUNT, 62).to_csv(path, sep="\t", compression="gzip")
 
     primary_path, unit, notes = download.check_rnaseq_expression_qc([path], tmp_path, n_samples=62)
 
@@ -836,7 +879,10 @@ def test_download_cohort_reports_rnaseq_expression_qc_and_reuses_from_cache(monk
         download.clinical_annotate, "plan_column_mapping", lambda samples, model=None: clinical_annotate.ColumnMappingPlan()
     )
 
-    fpkm_bytes = pd.DataFrame({"GSM1": [0.0, 16096.1]}, index=["GENE1", "GENE2"]).to_csv().encode()
+    genes = _big_gene_index()
+    fpkm_bytes = pd.DataFrame(
+        {"GSM1": [0.0, 16096.1] + [0.0] * (len(genes) - 2)}, index=genes
+    ).to_csv().encode()
     fpkm_gz = gzip.compress(fpkm_bytes)
 
     def fake_get(url, timeout=None):

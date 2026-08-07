@@ -397,6 +397,36 @@ def test_check_expression_qc_empty_matrix():
     assert probe_mapping.check_expression_qc(pd.DataFrame()) == []
 
 
+def test_check_gene_count_flags_real_gse197728_shape():
+    """GSE197728's actual supplementary table: only genes with FPKM > 10
+    were reported, 7833 rows."""
+    matrix = pd.DataFrame(index=range(7833))
+    notes = probe_mapping.check_gene_count(matrix)
+    assert len(notes) == 1
+    assert "7833 genes" in notes[0]
+    assert "filtered/truncated" in notes[0]
+
+
+def test_check_gene_count_clean_for_full_transcriptome():
+    matrix = pd.DataFrame(index=range(20000))
+    assert probe_mapping.check_gene_count(matrix) == []
+
+
+def test_check_gene_count_boundary_at_threshold():
+    from geotool import config
+
+    at_threshold = pd.DataFrame(index=range(config.MIN_EXPECTED_RNASEQ_GENE_COUNT))
+    assert probe_mapping.check_gene_count(at_threshold) == []
+    just_below = pd.DataFrame(index=range(config.MIN_EXPECTED_RNASEQ_GENE_COUNT - 1))
+    assert len(probe_mapping.check_gene_count(just_below)) == 1
+
+
+def test_check_gene_count_empty_matrix_not_flagged():
+    """An empty matrix is a "no matrix at all" problem (see
+    classify_expression_status's has_matrix check), not "truncated"."""
+    assert probe_mapping.check_gene_count(pd.DataFrame()) == []
+
+
 def test_check_expression_qc_flags_likely_transposed_matrix():
     """15 "samples" (rows) x 20 "genes" (columns) -- the reverse of the
     expected genes-as-rows/samples-as-columns orientation."""
@@ -533,6 +563,24 @@ def test_normalize_expression_matrix_recovers_gene_identifier_from_pandas_index(
     assert any("pandas index" in n for n in notes)
     assert list(fixed.columns) == ["gene_id", "pat_01_T", "pat_02_T"]
     assert fixed["gene_id"].tolist() == ["DDX11L1", "WASH7P"]
+
+
+def test_normalize_expression_matrix_drops_fold_change_and_pvalue_columns():
+    """Real GSE197728 shape: a "fold change" column computed from two of the
+    file's own sample columns, published alongside them -- not a sample
+    itself, and easy to mistake for one since it's numeric."""
+    matrix = pd.DataFrame(
+        {
+            "Gene symbol": ["A1BG", "TP53"],
+            "Tracking_ID": ["ENSG1", "ENSG2"],
+            "12-0160-Veh": [1.0, 4.5],
+            "12-0160-ALA": [2.0, 8.8],
+            "12-0160 fold change (ALA/Veh)": [2.0, 1.95],
+            "adj p-value": [0.01, 0.04],
+        }
+    )
+    fixed, notes = probe_mapping.normalize_expression_matrix(matrix)
+    assert list(fixed.columns) == ["Gene symbol", "12-0160-Veh", "12-0160-ALA"]
 
 
 def test_normalize_expression_matrix_falls_back_to_first_column_when_no_keyword_matches():
