@@ -357,16 +357,21 @@ _ID_COLUMN_EXACT_PRIORITY = ["gene", "id", "name"]
 
 # Column names that are recognizable submitter/annotation metadata rather
 # than per-sample expression data -- dropped by normalize_expression_matrix
-# whenever they aren't the one column chosen as the identifier. Covers both
+# whenever they aren't the one column chosen as the identifier. Covers
 # alternate identifier columns (a file with both "gene_id" and "Symbol" only
-# needs one) and pure annotation columns from featureCounts/htseq-style
-# files (seqnames/strand/biotype/etc., published alongside per-sample counts
-# in the same table -- live example: GSE208732/GSE243584's PDAC RNA-seq
-# count matrices). Substring-matched against column *names* (not values), so
-# the same "GENE0" collision risk above doesn't apply here.
+# needs one), pure annotation columns from featureCounts/htseq-style files
+# (seqnames/strand/biotype/etc., published alongside per-sample counts in
+# the same table -- live example: GSE208732/GSE243584's PDAC RNA-seq count
+# matrices), and derived/computed columns that look numeric like a sample
+# but aren't one -- a fold-change or p-value column sitting next to the raw
+# per-sample values it was computed from (live example: GSE197728's "12-0160
+# fold change (ALA/Veh)", a ratio between two of its own sample columns).
+# Substring-matched against column *names* (not values), so the same
+# "GENE0" collision risk above doesn't apply here.
 _METADATA_COLUMN_KEYWORDS = _ID_COLUMN_SUBSTRING_PRIORITY + [
     "entrez", "seqnames", "chr", "chromosome", "strand", "start", "end", "width",
     "biotype", "type_of_gene", "locus", "hgnc", "name", "length", "description", "annotation",
+    "fold_change", "foldchange", "log2fc", "logfc", "p_value", "pvalue", "padj", "fdr", "q_value", "qvalue",
 ]
 
 # Bare row-numbering columns -- e.g. a literal "#" column, seen live in
@@ -454,6 +459,28 @@ def check_expression_qc(matrix: pd.DataFrame) -> list[str]:
         )
 
     return notes
+
+
+def check_gene_count(matrix: pd.DataFrame) -> list[str]:
+    """RNA-seq-specific: a real full-transcriptome bulk RNA-seq gene-level
+    table has tens of thousands of rows. Fewer than
+    config.MIN_EXPECTED_RNASEQ_GENE_COUNT strongly suggests the submitter
+    only published a filtered subset of genes -- live example: GSE197728's
+    supplementary table, which only reports genes with FPKM > 10 (7833
+    rows). There's no way to recover genes that were never published, so
+    this is reported, not auto-fixed by normalize_expression_matrix.
+
+    Not called for microarray matrices -- a platform's own probe/gene
+    coverage is a fixed design property there (see
+    platform_classify.classify_coverage), not evidence of filtering.
+    """
+    n_genes = len(matrix)
+    if n_genes == 0 or n_genes >= config.MIN_EXPECTED_RNASEQ_GENE_COUNT:
+        return []
+    return [
+        f"only {n_genes} genes (< {config.MIN_EXPECTED_RNASEQ_GENE_COUNT}) -- likely a "
+        "filtered/truncated gene list, not the full transcriptome"
+    ]
 
 
 def normalize_expression_matrix(matrix: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:

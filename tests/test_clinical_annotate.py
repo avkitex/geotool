@@ -328,3 +328,8 @@ def test_classify_expression_status_joins_both_tags_when_both_present():
 def test_classify_expression_status_looks_transposed():
     notes = ["expression.tsv.gz: more columns (20) than rows (15) -- expected features (genes) as rows and samples as columns; this matrix may be transposed"]
     assert ca.classify_expression_status(notes, has_matrix=True) == ca.EXPRESSION_STATUS_LOOKS_TRANSPOSED
+
+
+def test_classify_expression_status_low_gene_count():
+    notes = ["expression.tsv.gz: only 7833 genes (< 16000) -- likely a filtered/truncated gene list, not the full transcriptome"]
+    assert ca.classify_expression_status(notes, has_matrix=True) == ca.EXPRESSION_STATUS_LOW_GENE_COUNT
