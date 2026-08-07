@@ -316,6 +316,25 @@ def test_check_rnaseq_expression_qc_marks_truncated_gene_list(tmp_path):
     assert "only 100 genes" in notes[0] and "filtered/truncated" in notes[0]
 
 
+def test_check_rnaseq_expression_qc_overwrites_stale_truncated_file_from_earlier_run(tmp_path):
+    """Real GSE197728 shape: a repeat --force run re-resolves the primary
+    file back to its plain (non-.truncated) name, but the .truncated.tsv.gz
+    destination from an *earlier* run is still sitting on disk -- must
+    overwrite it, not fail. Live-broke on Windows before Path.replace()
+    (Path.rename() only overwrites an existing destination on POSIX)."""
+    path = tmp_path / "GSE197728_counts.csv.gz"
+    genes = [f"GENE{i}" for i in range(100)]
+    pd.DataFrame({"GSM1": range(100), "GSM2": range(100)}, index=genes).to_csv(path, compression="gzip")
+    stale = tmp_path / "GSE197728_counts.truncated.tsv.gz"
+    stale.write_bytes(b"stale content from an earlier run")
+
+    primary_path, unit, notes = download.check_rnaseq_expression_qc([path], tmp_path)
+
+    assert primary_path == stale
+    assert primary_path.read_bytes() != b"stale content from an earlier run"
+    assert len(notes) == 1
+
+
 def test_check_rnaseq_expression_qc_does_not_double_mark_already_truncated_file(tmp_path):
     path = tmp_path / "GSE1_counts.truncated.tsv.gz"
     genes = [f"GENE{i}" for i in range(100)]
