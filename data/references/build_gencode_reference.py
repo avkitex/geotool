@@ -78,6 +78,21 @@ BAD_GENE_TAGS = ("readthrough_gene", "artifactual_duplication")
 # histone and is polyadenylated normally, so it's left untouched.
 _RD_HISTONE_RE = re.compile(r"^(H1-[1-6]|H2AC\d+|H2BC\d+|H3C\d+|H4C\d+)$")
 
+# Immunoglobulin (IG) and T-cell receptor (TR) gene segments -- IGH/IGK/IGL
+# V/D/J/C and TRA/TRB/TRG/TRD V/D/J/C. GENCODE already types nearly all of
+# these IG_*_gene/TR_*_gene (not protein_coding), so the gene_type check
+# below excludes them anyway; this symbol pattern is a documented, explicit
+# reason for that exclusion (rather than the generic non-coding/pseudogene
+# one) and a backstop for the rare case where a segment is otherwise typed
+# (e.g. TRBV11-2, protein_coding but non-CCDS). These are germline
+# VDJ-recombination loci: standard bulk RNA-seq read alignment can't
+# resolve which rearranged allele a read came from, so they're not usable
+# gene-expression signal regardless of biotype label. Requires a trailing
+# digit/hyphen or end-of-string after the V/D/J/C letter so real unrelated
+# genes that merely start with "TR"+letter (TRADD, TRAF1, TRAP1, TRAK1,
+# ...) don't match.
+_IG_TR_RECEPTOR_RE = re.compile(r"^(IG[HKL][VDJC]|TR[ABGD][VDJC])($|[0-9-])")
+
 _ATTR_RE = re.compile(r'(\w+) (?:"([^"]*)"|(\S+));')
 
 
@@ -262,12 +277,18 @@ def step4_clean_matrix(genes_df, tx_df, out_dir, tag):
     # comparable biology -- not worth carrying in a cross-cohort TPM matrix.
     mt_gene_ids = set(genes_df[genes_df["chrom"] == "chrM"]["gene_id"])
     rd_histone_gene_ids = set(genes_df[genes_df["gene_symbol"].str.match(_RD_HISTONE_RE)]["gene_id"])
+    ig_tr_gene_ids = set(genes_df[
+        genes_df["gene_type"].str.match(r"^(IG|TR)_")
+        | genes_df["gene_symbol"].str.match(_IG_TR_RECEPTOR_RE)
+    ]["gene_id"])
 
     def classify(row):
         if row["gene_id"] in mt_gene_ids:
             return False, "mitochondrially-encoded gene: excluded (polyA marks these for degradation, not translation, so apparent expression is highly library-prep-dependent and not comparable across cohorts)"
         if row["gene_id"] in rd_histone_gene_ids:
             return False, "replication-dependent histone gene: excluded (mRNA ends in a stem-loop, not a poly-A tail, so apparent expression is highly library-prep-dependent -- captured poorly or not at all by polyA-selected RNA-seq -- and not comparable across cohorts)"
+        if row["gene_id"] in ig_tr_gene_ids:
+            return False, "immunoglobulin/T-cell-receptor gene segment: excluded (germline VDJ-recombination locus -- reads can't be resolved to a specific rearranged allele, not usable bulk RNA-seq expression signal)"
         if row["gene_type"] != "protein_coding":
             return False, f"gene biotype is non-coding/pseudogene: gene_type={row['gene_type']}"
         if row["gene_id"] in bad_genes:
