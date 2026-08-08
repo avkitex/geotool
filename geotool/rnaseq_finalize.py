@@ -29,14 +29,25 @@ per-cohort file resolution / skip reporting.
 
 Quantification unit comes from expression_qc.json's primary_expression_unit
 (tpm/fpkm/rpkm need no length step; count/cpm do, via compute_tpm's
-per-gene median included-transcript length). Cohorts whose unit is
-"unknown", missing entirely (no expression_qc.json), a multi-file cohort
-(unit present but null), or whose file's actual value scale doesn't match
-what this module can safely process are skipped and reported, never guessed
-at. A matrix whose row identifiers can't be resolved to any gene at all
-(e.g. Cufflinks XLOC_ novel-locus ids with no stable cross-reference) is
-reported as failed, not skipped -- that's an unrecoverable gene-identity
-problem for the cohort, not a transient/parseable condition.
+per-gene median included-transcript length). A cohort missing an
+expression_qc.json entirely, or a multi-file cohort (unit present but
+null), is skipped and reported, never guessed at -- there's no single
+resolved matrix to guess about in the first place. A matrix whose row
+identifiers can't be resolved to any gene at all (e.g. Cufflinks XLOC_
+novel-locus ids with no stable cross-reference) is reported as failed, not
+skipped -- that's an unrecoverable gene-identity problem for the cohort,
+not a transient/parseable condition.
+
+A resolved matrix whose unit is specifically "unknown" (geotool.download
+verified it's a real gene-expression matrix by content, but neither the
+filename nor the content told it what unit the values are in -- e.g.
+GSE230065's "..._genes.tsv.gz") gets a best-effort default instead of being
+skipped outright (see _guess_unit): integer values (the one unit that's
+always a whole number) -> raw counts; otherwise transcript-level
+identifiers -> CPM; otherwise (gene-level or already-symbol identifiers)
+-> FPKM. This is a guess, not a verified fact -- every such cohort's report
+row says so explicitly (and expression_final.tsv.gz's own transform_note),
+so it's never presented as equivalent to a submitter-labeled unit.
 
 Whether the matrix on disk is already log2(x+1)-scale or still linear is
 detected per file with the same heuristic the rest of this codebase uses
@@ -52,9 +63,11 @@ import json
 import re
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from geotool import config
+from geotool import download as download_mod
 from geotool import gene_symbol_mapping as gsm
 from geotool import probe_mapping
 from geotool import sample_id_matching
@@ -106,6 +119,70 @@ def to_linear_scale(matrix: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
     if probe_mapping.needs_log2_transform(matrix):
         return matrix.clip(lower=0), False
     return (2 ** matrix - 1).clip(lower=0), True
+
+
+def looks_like_integer_data(matrix: pd.DataFrame) -> bool:
+    """True if every finite value in matrix is (within float noise of) a
+    whole number -- the one property raw read counts always have (an
+    already length- or depth-normalized unit like TPM/FPKM/CPM essentially
+    never produces an all-integer matrix by chance), and this module's
+    primary signal for guessing an unlabeled quantification unit (see
+    _guess_unit). Call on a *linear*-scale matrix (post to_linear_scale) --
+    log2(x+1)-transformed counts are themselves fractional.
+    """
+    values = matrix.to_numpy(dtype=float)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return False
+    return bool(np.allclose(finite, np.round(finite), atol=1e-6))
+
+
+def find_original_raw_file(path: Path) -> Path | None:
+    """The true, untransformed raw file geotool.download preserved
+    alongside path when probe_mapping.normalize_expression_matrix (log2/
+    orientation/format fixes, applied to every resolved primary file)
+    changed it in place -- "<stem>.original.tsv.gz" next to path (see
+    download._write_normalized_expression_matrix). None if no such backup
+    exists: path was never modified from what the submitter published (so
+    path's own values already are the raw ones), or it doesn't live in
+    this same directory.
+    """
+    candidate = path.parent / f"{download_mod._strip_known_extensions(path.name)}.original.tsv.gz"
+    return candidate if candidate.exists() else None
+
+
+def guess_unit(
+    linear_matrix: pd.DataFrame, ref: gsm.GencodeReference, integer_check_matrix: pd.DataFrame | None = None,
+) -> tuple[str, str]:
+    """Best-effort default quantification unit for a matrix whose
+    expression_qc.json recorded primary_expression_unit as "unknown"
+    (geotool.download verified it's a real gene-expression matrix by
+    content, but couldn't determine its unit from filename or content
+    alone). Returns (unit, explanation) -- integer values -> "count"
+    (raw counts are always whole numbers); otherwise transcript-level
+    identifiers -> "cpm"; otherwise (gene-level, or already gene symbols)
+    -> "fpkm". A guess, not a verified fact -- callers should say so.
+
+    integer_check_matrix, if given, is used instead of linear_matrix
+    purely for the integer-values check. Pass this when linear_matrix was
+    itself reconstructed by inverting an already-log2 file (2**x - 1):
+    exponentiating a value that was rounded in log2 space reintroduces
+    error large enough, at real gene-expression magnitudes, to erase
+    whether the true underlying values were integers -- verified live on
+    GSE230065's on-disk log2 file (rounded to 3 decimals): reconstructing
+    its largest counts lands up to ~63 away from their true integer value,
+    a dead giveaway (find_original_raw_file's ".original.tsv.gz", the
+    exact pre-transform raw file geotool.download preserves whenever it
+    changes a file in place) is the right thing to pass here when it
+    exists -- no reconstruction involved, so no such error.
+    """
+    if looks_like_integer_data(integer_check_matrix if integer_check_matrix is not None else linear_matrix):
+        return "count", "all values are (near-)whole numbers, so assumed raw counts"
+    located = gsm.locate_identifier_axis(linear_matrix, ref)
+    id_type = located[1] if located else "gene"
+    if id_type == "transcript":
+        return "cpm", "non-integer values with transcript-level identifiers, so assumed CPM"
+    return "fpkm", "non-integer values with gene-level identifiers, so assumed FPKM"
 
 
 def renormalize_to_1e6(gene_matrix: pd.DataFrame) -> tuple[pd.DataFrame | None, str | None]:
@@ -170,9 +247,11 @@ def write_sample_id_map(cohort_dir: Path, expression_columns: list[str]) -> pd.D
 def finalize_cohort(cohort_dir: Path, ref: gsm.GencodeReference, clean_symbols: set[str]) -> dict:
     """Finalize one cohort's expression matrix, writing
     <cohort_dir>/expression_final.tsv.gz on success. Returns a report row
-    dict: status is "processed" (file written), "skipped" (a transient/
-    expected condition -- unknown unit, multi-file cohort, ...), or "failed"
-    (an unrecoverable gene-identity problem for this cohort's data).
+    dict: status is "processed" (file written -- unit "unknown" gets a
+    best-effort default rather than blocking this, see guess_unit),
+    "skipped" (a transient/expected condition -- multi-file cohort, zero-sum
+    sample after filtering, ...), or "failed" (an unrecoverable gene-identity
+    problem for this cohort's data).
 
     Also writes <cohort_dir>/sample_id_map.tsv (see write_sample_id_map)
     as soon as the matrix's sample columns are known -- independent of
@@ -189,8 +268,6 @@ def finalize_cohort(cohort_dir: Path, ref: gsm.GencodeReference, clean_symbols: 
     unit = qc.get("primary_expression_unit")
     if unit is None:
         return {"gse_id": gse_id, "status": "skipped", "reason": "no single primary expression matrix for this cohort (multi-file case)"}
-    if unit == "unknown":
-        return {"gse_id": gse_id, "status": "skipped", "reason": "quantification unit unknown -- can't safely length-normalize or trust as already-normalized"}
 
     path = find_local_expression_file(cohort_dir, qc)
     if path is None:
@@ -212,6 +289,19 @@ def finalize_cohort(cohort_dir: Path, ref: gsm.GencodeReference, clean_symbols: 
         return {"gse_id": gse_id, "status": "skipped", "reason": f"{path.name}: negative values remain after scale detection -- not a clean expression matrix"}
 
     linear = unwrap_embedded_ensembl_ids(linear)
+
+    unit_note = ""
+    if unit == "unknown":
+        integer_check_matrix = None
+        original_path = find_original_raw_file(path)
+        if original_path is not None:
+            try:
+                integer_check_matrix = pd.read_csv(original_path, sep="\t", index_col=0).select_dtypes(include="number")
+            except Exception:
+                integer_check_matrix = None
+        unit, why = guess_unit(linear, ref, integer_check_matrix=integer_check_matrix)
+        unit_note = f"quantification unit unknown in expression_qc.json -- {why}"
+
     converted, convert_note = gsm.convert_to_gene_symbols(linear, ref)
     if converted is None:
         # "no recognizable transcript/gene/symbol identifier found" (see
@@ -224,12 +314,14 @@ def finalize_cohort(cohort_dir: Path, ref: gsm.GencodeReference, clean_symbols: 
         # cross-reference to any gene.
         if "no recognizable" in convert_note:
             return {"gse_id": gse_id, "status": "failed", "reason": "gene names unrecoverable"}
-        return {"gse_id": gse_id, "status": "skipped", "reason": f"{path.name}: {convert_note}"}
+        reason = f"{path.name}: {convert_note}"
+        return {"gse_id": gse_id, "status": "skipped", "reason": f"{unit_note}; {reason}" if unit_note else reason}
 
     if unit in _LENGTH_NORM_UNITS:
         tpm_df, tpm_note = gsm.compute_tpm(converted, ref)
         if tpm_df is None:
-            return {"gse_id": gse_id, "status": "skipped", "reason": f"{path.name}: {tpm_note}"}
+            reason = f"{path.name}: {tpm_note}"
+            return {"gse_id": gse_id, "status": "skipped", "reason": f"{unit_note}; {reason}" if unit_note else reason}
         gene_matrix = tpm_df.set_index("gene_symbol")
         detail = f"{convert_note}; {tpm_note}"
     else:
@@ -238,11 +330,13 @@ def finalize_cohort(cohort_dir: Path, ref: gsm.GencodeReference, clean_symbols: 
 
     clean_matrix = restrict_to_clean_genes(gene_matrix, clean_symbols)
     if clean_matrix is None:
-        return {"gse_id": gse_id, "status": "skipped", "reason": f"{path.name}: none of the mapped genes are in the clean reference gene set"}
+        reason = f"{path.name}: none of the mapped genes are in the clean reference gene set"
+        return {"gse_id": gse_id, "status": "skipped", "reason": f"{unit_note}; {reason}" if unit_note else reason}
 
     tpm, err = renormalize_to_1e6(clean_matrix)
     if tpm is None:
-        return {"gse_id": gse_id, "status": "skipped", "reason": f"{path.name}: {err}"}
+        reason = f"{path.name}: {err}"
+        return {"gse_id": gse_id, "status": "skipped", "reason": f"{unit_note}; {reason}" if unit_note else reason}
 
     out = probe_mapping.maybe_log2_transform(tpm)
     out_path = cohort_dir / "expression_final.tsv.gz"
@@ -250,6 +344,8 @@ def finalize_cohort(cohort_dir: Path, ref: gsm.GencodeReference, clean_symbols: 
 
     n_matched = int(id_map["gsm_id"].notna().sum()) if id_map is not None else None
     n_id_map = len(id_map) if id_map is not None else None
+    if unit_note:
+        detail = f"{unit_note}; {detail}"
 
     return {
         "gse_id": gse_id, "status": "processed", "reason": f"{detail}; {len(tpm)} clean genes kept",
