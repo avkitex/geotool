@@ -8,8 +8,13 @@ probes to genes via probe_mapping.py -- including, for two-channel Agilent
 samples that publish per-channel columns, each channel's own matrix as an
 *additional* output alongside the always-produced ratio-based one (see
 build_and_map_channel_expression_matrices / probe_mapping.py's
-detect_channel_columns). Always also produce a cleaned, semantically-unified
-per-sample annotation table via clinical_annotate.py.
+detect_channel_columns). Always also produce a cleaned per-sample
+annotation table via clinical_annotate.py -- LLM-independent cleanup
+(constant-column drop, "Label: " prefix strip) always runs; treatment/
+response/RECIST/survival unification additionally runs only with
+download_cohort(..., clinical_annotate_flag=True) (the one Claude call in
+this whole module, needs ANTHROPIC_API_KEY -- off by default so a bare
+download never requires one).
 
 Phase 2b (opt-in via download_cohort(..., rma=True)): for Affymetrix
 microarray series, also download raw CEL files and RMA-renormalize them via
@@ -1245,7 +1250,7 @@ def resolve_download_targets(gse_id: str, series_dir: Path | None = None, force:
 
 def download_cohort(
     gse_id: str, series_dir: Path | None = None, escalate_ambiguous: bool = False, rma: bool = False,
-    force: bool = False,
+    force: bool = False, clinical_annotate_flag: bool = False,
 ) -> dict:
     out_dir = _series_dir(gse_id, series_dir)
 
@@ -1349,7 +1354,14 @@ def download_cohort(
     result["expression_status"] = expression_status
     print(f"  {gse_id}: expression status: {expression_status}")
 
-    plan = clinical_annotate.plan_column_mapping(samples)
+    # plan_column_mapping is the one unconditional Claude call in the whole
+    # download path (needs ANTHROPIC_API_KEY) -- off by default so a bare
+    # `geotool download` never requires an API key. An empty ColumnMappingPlan()
+    # (its own field defaults: no redundant/treatment/response/survival columns
+    # identified) degrades apply_column_mapping safely to its LLM-independent
+    # steps only (constant-column drop, "Label: " prefix strip) -- not a raw
+    # pass-through, but no fabricated LLM output either.
+    plan = clinical_annotate.plan_column_mapping(samples) if clinical_annotate_flag else clinical_annotate.ColumnMappingPlan()
     annotation = clinical_annotate.apply_column_mapping(samples, plan)
     annotation["expression_status"] = expression_status
     annotation_path = out_dir / "annotation.tsv"

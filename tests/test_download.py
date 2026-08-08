@@ -998,6 +998,57 @@ def test_download_cohort_routes_rnaseq_and_writes_annotation(monkeypatch, tmp_pa
     assert (tmp_path / "GSE_RNASEQ" / "expression").exists()
 
 
+def test_download_cohort_skips_clinical_annotate_llm_call_by_default(monkeypatch, tmp_path):
+    """The one unconditional Claude call in the whole download path (needs
+    ANTHROPIC_API_KEY) -- must not fire unless explicitly requested via
+    clinical_annotate_flag=True, so a bare download never requires a key."""
+    gse = make_rnaseq_gse()
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)
+
+    def _raise(*a, **k):
+        raise AssertionError("plan_column_mapping must not be called when clinical_annotate_flag=False")
+
+    monkeypatch.setattr(download.clinical_annotate, "plan_column_mapping", _raise)
+
+    class _NoopResponse:
+        content = b"gene\tcount\n"
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(download.requests, "get", lambda *a, **k: _NoopResponse())
+
+    result = download.download_cohort("GSE_RNASEQ", series_dir=tmp_path)  # clinical_annotate_flag defaults to False
+
+    assert (tmp_path / "GSE_RNASEQ" / "annotation.tsv").exists()
+    assert result["assay_types"] == ["bulk_rnaseq"]
+
+
+def test_download_cohort_calls_clinical_annotate_when_flag_enabled(monkeypatch, tmp_path):
+    gse = make_rnaseq_gse()
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)
+
+    calls = []
+
+    def _fake_plan(samples, model=None):
+        calls.append(samples)
+        return clinical_annotate.ColumnMappingPlan()
+
+    monkeypatch.setattr(download.clinical_annotate, "plan_column_mapping", _fake_plan)
+
+    class _NoopResponse:
+        content = b"gene\tcount\n"
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(download.requests, "get", lambda *a, **k: _NoopResponse())
+
+    download.download_cohort("GSE_RNASEQ", series_dir=tmp_path, clinical_annotate_flag=True)
+
+    assert len(calls) == 1
+
+
 def test_download_cohort_reports_rnaseq_expression_qc_and_reuses_from_cache(monkeypatch, tmp_path):
     """Real GSE163305 shape: an FPKM matrix (linear-scale) is the only
     genuine expression file among its supplementary files.

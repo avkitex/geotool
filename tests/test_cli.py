@@ -1,6 +1,6 @@
 from click.testing import CliRunner
 
-from geotool import cli, download as download_mod
+from geotool import cli, download as download_mod, search as search_mod
 
 
 class FakeStream:
@@ -55,7 +55,7 @@ def test_download_command_calls_download_cohort_directly_for_a_plain_series(monk
     calls = []
     monkeypatch.setattr(
         download_mod, "download_cohort",
-        lambda gse_id, rma=False, force=False: (calls.append(gse_id), _fake_result(gse_id))[1],
+        lambda gse_id, rma=False, force=False, clinical_annotate_flag=False: (calls.append(gse_id), _fake_result(gse_id))[1],
     )
 
     result = CliRunner().invoke(cli.main, ["download", "GSE_LEAF"])
@@ -72,7 +72,7 @@ def test_download_command_expands_and_downloads_every_subseries(monkeypatch):
     calls = []
     monkeypatch.setattr(
         download_mod, "download_cohort",
-        lambda gse_id, rma=False, force=False: (calls.append(gse_id), _fake_result(gse_id))[1],
+        lambda gse_id, rma=False, force=False, clinical_annotate_flag=False: (calls.append(gse_id), _fake_result(gse_id))[1],
     )
 
     result = CliRunner().invoke(cli.main, ["download", "GSE100"])
@@ -87,7 +87,7 @@ def test_download_command_reports_failure_per_target_and_continues(monkeypatch):
         download_mod, "resolve_download_targets", lambda gse_id, force=False: ["GSE101", "GSE102"]
     )
 
-    def fake_download_cohort(gse_id, rma=False, force=False):
+    def fake_download_cohort(gse_id, rma=False, force=False, clinical_annotate_flag=False):
         if gse_id == "GSE101":
             raise download_mod.UnsupportedCohortError("cna array, not a supported mRNA-expression platform")
         return _fake_result(gse_id)
@@ -100,3 +100,57 @@ def test_download_command_reports_failure_per_target_and_continues(monkeypatch):
     assert "GSE101:" in result.output
     assert "FAILED: cna array" in result.output
     assert "GSE102:" in result.output
+
+
+def test_download_command_clinical_annotate_flag_off_by_default(monkeypatch):
+    """No LLM call, no ANTHROPIC_API_KEY needed, on a bare `geotool download`."""
+    monkeypatch.setattr(download_mod, "resolve_download_targets", lambda gse_id, force=False: [gse_id])
+    calls = []
+    monkeypatch.setattr(
+        download_mod, "download_cohort",
+        lambda gse_id, rma=False, force=False, clinical_annotate_flag=False: (
+            calls.append(clinical_annotate_flag), _fake_result(gse_id)
+        )[1],
+    )
+
+    result = CliRunner().invoke(cli.main, ["download", "GSE_LEAF"])
+
+    assert result.exit_code == 0
+    assert calls == [False]
+
+
+def test_download_command_clinical_annotate_flag_passed_through():
+    result = CliRunner().invoke(cli.main, ["download", "--help"])
+    assert result.exit_code == 0
+    assert "--clinical-annotate" in result.output
+    assert "--no-clinical-annotate" in result.output
+
+
+# --- search command LLM default ------------------------------------------------
+
+def _stub_report_write(monkeypatch, tmp_path):
+    # report.write(df, out_name) really writes .tsv/.xlsx under data/reports/
+    # -- stub it so these CLI-wiring tests never touch the real project dir.
+    monkeypatch.setattr(cli.report, "write", lambda df, out_name: (tmp_path / "report.tsv", tmp_path / "report.xlsx"))
+
+
+def test_search_command_llm_annotate_off_by_default(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(search_mod, "search", lambda **kwargs: (calls.append(kwargs), [])[1])
+    _stub_report_write(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli.main, ["search", "--title", "cancer"])
+
+    assert result.exit_code == 0
+    assert calls[0]["llm_annotate_flag"] is False
+
+
+def test_search_command_llm_annotate_flag_enables_it(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(search_mod, "search", lambda **kwargs: (calls.append(kwargs), [])[1])
+    _stub_report_write(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli.main, ["search", "--title", "cancer", "--llm-annotate"])
+
+    assert result.exit_code == 0
+    assert calls[0]["llm_annotate_flag"] is True
