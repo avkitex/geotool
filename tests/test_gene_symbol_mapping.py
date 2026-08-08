@@ -23,6 +23,33 @@ def test_canonical_id_plain_id_unaffected():
     assert gsm.canonical_id("TSPAN6") == "TSPAN6"
 
 
+def test_undouble_repeated_symbol_ids_strips_majority_doubled_shape():
+    """Real GSE174615 shape: RSEM gene_id column doubles the symbol as its
+    own id -- "ACCSL_ACCSL" -- or, for a multi-copy gene family sharing one
+    symbol, "<symbol>_<copy index>_<symbol>" ("5S_rRNA_10_5S_rRNA")."""
+    ids = ["ACCSL_ACCSL", "5S_rRNA_10_5S_rRNA", "TSPAN6_TSPAN6"]
+    result = gsm.undouble_repeated_symbol_ids(ids)
+    assert list(result) == ["ACCSL", "5S_rRNA", "TSPAN6"]
+
+
+def test_undouble_repeated_symbol_ids_leaves_minority_shape_unchanged():
+    """Only unwraps when a majority of the values match the doubled shape --
+    a matrix that's mostly plain symbols with one coincidentally
+    self-repeating id must not have that id corrupted."""
+    ids = ["TSPAN6", "TNMD", "A1BG", "FOO_FOO"]
+    result = gsm.undouble_repeated_symbol_ids(ids)
+    assert list(result) == ids
+
+
+def test_undouble_repeated_symbol_ids_non_doubled_values_pass_through():
+    """GSE174615's own non-doubled outliers (miRNA accessions, embedded-ENSG
+    rows, clone IDs) must pass through unchanged even when the majority of
+    the axis does unwrap."""
+    ids = ["ACCSL_ACCSL", "TSPAN6_TSPAN6", "TNMD_TNMD", "MI0000060_hsa-let-7a-1"]
+    result = gsm.undouble_repeated_symbol_ids(ids)
+    assert list(result) == ["ACCSL", "TSPAN6", "TNMD", "MI0000060_hsa-let-7a-1"]
+
+
 def make_reference(
     gene_to_symbol=None, transcript_to_symbol=None, gene_length=None,
 ) -> gsm.GencodeReference:
@@ -165,6 +192,18 @@ def test_locate_identifier_axis_prefers_gene_id_over_already_symbol_column():
     ids, id_type = gsm.locate_identifier_axis(matrix, _REF)
     assert id_type == "gene"
     assert list(ids) == ["ENSG00000000003", "ENSG00000000005"]
+
+
+def test_locate_identifier_axis_recognizes_doubled_rsem_symbols():
+    """Real GSE174615 shape: without undoubling, "ACCSL_ACCSL" et al. match
+    neither ENST/ENSG nor any known symbol, so the whole axis used to read
+    as unrecognizable and the cohort was skipped outright."""
+    matrix = pd.DataFrame(
+        {"GSM1": [1.0, 2.0]}, index=["TSPAN6_TSPAN6", "TNMD_TNMD"],
+    )
+    ids, id_type = gsm.locate_identifier_axis(matrix, _REF)
+    assert id_type == "symbol"
+    assert list(ids) == ["TSPAN6", "TNMD"]
 
 
 def test_locate_identifier_axis_none_when_nothing_recognizable():
