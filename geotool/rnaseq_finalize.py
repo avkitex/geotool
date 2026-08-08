@@ -67,6 +67,7 @@ import numpy as np
 import pandas as pd
 
 from geotool import config
+from geotool import download as download_mod
 from geotool import gene_symbol_mapping as gsm
 from geotool import probe_mapping
 from geotool import sample_id_matching
@@ -136,7 +137,23 @@ def looks_like_integer_data(matrix: pd.DataFrame) -> bool:
     return bool(np.allclose(finite, np.round(finite), atol=1e-6))
 
 
-def guess_unit(linear_matrix: pd.DataFrame, ref: gsm.GencodeReference) -> tuple[str, str]:
+def find_original_raw_file(path: Path) -> Path | None:
+    """The true, untransformed raw file geotool.download preserved
+    alongside path when probe_mapping.normalize_expression_matrix (log2/
+    orientation/format fixes, applied to every resolved primary file)
+    changed it in place -- "<stem>.original.tsv.gz" next to path (see
+    download._write_normalized_expression_matrix). None if no such backup
+    exists: path was never modified from what the submitter published (so
+    path's own values already are the raw ones), or it doesn't live in
+    this same directory.
+    """
+    candidate = path.parent / f"{download_mod._strip_known_extensions(path.name)}.original.tsv.gz"
+    return candidate if candidate.exists() else None
+
+
+def guess_unit(
+    linear_matrix: pd.DataFrame, ref: gsm.GencodeReference, integer_check_matrix: pd.DataFrame | None = None,
+) -> tuple[str, str]:
     """Best-effort default quantification unit for a matrix whose
     expression_qc.json recorded primary_expression_unit as "unknown"
     (geotool.download verified it's a real gene-expression matrix by
@@ -145,8 +162,21 @@ def guess_unit(linear_matrix: pd.DataFrame, ref: gsm.GencodeReference) -> tuple[
     (raw counts are always whole numbers); otherwise transcript-level
     identifiers -> "cpm"; otherwise (gene-level, or already gene symbols)
     -> "fpkm". A guess, not a verified fact -- callers should say so.
+
+    integer_check_matrix, if given, is used instead of linear_matrix
+    purely for the integer-values check. Pass this when linear_matrix was
+    itself reconstructed by inverting an already-log2 file (2**x - 1):
+    exponentiating a value that was rounded in log2 space reintroduces
+    error large enough, at real gene-expression magnitudes, to erase
+    whether the true underlying values were integers -- verified live on
+    GSE230065's on-disk log2 file (rounded to 3 decimals): reconstructing
+    its largest counts lands up to ~63 away from their true integer value,
+    a dead giveaway (find_original_raw_file's ".original.tsv.gz", the
+    exact pre-transform raw file geotool.download preserves whenever it
+    changes a file in place) is the right thing to pass here when it
+    exists -- no reconstruction involved, so no such error.
     """
-    if looks_like_integer_data(linear_matrix):
+    if looks_like_integer_data(integer_check_matrix if integer_check_matrix is not None else linear_matrix):
         return "count", "all values are (near-)whole numbers, so assumed raw counts"
     located = gsm.locate_identifier_axis(linear_matrix, ref)
     id_type = located[1] if located else "gene"
@@ -262,7 +292,14 @@ def finalize_cohort(cohort_dir: Path, ref: gsm.GencodeReference, clean_symbols: 
 
     unit_note = ""
     if unit == "unknown":
-        unit, why = guess_unit(linear, ref)
+        integer_check_matrix = None
+        original_path = find_original_raw_file(path)
+        if original_path is not None:
+            try:
+                integer_check_matrix = pd.read_csv(original_path, sep="\t", index_col=0).select_dtypes(include="number")
+            except Exception:
+                integer_check_matrix = None
+        unit, why = guess_unit(linear, ref, integer_check_matrix=integer_check_matrix)
         unit_note = f"quantification unit unknown in expression_qc.json -- {why}"
 
     converted, convert_note = gsm.convert_to_gene_symbols(linear, ref)

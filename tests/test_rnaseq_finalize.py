@@ -87,19 +87,62 @@ def test_guess_unit_non_integer_transcript_level_assumed_cpm():
 
 
 def test_guess_unit_non_integer_gene_level_assumed_fpkm():
-    """Real GSE230065 shape: non-integer values, ENSG gene-level identifiers,
-    unit unrecoverable from filename or content alone."""
+    """Genuinely non-integer values (not a lossy log2 reconstruction --
+    see the integer_check_matrix tests below for that case), ENSG
+    gene-level identifiers, unit unrecoverable from filename or content
+    alone."""
     ref = make_reference(gene_to_symbol={"ENSG00000000003": "TSPAN6", "ENSG00000000005": "TNMD"})
-    df = pd.DataFrame({"s1": [8.748, 0.0]}, index=["ENSG00000000003", "ENSG00000000005"])
+    df = pd.DataFrame({"s1": [8.5, 0.25]}, index=["ENSG00000000003", "ENSG00000000005"])
     unit, why = finalize.guess_unit(df, ref)
     assert unit == "fpkm"
     assert "gene-level" in why
 
 
 def test_guess_unit_non_integer_symbol_level_assumed_fpkm():
-    df = pd.DataFrame({"s1": [8.748, 0.0]}, index=["TSPAN6", "TNMD"])
+    df = pd.DataFrame({"s1": [8.5, 0.25]}, index=["TSPAN6", "TNMD"])
     unit, why = finalize.guess_unit(df, _REF)
     assert unit == "fpkm"
+
+
+def test_guess_unit_integer_check_matrix_overrides_linear_matrix():
+    """Real GSE230065 shape: linear_matrix is a *reconstruction* (2**x - 1
+    from an already-log2, 3-decimal-rounded file) and looks non-integer,
+    but integer_check_matrix (the preserved pre-transform raw file) is
+    exact and genuinely integer -- the count guess must win."""
+    ref = make_reference(gene_to_symbol={"ENSG00000000003": "TSPAN6"})
+    linear_matrix = pd.DataFrame({"s1": [428.9], "s2": [643.6]}, index=["ENSG00000000003"])
+    integer_check_matrix = pd.DataFrame({"s1": [429.0], "s2": [644.0]}, index=["ENSG00000000003"])
+    unit, why = finalize.guess_unit(linear_matrix, ref, integer_check_matrix=integer_check_matrix)
+    assert unit == "count"
+    assert "whole number" in why
+
+
+def test_guess_unit_without_integer_check_matrix_falls_back_to_linear_matrix():
+    df = pd.DataFrame({"s1": [8.5, 0.25]}, index=["TSPAN6", "TNMD"])
+    unit, why = finalize.guess_unit(df, _REF, integer_check_matrix=None)
+    assert unit == "fpkm"
+
+
+# --- find_original_raw_file -----------------------------------------------------
+
+def test_find_original_raw_file_present(tmp_path):
+    expr_dir = tmp_path / "expression"
+    expr_dir.mkdir()
+    primary = expr_dir / "GSE1_genes.tsv.gz"
+    primary.write_bytes(b"x")
+    original = expr_dir / "GSE1_genes.original.tsv.gz"
+    original.write_bytes(b"y")
+
+    assert finalize.find_original_raw_file(primary) == original
+
+
+def test_find_original_raw_file_absent(tmp_path):
+    expr_dir = tmp_path / "expression"
+    expr_dir.mkdir()
+    primary = expr_dir / "GSE1_genes.tsv.gz"
+    primary.write_bytes(b"x")
+
+    assert finalize.find_original_raw_file(primary) is None
 
 
 # --- renormalize_to_1e6 --------------------------------------------------------
@@ -204,9 +247,10 @@ def test_finalize_cohort_unknown_unit_guessed_as_count_when_integer(tmp_path):
 
 
 def test_finalize_cohort_unknown_unit_guessed_as_fpkm_for_gene_level_non_integer(tmp_path):
-    """Real GSE230065 shape: no filename/content unit hint, non-integer
-    values, ENSG gene-level identifiers -- guessed FPKM rather than skipped."""
-    df = pd.DataFrame({"s1": [8.748, 0.0], "s2": [9.333, 1.0]}, index=["ENSG00000000003", "ENSG00000000005"])
+    """No filename/content unit hint, genuinely non-integer values, ENSG
+    gene-level identifiers, no preserved .original raw file to check
+    instead -- guessed FPKM rather than skipped."""
+    df = pd.DataFrame({"s1": [8.5, 0.25], "s2": [9.5, 1.25]}, index=["ENSG00000000003", "ENSG00000000005"])
     df.index.name = "id"
     path = _write_matrix(tmp_path, "genes.tsv.gz", df)
     _write_qc(tmp_path, path, "unknown")
@@ -216,6 +260,40 @@ def test_finalize_cohort_unknown_unit_guessed_as_fpkm_for_gene_level_non_integer
     assert row["unit"] == "fpkm"
     assert "quantification unit unknown" in row["reason"]
     assert "gene-level" in row["reason"]
+
+
+def test_finalize_cohort_unknown_unit_uses_original_raw_file_for_integer_check(tmp_path):
+    """Real GSE230065 bug: the primary file was already log2-transformed by
+    geotool.download at ingest time (values like 8.748 = log2(429 + 1)),
+    so to_linear_scale's reconstruction (2**x - 1) is lossy -- large enough,
+    at real magnitudes, to look non-integer even though the true underlying
+    data (preserved as "<name>.original.tsv.gz" right next to the primary
+    file, exactly geotool.download's own convention) is exact raw counts.
+    Must guess "count", not "fpkm"."""
+    log2_df = pd.DataFrame(
+        {"s1": [8.748, 0.0], "s2": [9.333, 1.0]}, index=["ENSG00000000003", "ENSG00000000005"],
+    )
+    log2_df.index.name = "id"
+    path = _write_matrix(tmp_path, "GSE230065_genes.tsv.gz", log2_df)
+
+    raw_counts_df = pd.DataFrame(
+        {"s1": [429, 0], "s2": [644, 1]}, index=["ENSG00000000003", "ENSG00000000005"],
+    )
+    raw_counts_df.index.name = "id"
+    raw_counts_df.to_csv(tmp_path / "expression" / "GSE230065_genes.original.tsv.gz", sep="\t", compression="gzip")
+
+    _write_qc(tmp_path, path, "unknown")
+
+    # "count" is in _LENGTH_NORM_UNITS, so compute_tpm needs gene-length
+    # data to reach "processed" (unlike fpkm, which skips that step).
+    ref_with_length = make_reference(
+        gene_to_symbol={"ENSG00000000003": "TSPAN6", "ENSG00000000005": "TNMD"},
+        gene_length={"ENSG00000000003": 2200, "ENSG00000000005": 1200},
+    )
+    row = finalize.finalize_cohort(tmp_path, ref_with_length, _CLEAN_SYMBOLS)
+    assert row["status"] == "processed"
+    assert row["unit"] == "count"
+    assert "whole number" in row["reason"]
 
 
 def test_finalize_cohort_multi_file_skipped(tmp_path):
