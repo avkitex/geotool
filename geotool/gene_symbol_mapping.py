@@ -96,6 +96,41 @@ def canonical_id(value) -> str:
     return strip_version(match.group(1) if match else text)
 
 
+# Some RSEM-based quantification pipelines double-encode a gene symbol as
+# its own row id instead of emitting a plain symbol -- "ACCSL_ACCSL", or,
+# for the Nth copy of a multi-copy gene family sharing one symbol,
+# "<symbol>_<copy index>_<symbol>" ("5S_rRNA_10_5S_rRNA") -- live example,
+# GSE174615, where this shape covers 93.7% of a 30,373-row matrix's raw
+# IDs. Neither form is ENST/ENSG, nor a literal match against any known
+# symbol (the doubled string itself isn't a real gene symbol), so unless
+# unwrapped first the whole axis reads as "unknown" to
+# detect_identifier_type and the cohort is skipped outright rather than
+# read as the plain gene-symbol matrix it actually is.
+_DOUBLED_SYMBOL_RE = re.compile(r"^(.+)_(?:\d+_)?\1$")
+
+
+def undouble_repeated_symbol_ids(values) -> pd.Series:
+    """Strip "SYMBOL_SYMBOL"/"SYMBOL_N_SYMBOL" doubling (see
+    _DOUBLED_SYMBOL_RE) down to the single symbol, positionally aligned
+    (fresh default RangeIndex, same as detect_identifier_type/
+    convert_to_gene_symbols expect from an identifier axis). Only unwraps
+    when a majority (>50%) of `values` actually match that shape -- same
+    majority-vote guard the ENST/ENSG embedded-id and Kallisto/Salmon
+    composite-header handling use elsewhere in this codebase -- so a matrix
+    with a handful of coincidentally self-repeating IDs isn't corrupted.
+    Values that don't match the shape pass through unchanged either way:
+    e.g. GSE174615's own miRNA "MI0000060_hsa-let-7a-1" accessions,
+    "ENSG00000198695_MT-ND6"-style embedded-ENSG rows, and
+    "Em:AC005003.4_AC005003.4" clone IDs -- none of which are
+    protein-coding genes the clean GENCODE reference would keep anyway.
+    """
+    series = pd.Series([str(v) for v in values])
+    extracted = series.str.extract(_DOUBLED_SYMBOL_RE, expand=False)
+    if extracted.notna().mean() > 0.5:
+        return extracted.fillna(series)
+    return series
+
+
 class GencodeReference(NamedTuple):
     version: str
     transcript_to_symbol: dict[str, str]  # stripped ENST -> symbol (clean/filtered set only)
@@ -188,16 +223,18 @@ def locate_identifier_axis(matrix: pd.DataFrame, reference: GencodeReference) ->
     candidates: list[tuple[pd.Series, IdentifierType]] = []
 
     if not isinstance(matrix.index, pd.RangeIndex):
-        id_type = detect_identifier_type(matrix.index, reference)
+        ids = undouble_repeated_symbol_ids(matrix.index)
+        id_type = detect_identifier_type(ids, reference)
         if id_type != "unknown":
-            candidates.append((matrix.index.to_series(index=matrix.index).reset_index(drop=True), id_type))
+            candidates.append((ids, id_type))
 
     for col in matrix.columns:
         if pd.api.types.is_numeric_dtype(matrix[col]):
             continue
-        id_type = detect_identifier_type(matrix[col], reference)
+        ids = undouble_repeated_symbol_ids(matrix[col])
+        id_type = detect_identifier_type(ids, reference)
         if id_type != "unknown":
-            candidates.append((matrix[col].reset_index(drop=True), id_type))
+            candidates.append((ids, id_type))
 
     if not candidates:
         return None
