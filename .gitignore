@@ -13,12 +13,6 @@ data/references/*
 !data/references/gencode50_hg19/
 data/references/gencode50/gencode.v50.annotation.gtf.gz
 data/references/gencode50_hg19/gencode.v50lift37.annotation.gtf.gz
-# One reusable pipeline script tracked out of data/reports/ (otherwise all
-# generated/local cohort-report output, left untracked); its own generated
-# report (rnaseq_clean_tpm_report.tsv) stays untracked like the rest.
-!data/reports/
-data/reports/*
-!data/reports/filter_renormalize_rnaseq_cohorts.py
 .env
 __pycache__/
 *.pyc
