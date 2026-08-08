@@ -7,7 +7,6 @@ from pathlib import Path
 import click
 import pandas as pd
 
-from geotool import cohort_report as cohort_report_mod
 from geotool import config, download as download_mod, harmonize as harmonize_mod, report, search as search_mod
 from geotool import rnaseq_finalize as rnaseq_finalize_mod
 
@@ -333,24 +332,19 @@ def harmonize(gse_ids, from_report, llm_annotate_flag, out_name, master_path, ma
         raise click.UsageError("Provide one or more GSE IDs, or --from-report <path>")
 
     out_dir = config.DATA_DIR / "harmonized" / out_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    master = harmonize_mod.harmonize_cohorts(
-        ids, llm_annotate_flag=llm_annotate_flag, master_path=master_path, match_columns=match_columns,
+    master, cohort_df = harmonize_mod.harmonize_and_report(
+        ids, out_dir, llm_annotate_flag=llm_annotate_flag, master_path=master_path,
+        match_columns=match_columns, collection_root=collection_root,
     )
+
     if master.empty:
         click.echo("No cohorts could be harmonized -- none of the given GSE IDs have been downloaded yet.")
     else:
-        out_path = out_dir / "annotation.tsv"
-        master.to_csv(out_path, sep="\t", index=False)
         n_cohorts = master["gse_id"].nunique() if "gse_id" in master.columns else len(ids)
-        click.echo(f"{len(master)} samples across {n_cohorts} cohort(s) written to {out_path}")
+        click.echo(f"{len(master)} samples across {n_cohorts} cohort(s) written to {out_dir / 'annotation.tsv'}")
 
-    cohort_df = cohort_report_mod.build_cohort_report(ids, collection_root=collection_root)
-    cohort_out_path = out_dir / "cohort_annotations.tsv"
-    cohort_df.to_csv(cohort_out_path, sep="\t", index=False)
     n_ready = int((cohort_df["readiness"] == "ready").sum())
-    click.echo(f"{len(cohort_df)} cohort(s) ({n_ready} ready) written to {cohort_out_path}")
+    click.echo(f"{len(cohort_df)} cohort(s) ({n_ready} ready) written to {out_dir / 'cohort_annotations.tsv'}")
 
 
 @main.command("finalize-rnaseq")
