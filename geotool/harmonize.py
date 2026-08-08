@@ -172,6 +172,30 @@ def _load_master(master_path: Path | str | None) -> pd.DataFrame | None:
     return pd.read_csv(path, sep="\t")
 
 
+def _drop_superseries_parent_rows(df: pd.DataFrame, series_dir: Path) -> pd.DataFrame:
+    """A gse_id with its own data/series/<gse_id>/superseries.json marker is
+    a pure SuperSeries record -- download_cohort is never called on it (see
+    download.resolve_download_targets), so it must never own sample rows
+    here; its real samples live under its subseries' own gse_ids. Its GEO
+    SOFT record nonetheless lists every sample across those subseries too,
+    so if rows under its gse_id ever got captured anyway (e.g. stale data
+    carried forward via --master from before SuperSeries detection existed
+    -- live incident: GSE240726/GSE236500 duplicating their subseries'
+    samples in the harmonized table), drop them now rather than double-count.
+    Applied on every call (not just when reprocessing), so a `--master` that
+    already carries this duplication self-heals on its very next run.
+    """
+    if df.empty or "gse_id" not in df.columns:
+        return df
+    parent_ids = {
+        gse_id for gse_id in df["gse_id"].dropna().astype(str).unique()
+        if cohort_report_mod._load_superseries_marker(gse_id, series_dir) is not None
+    }
+    if not parent_ids:
+        return df
+    return df[~df["gse_id"].astype(str).isin(parent_ids)].reset_index(drop=True)
+
+
 def harmonize_cohorts(
     gse_ids: list[str],
     series_dir: Path | None = None,
@@ -186,7 +210,11 @@ def harmonize_cohorts(
     cohort's OS_time/OS_event and another's PFS_time/PFS_event both survive,
     NaN where a given cohort doesn't report that column). Cohorts that
     haven't been downloaded yet are skipped with a printed warning rather
-    than failing the whole run.
+    than failing the whole run. A SuperSeries parent id never contributes
+    rows of its own here (see _drop_superseries_parent_rows) -- applied to
+    the result regardless of whether it came from a fresh read or an
+    existing --master, so stale duplication from before that check existed
+    doesn't persist across runs either.
 
     With match_columns=True (the default), a cross-cohort LLM pass
     (harmonize_columns.py) then finds raw characteristic columns from
@@ -197,6 +225,7 @@ def harmonize_cohorts(
     reprocessed), its already-canonical columns are given priority in the
     matching prompt, and its rows are concatenated onto the result unchanged.
     """
+    resolved_series_dir = series_dir or config.SERIES_DIR
     master_df = _load_master(master_path)
     already_in_master = (
         set(master_df["gse_id"].astype(str)) if master_df is not None and "gse_id" in master_df.columns else set()
@@ -217,7 +246,8 @@ def harmonize_cohorts(
         frames.append(df)
 
     if not frames:
-        return master_df if master_df is not None else pd.DataFrame()
+        result = master_df if master_df is not None else pd.DataFrame()
+        return _drop_superseries_parent_rows(result, resolved_series_dir)
 
     combined = pd.concat(frames, ignore_index=True, sort=False)
 
@@ -235,9 +265,8 @@ def harmonize_cohorts(
             )
             combined = harmonize_columns.apply_column_clusters(combined, plan)
 
-    if master_df is not None:
-        return pd.concat([master_df, combined], ignore_index=True, sort=False)
-    return combined
+    result = pd.concat([master_df, combined], ignore_index=True, sort=False) if master_df is not None else combined
+    return _drop_superseries_parent_rows(result, resolved_series_dir)
 
 
 def harmonize_and_report(
