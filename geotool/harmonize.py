@@ -38,6 +38,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from geotool import cohort_report as cohort_report_mod
 from geotool import config, harmonize_columns, llm_annotate
 
 _DEFAULT_ALIASES_PATH = config.PROJECT_ROOT / "geotool" / "vocab_data" / "annotation_aliases.json"
@@ -237,3 +238,49 @@ def harmonize_cohorts(
     if master_df is not None:
         return pd.concat([master_df, combined], ignore_index=True, sort=False)
     return combined
+
+
+def harmonize_and_report(
+    gse_ids: list[str],
+    out_dir: Path | str,
+    series_dir: Path | None = None,
+    llm_annotate_flag: bool = False,
+    model: str | None = None,
+    escalate_ambiguous: bool = False,
+    master_path: Path | str | None = None,
+    match_columns: bool = True,
+    collection_root: Path | str | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Write both halves of "the harmonization process" to out_dir together:
+    annotation.tsv (one row per sample, harmonize_cohorts) and
+    cohort_annotations.tsv (one row per cohort, cohort_report.build_cohort_report).
+
+    These two are always produced in the same call -- a sample-level master
+    table with no matching cohort-level readiness summary (or vice versa) is
+    never a state this leaves behind. Call this rather than
+    harmonize_cohorts/cohort_report.build_cohort_report separately whenever
+    writing harmonized output to disk; use the two functions directly only
+    when you specifically need just one table in memory, not written out.
+
+    Returns (sample_df, cohort_df) -- sample_df is empty if none of gse_ids
+    have been downloaded yet (nothing written for that half; cohort_df is
+    still written, since "not downloaded" is itself a real, reportable
+    per-cohort status).
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    sample_df = harmonize_cohorts(
+        gse_ids, series_dir=series_dir, llm_annotate_flag=llm_annotate_flag,
+        model=model, escalate_ambiguous=escalate_ambiguous,
+        master_path=master_path, match_columns=match_columns,
+    )
+    if not sample_df.empty:
+        sample_df.to_csv(out_dir / "annotation.tsv", sep="\t", index=False)
+
+    cohort_df = cohort_report_mod.build_cohort_report(
+        gse_ids, series_dir=series_dir, collection_root=collection_root,
+    )
+    cohort_df.to_csv(out_dir / "cohort_annotations.tsv", sep="\t", index=False)
+
+    return sample_df, cohort_df

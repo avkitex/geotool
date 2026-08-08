@@ -407,3 +407,47 @@ def test_harmonize_cohorts_returns_master_unchanged_when_all_cohorts_already_in_
 
     result = harmonize.harmonize_cohorts(["GSE_A"], series_dir=tmp_path, master_path=master_path)
     assert set(result["gsm_id"]) == {"GSM_OLD"}
+
+
+# --- harmonize_and_report ------------------------------------------------------
+
+def test_harmonize_and_report_writes_both_tables_together(tmp_path):
+    series_dir = tmp_path / "series"
+    annotation = pd.DataFrame({"gsm_id": ["GSM1"], "gse_id": ["GSE_A"], "expression_status": ["ok"]})
+    _write_cohort(series_dir, "GSE_A", annotation)
+
+    out_dir = tmp_path / "harmonized" / "myproject"
+    sample_df, cohort_df = harmonize.harmonize_and_report(["GSE_A"], out_dir, series_dir=series_dir, match_columns=False)
+
+    assert (out_dir / "annotation.tsv").exists()
+    assert (out_dir / "cohort_annotations.tsv").exists()
+    assert set(sample_df["gsm_id"]) == {"GSM1"}
+    assert set(cohort_df["gse_id"]) == {"GSE_A"}
+    assert cohort_df.iloc[0]["readiness"] == "ready"
+
+
+def test_harmonize_and_report_still_writes_cohort_table_when_nothing_downloaded(tmp_path):
+    out_dir = tmp_path / "harmonized" / "myproject"
+    sample_df, cohort_df = harmonize.harmonize_and_report(["GSE_MISSING"], out_dir, series_dir=tmp_path)
+
+    assert sample_df.empty
+    assert not (out_dir / "annotation.tsv").exists()
+    assert (out_dir / "cohort_annotations.tsv").exists()
+    assert cohort_df.iloc[0]["downloaded"] == False
+
+
+def test_harmonize_and_report_respects_collection_root_for_readiness(tmp_path):
+    series_dir = tmp_path / "series"
+    annotation = pd.DataFrame({"gsm_id": ["GSM1"], "gse_id": ["GSE_A"], "expression_status": ["ok"]})
+    _write_cohort(series_dir, "GSE_A", annotation)
+
+    collection_root = tmp_path / "collection"
+    (collection_root / "GSE_A").mkdir(parents=True)
+    # Deliberately no expression_final.tsv.gz -- readiness should reflect
+    # collection_root, not expression_status, once collection_root is given.
+
+    out_dir = tmp_path / "harmonized" / "myproject"
+    _sample_df, cohort_df = harmonize.harmonize_and_report(
+        ["GSE_A"], out_dir, series_dir=series_dir, collection_root=collection_root, match_columns=False,
+    )
+    assert cohort_df.iloc[0]["readiness"] == "not_ready"
