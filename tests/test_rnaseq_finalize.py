@@ -398,6 +398,128 @@ def test_finalize_cohort_writes_sample_id_map_even_when_finalization_later_skips
     assert dict(zip(id_map["expression_id"], id_map["gsm_id"])) == {"col_a": "GSM1", "col_b": "GSM2"}
 
 
+# --- merge_sample_id_map_into_series_annotation ----------------------------------
+
+def _write_series_annotation(series_dir, gse_id, df):
+    out_dir = series_dir / gse_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_dir / "annotation.tsv", sep="\t", index=False)
+    return out_dir / "annotation.tsv"
+
+
+def test_merge_sample_id_map_noop_without_series_annotation(tmp_path):
+    id_map = pd.DataFrame({
+        "expression_id": ["DMSO_1"], "gsm_id": ["GSM1"], "match_method": ["exact"], "confidence": [0.95],
+    })
+    # No data/series/GSE1/annotation.tsv at all -- must not raise, must not create one.
+    finalize.merge_sample_id_map_into_series_annotation("GSE1", id_map, series_dir=tmp_path)
+    assert not (tmp_path / "GSE1").exists()
+
+
+def test_merge_sample_id_map_noop_without_gsm_id_column(tmp_path):
+    path = _write_series_annotation(tmp_path, "GSE1", pd.DataFrame({"title": ["a"]}))
+    id_map = pd.DataFrame({
+        "expression_id": ["DMSO_1"], "gsm_id": ["GSM1"], "match_method": ["exact"], "confidence": [0.95],
+    })
+    finalize.merge_sample_id_map_into_series_annotation("GSE1", id_map, series_dir=tmp_path)
+    written = pd.read_csv(path, sep="\t")
+    assert "expression_id" not in written.columns
+
+
+def test_merge_sample_id_map_adds_columns_joined_on_gsm_id(tmp_path):
+    path = _write_series_annotation(
+        tmp_path, "GSE1", pd.DataFrame({"gsm_id": ["GSM1", "GSM2"], "title": ["a", "b"]}),
+    )
+    id_map = pd.DataFrame({
+        "expression_id": ["DMSO_1", "DMSO_2"], "gsm_id": ["GSM1", "GSM2"],
+        "match_method": ["exact", "substring"], "confidence": [0.95, 0.75],
+    })
+    finalize.merge_sample_id_map_into_series_annotation("GSE1", id_map, series_dir=tmp_path)
+
+    written = pd.read_csv(path, sep="\t")
+    assert list(written["expression_id"]) == ["DMSO_1", "DMSO_2"]
+    assert list(written["sample_id_match_method"]) == ["exact", "substring"]
+    assert list(written["sample_id_match_confidence"]) == [0.95, 0.75]
+    assert list(written["title"]) == ["a", "b"]  # original columns preserved
+
+
+def test_merge_sample_id_map_nan_for_unmatched_sample(tmp_path):
+    path = _write_series_annotation(
+        tmp_path, "GSE1", pd.DataFrame({"gsm_id": ["GSM1", "GSM2"], "title": ["a", "b"]}),
+    )
+    # Only GSM1 resolved -- GSM2's expression column was ambiguous/unmatched.
+    id_map = pd.DataFrame({
+        "expression_id": ["DMSO_1", "colX"], "gsm_id": ["GSM1", None],
+        "match_method": ["exact", "unmatched"], "confidence": [0.95, 0.0],
+    })
+    finalize.merge_sample_id_map_into_series_annotation("GSE1", id_map, series_dir=tmp_path)
+
+    written = pd.read_csv(path, sep="\t")
+    gsm2_row = written[written["gsm_id"] == "GSM2"].iloc[0]
+    assert pd.isna(gsm2_row["expression_id"])
+    assert pd.isna(gsm2_row["sample_id_match_method"])
+    assert len(written) == 2  # the unmatched id_map row doesn't create a spurious extra row
+
+
+def test_merge_sample_id_map_is_idempotent(tmp_path):
+    path = _write_series_annotation(
+        tmp_path, "GSE1", pd.DataFrame({"gsm_id": ["GSM1"], "title": ["a"]}),
+    )
+    id_map = pd.DataFrame({
+        "expression_id": ["DMSO_1"], "gsm_id": ["GSM1"], "match_method": ["exact"], "confidence": [0.95],
+    })
+    finalize.merge_sample_id_map_into_series_annotation("GSE1", id_map, series_dir=tmp_path)
+    finalize.merge_sample_id_map_into_series_annotation("GSE1", id_map, series_dir=tmp_path)
+
+    written = pd.read_csv(path, sep="\t")
+    assert len(written) == 1
+    assert list(written.columns).count("expression_id") == 1
+
+
+def test_write_sample_id_map_merges_into_series_annotation(tmp_path):
+    """The collection-root copy (cohort_dir) and the canonical series
+    annotation are different directories in real usage -- confirm both get
+    consulted/written correctly, not just the collection-root copy."""
+    cohort_dir = tmp_path / "collection" / "GSE1"
+    cohort_dir.mkdir(parents=True)
+    pd.DataFrame({"gsm_id": ["GSM1", "GSM2"], "title": ["DMSO_1", "DMSO_2"]}).to_csv(
+        cohort_dir / "annotation.tsv", sep="\t", index=False
+    )
+    series_dir = tmp_path / "series"
+    series_path = _write_series_annotation(
+        series_dir, "GSE1", pd.DataFrame({"gsm_id": ["GSM1", "GSM2"], "title": ["DMSO_1", "DMSO_2"]}),
+    )
+
+    finalize.write_sample_id_map(cohort_dir, ["DMSO_1", "DMSO_2"], series_dir=series_dir)
+
+    written = pd.read_csv(series_path, sep="\t")
+    assert list(written["expression_id"]) == ["DMSO_1", "DMSO_2"]
+
+
+def test_finalize_cohort_merges_sample_id_map_into_series_annotation(tmp_path):
+    cohort_dir = tmp_path / "collection" / "GSE1"
+    cohort_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"gsm_id": ["GSM1", "GSM2"], "title": ["TSPAN6", "TNMD"]}).to_csv(
+        cohort_dir / "annotation.tsv", sep="\t", index=False,
+    )
+    df = pd.DataFrame({"TSPAN6": [10.0, 20.0], "TNMD": [15.0, 25.0]}, index=["TSPAN6", "TNMD"])
+    df.index.name = "gene_id"
+    path = _write_matrix(cohort_dir, "tpm.tsv.gz", df)
+    _write_qc(cohort_dir, path, "tpm")
+
+    series_dir = tmp_path / "series"
+    _write_series_annotation(
+        series_dir, "GSE1", pd.DataFrame({"gsm_id": ["GSM1", "GSM2"], "title": ["TSPAN6", "TNMD"]}),
+    )
+
+    row = finalize.finalize_cohort(cohort_dir, _REF, _CLEAN_SYMBOLS, series_dir=series_dir)
+    assert row["status"] == "processed"
+
+    written = pd.read_csv(series_dir / "GSE1" / "annotation.tsv", sep="\t")
+    assert set(written["expression_id"]) == {"TSPAN6", "TNMD"}
+    assert written["sample_id_match_confidence"].notna().all()
+
+
 # --- build_final_matrices -------------------------------------------------------
 
 def _write_clean_genes_reference(references_dir, version, symbols):

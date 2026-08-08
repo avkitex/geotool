@@ -40,14 +40,21 @@ import pandas as pd
 
 from geotool import cohort_report as cohort_report_mod
 from geotool import config, harmonize_columns, llm_annotate
+from geotool import rnaseq_finalize as rnaseq_finalize_mod
 
 _DEFAULT_ALIASES_PATH = config.PROJECT_ROOT / "geotool" / "vocab_data" / "annotation_aliases.json"
 
 # Columns clinical_annotate.py / llm_annotate.py / apply_column_aliases already gave a
 # stable cross-cohort name -- the cross-cohort concept matcher (harmonize_columns.py)
 # must leave these alone rather than re-clustering e.g. two cohorts' already-identical
-# "response" columns, or accidentally merging OS_time into PFS_time.
-_ALWAYS_PROTECTED_COLUMNS = {"gsm_id", "gse_id", "platform_id", "treatment", "treatment_detail", "response", "recist"}
+# "response" columns, or accidentally merging OS_time into PFS_time. Also protects
+# rnaseq_finalize.SAMPLE_ID_MAP_ANNOTATION_COLUMNS (expression_id/sample_id_match_*,
+# merged onto annotation.tsv by write_sample_id_map) -- structural bookkeeping, not a
+# clinical characteristic, so never a clustering candidate.
+_ALWAYS_PROTECTED_COLUMNS = {
+    "gsm_id", "gse_id", "platform_id", "treatment", "treatment_detail", "response", "recist",
+    *rnaseq_finalize_mod.SAMPLE_ID_MAP_ANNOTATION_COLUMNS,
+}
 _SURVIVAL_SUFFIX_RE = re.compile(r".+_(time|event)$")
 
 
