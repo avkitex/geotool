@@ -57,6 +57,7 @@ import pandas as pd
 from geotool import config
 from geotool import gene_symbol_mapping as gsm
 from geotool import probe_mapping
+from geotool import sample_id_matching
 
 # fpkm/rpkm/tpm are already length-normalized -- rescaling them to sum to
 # 1e6 per sample *is* the standard FPKM/RPKM->TPM conversion. count/cpm are
@@ -139,12 +140,45 @@ def find_local_expression_file(cohort_dir: Path, qc: dict) -> Path | None:
     return matches[0] if matches else None
 
 
+def write_sample_id_map(cohort_dir: Path, expression_columns: list[str]) -> pd.DataFrame | None:
+    """Match expression_columns (an expression matrix's sample columns, in
+    their original submitter-chosen labels) back to this cohort's own
+    annotation.tsv gsm_ids (see geotool.sample_id_matching), and write the
+    result to <cohort_dir>/sample_id_map.tsv. None (nothing written) if
+    there's no local annotation.tsv or it has no gsm_id column to match
+    against.
+
+    Run this before final cohort harmonization (geotool.harmonize) needs to
+    join expression data back to sample annotation -- by the time a matrix
+    is "finalized" here, this mapping should already exist rather than being
+    reconstructed ad hoc downstream. A best-effort match: see match_method/
+    confidence in the output for how much to trust each row: an "unmatched"
+    gsm_id (None) means neither a name-based nor positional match could be
+    made with any confidence, not that the sample doesn't exist.
+    """
+    annotation_path = cohort_dir / "annotation.tsv"
+    if not annotation_path.exists():
+        return None
+    annotation = pd.read_csv(annotation_path, sep="\t", low_memory=False)
+    if "gsm_id" not in annotation.columns:
+        return None
+    id_map = sample_id_matching.match_expression_columns(expression_columns, annotation)
+    id_map.to_csv(cohort_dir / "sample_id_map.tsv", sep="\t", index=False)
+    return id_map
+
+
 def finalize_cohort(cohort_dir: Path, ref: gsm.GencodeReference, clean_symbols: set[str]) -> dict:
     """Finalize one cohort's expression matrix, writing
     <cohort_dir>/expression_final.tsv.gz on success. Returns a report row
     dict: status is "processed" (file written), "skipped" (a transient/
     expected condition -- unknown unit, multi-file cohort, ...), or "failed"
     (an unrecoverable gene-identity problem for this cohort's data).
+
+    Also writes <cohort_dir>/sample_id_map.tsv (see write_sample_id_map)
+    as soon as the matrix's sample columns are known -- independent of
+    whether gene-symbol conversion below ultimately succeeds, since the
+    column<->gsm_id correspondence is useful diagnostic information on its
+    own even for a cohort that ends up skipped/failed here.
     """
     gse_id = cohort_dir.name
     qc_path = cohort_dir / "expression_qc.json"
@@ -170,6 +204,8 @@ def finalize_cohort(cohort_dir: Path, ref: gsm.GencodeReference, clean_symbols: 
     numeric = matrix.select_dtypes(include="number")
     if numeric.empty:
         return {"gse_id": gse_id, "status": "skipped", "reason": f"{path.name}: no numeric sample columns"}
+
+    id_map = write_sample_id_map(cohort_dir, list(numeric.columns))
 
     linear, was_log2 = to_linear_scale(numeric)
     if float(linear.min().min()) < -1e-3:
@@ -212,10 +248,14 @@ def finalize_cohort(cohort_dir: Path, ref: gsm.GencodeReference, clean_symbols: 
     out_path = cohort_dir / "expression_final.tsv.gz"
     out.round(3).to_csv(out_path, sep="\t")
 
+    n_matched = int(id_map["gsm_id"].notna().sum()) if id_map is not None else None
+    n_id_map = len(id_map) if id_map is not None else None
+
     return {
         "gse_id": gse_id, "status": "processed", "reason": f"{detail}; {len(tpm)} clean genes kept",
         "unit": unit, "source_file": path.name, "was_log2_on_disk": was_log2,
         "n_genes": len(tpm), "n_samples": tpm.shape[1], "out_file": str(out_path),
+        "n_samples_matched_to_gsm": n_matched, "n_samples_in_id_map": n_id_map,
     }
 
 

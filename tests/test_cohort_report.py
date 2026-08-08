@@ -152,6 +152,57 @@ def test_cohort_report_row_collection_root_missing_file(tmp_path):
     assert "expression_final.tsv.gz" in row["reason_if_not_ready"]
 
 
+# --- sample_id_match_status ---------------------------------------------------
+
+def test_cohort_report_row_sample_id_match_blank_without_collection_root(tmp_path):
+    _write_series(tmp_path, "GSE1")
+    row = cohort_report.cohort_report_row("GSE1", tmp_path, {}, {"GSE1"})
+    assert row["sample_id_match_status"] == ""
+    assert row["sample_id_match_detail"] == ""
+
+
+def test_cohort_report_row_sample_id_match_not_available_without_map_file(tmp_path):
+    _write_series(tmp_path, "GSE1")
+    collection_root = tmp_path / "collection"
+    (collection_root / "GSE1").mkdir(parents=True)
+
+    row = cohort_report.cohort_report_row("GSE1", tmp_path, {}, {"GSE1"}, collection_root=collection_root)
+    assert row["sample_id_match_status"] == "not_available"
+    assert "sample_id_map.tsv" in row["sample_id_match_detail"]
+
+
+def test_cohort_report_row_sample_id_match_matched(tmp_path):
+    _write_series(tmp_path, "GSE1")
+    collection_root = tmp_path / "collection"
+    cohort_dir = collection_root / "GSE1"
+    cohort_dir.mkdir(parents=True)
+    pd.DataFrame({
+        "expression_id": ["DMSO_1", "DMSO_2"], "gsm_id": ["GSM1", "GSM2"],
+        "match_method": ["exact", "exact"], "confidence": [0.95, 0.95],
+    }).to_csv(cohort_dir / "sample_id_map.tsv", sep="\t", index=False)
+
+    row = cohort_report.cohort_report_row("GSE1", tmp_path, {}, {"GSE1"}, collection_root=collection_root)
+    assert row["sample_id_match_status"] == "matched"
+    assert row["sample_id_match_detail"] == "2/2 matched"
+
+
+def test_cohort_report_row_sample_id_match_needs_review(tmp_path):
+    _write_series(tmp_path, "GSE1")
+    collection_root = tmp_path / "collection"
+    cohort_dir = collection_root / "GSE1"
+    cohort_dir.mkdir(parents=True)
+    pd.DataFrame({
+        "expression_id": ["DMSO_1", "DMSO_2", "DMSO_3"],
+        "gsm_id": ["GSM1", None, None],
+        "match_method": ["exact", "unmatched", "unmatched"],
+        "confidence": [0.95, 0.0, 0.0],
+    }).to_csv(cohort_dir / "sample_id_map.tsv", sep="\t", index=False)
+
+    row = cohort_report.cohort_report_row("GSE1", tmp_path, {}, {"GSE1"}, collection_root=collection_root)
+    assert row["sample_id_match_status"] == "needs_review"
+    assert row["sample_id_match_detail"].startswith("1/3 matched")
+
+
 def test_cohort_report_row_in_requested_list_flag(tmp_path):
     _write_series(tmp_path, "GSE1")
     row_requested = cohort_report.cohort_report_row("GSE1", tmp_path, {}, {"GSE1"})
