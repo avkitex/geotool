@@ -5,6 +5,15 @@ cohort in data/pdac_cohorts and data/mtap_prmt5_cohorts that has a resolved
 primary expression matrix (geotool.download's own expression_qc.json,
 written for every RNA-seq cohort it successfully resolved a file for).
 
+Writes data/<pdac_cohorts|mtap_prmt5_cohorts>/<GSE>/expression_final.tsv.gz --
+the actual analysis-ready matrix for this pipeline (HUGO gene symbols, clean
+GENCODE gene set only, TPM-renormalized, log2(x+1)). Some cohort collections
+also carry an expression_ensg_log2.tsv.gz (e.g. from
+data/reports/build_prmt5_final_matrices.py) -- that one is still indexed by
+raw Ensembl gene ID and isn't restricted to the clean gene set or
+TPM-renormalized; prefer this script's expression_final.tsv.gz unless you
+specifically need Ensembl IDs.
+
 Row-identifier detection, ENST/ENSG->gene-symbol mapping, and duplicate-row
 aggregation are all delegated to geotool.gene_symbol_mapping (built on this
 same reference), not reimplemented here -- it already handles the ENST/
@@ -201,7 +210,7 @@ def process_cohort(cohort_dir, ref, clean_symbols):
         return {"gse_id": gse_id, "status": "skipped", "reason": f"{path.name}: {err}"}
 
     out = probe_mapping.maybe_log2_transform(tpm)
-    out_path = cohort_dir / "expression_clean.tsv.gz"
+    out_path = cohort_dir / "expression_final.tsv.gz"
     out.round(3).to_csv(out_path, sep="\t")
 
     return {

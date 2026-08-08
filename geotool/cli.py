@@ -6,6 +6,7 @@ import sys
 import click
 import pandas as pd
 
+from geotool import cohort_report as cohort_report_mod
 from geotool import config, download as download_mod, harmonize as harmonize_mod, report, search as search_mod
 
 
@@ -284,26 +285,42 @@ def download(gse_ids, from_report, rma_flag, force_flag):
     help="Cross-cohort column-concept matching LLM call (e.g. COO/PAM50/IGHV status unification). "
     "--no-match-columns skips it and just applies the existing per-cohort unification and alias renames.",
 )
-def harmonize(gse_ids, from_report, llm_annotate_flag, out_name, master_path, match_columns):
-    """Unify already-downloaded cohorts' annotation tables into one master table, e.g.
+@click.option(
+    "--collection-root",
+    "collection_root",
+    type=click.Path(file_okay=False),
+    default=None,
+    help="A project-specific processed-matrix collection (e.g. data/mtap_prmt5_cohorts) to check for "
+    "each cohort's final analysis-ready expression_final.tsv.gz when computing cohort_annotations.tsv's "
+    "readiness column. Without this, readiness falls back to each cohort's own expression_status alone.",
+)
+def harmonize(gse_ids, from_report, llm_annotate_flag, out_name, master_path, match_columns, collection_root):
+    """Unify already-downloaded cohorts' annotation into one harmonized set of tables, e.g.
 
     geotool harmonize GSE10846 GSE98588
 
-    Reuses each cohort's annotation.tsv (from `geotool download`) plus, if
-    present, its cached llm_annotations.json (from `geotool search
-    --llm-annotate`) -- at zero additional cost. Add --llm-annotate to
-    backfill tissue/diagnosis classification for cohorts that don't have
-    that cache yet. Cohorts that haven't been downloaded yet (no
-    annotation.tsv) are skipped with a warning rather than failing the run.
+    Two outputs, together "the harmonization process":
 
-    By default, a further LLM pass finds raw characteristic columns from
-    different cohorts that describe the same concept (e.g. a DLBCL
-    cell-of-origin call spelled three different ways across cohorts) and
-    merges them under one canonical name with unified values; pass
-    --no-match-columns to skip this. --master lets you grow an existing
-    harmonized table incrementally rather than starting over each time.
+    \b
+    - annotation.tsv: one row per *sample*, reusing each cohort's own
+      annotation.tsv (from `geotool download`) plus, if present, its cached
+      llm_annotations.json (from `geotool search --llm-annotate`) -- at zero
+      additional cost. Add --llm-annotate to backfill tissue/diagnosis
+      classification for cohorts that don't have that cache yet. By default,
+      a further LLM pass finds raw characteristic columns from different
+      cohorts that describe the same concept (e.g. a DLBCL cell-of-origin
+      call spelled three different ways across cohorts) and merges them
+      under one canonical name with unified values; pass --no-match-columns
+      to skip this. --master lets you grow an existing harmonized table
+      incrementally rather than starting over each time.
+    - cohort_annotations.tsv: one row per *cohort* (geotool.cohort_report),
+      including every subseries a requested SuperSeries id expanded to.
 
-    Writes data/harmonized/<name>/annotation.tsv.
+    Cohorts that haven't been downloaded yet (no annotation.tsv) are skipped
+    with a warning rather than failing the run.
+
+    Writes data/harmonized/<name>/annotation.tsv and
+    data/harmonized/<name>/cohort_annotations.tsv.
     """
     ids = list(gse_ids)
     if from_report:
@@ -313,19 +330,25 @@ def harmonize(gse_ids, from_report, llm_annotate_flag, out_name, master_path, ma
     if not ids:
         raise click.UsageError("Provide one or more GSE IDs, or --from-report <path>")
 
+    out_dir = config.DATA_DIR / "harmonized" / out_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     master = harmonize_mod.harmonize_cohorts(
         ids, llm_annotate_flag=llm_annotate_flag, master_path=master_path, match_columns=match_columns,
     )
     if master.empty:
         click.echo("No cohorts could be harmonized -- none of the given GSE IDs have been downloaded yet.")
-        return
+    else:
+        out_path = out_dir / "annotation.tsv"
+        master.to_csv(out_path, sep="\t", index=False)
+        n_cohorts = master["gse_id"].nunique() if "gse_id" in master.columns else len(ids)
+        click.echo(f"{len(master)} samples across {n_cohorts} cohort(s) written to {out_path}")
 
-    out_dir = config.DATA_DIR / "harmonized" / out_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "annotation.tsv"
-    master.to_csv(out_path, sep="\t", index=False)
-    n_cohorts = master["gse_id"].nunique() if "gse_id" in master.columns else len(ids)
-    click.echo(f"{len(master)} samples across {n_cohorts} cohort(s) written to {out_path}")
+    cohort_df = cohort_report_mod.build_cohort_report(ids, collection_root=collection_root)
+    cohort_out_path = out_dir / "cohort_annotations.tsv"
+    cohort_df.to_csv(cohort_out_path, sep="\t", index=False)
+    n_ready = int((cohort_df["readiness"] == "ready").sum())
+    click.echo(f"{len(cohort_df)} cohort(s) ({n_ready} ready) written to {cohort_out_path}")
 
 
 if __name__ == "__main__":
