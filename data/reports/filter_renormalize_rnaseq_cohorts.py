@@ -170,6 +170,16 @@ def process_cohort(cohort_dir, ref, clean_symbols):
     linear = unwrap_embedded_ensembl_ids(linear)
     converted, convert_note = gsm.convert_to_gene_symbols(linear, ref)
     if converted is None:
+        # "no recognizable transcript/gene/symbol identifier found" (see
+        # gene_symbol_mapping.convert_to_gene_symbols) means the matrix's row
+        # index is neither ENSG/ENST nor a HUGO symbol and locate_identifier_axis
+        # couldn't resolve it to one either -- not a transient/skippable
+        # condition like an unknown quantification unit, but an unrecoverable
+        # gene-identity failure for this series. Live example: GSE163305, whose
+        # Cufflinks output is indexed by XLOC_ novel-locus ids with no stable
+        # cross-reference to any gene.
+        if "no recognizable" in convert_note:
+            return {"gse_id": gse_id, "status": "failed", "reason": "gene names unrecoverable"}
         return {"gse_id": gse_id, "status": "skipped", "reason": f"{path.name}: {convert_note}"}
 
     if unit in _LENGTH_NORM_UNITS:
@@ -219,7 +229,8 @@ def main():
     print(report_df.to_string(index=False))
     n_processed = (report_df["status"] == "processed").sum()
     n_skipped = (report_df["status"] == "skipped").sum()
-    print(f"\nprocessed: {n_processed}, skipped: {n_skipped}")
+    n_failed = (report_df["status"] == "failed").sum()
+    print(f"\nprocessed: {n_processed}, skipped: {n_skipped}, failed: {n_failed}")
     print(f"wrote {REPORT_PATH}")
 
 
