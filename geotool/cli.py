@@ -47,25 +47,33 @@ def main():
     "Slower: fetches each candidate series' full record.",
 )
 @click.option(
-    "--llm-annotate",
+    "--llm-annotate/--no-llm-annotate",
     "llm_annotate_flag",
-    is_flag=True,
+    default=False,
+    show_default=True,
     help="Use Claude to classify sample source/tissue/diagnosis/therapy for every candidate "
-    "(fetches each candidate's full record; needs ANTHROPIC_API_KEY). Adds llm_* columns "
-    "to samples.tsv and a diagnosis breakdown to the report.",
+    "(fetches each candidate's full record; needs ANTHROPIC_API_KEY -- one call per candidate, "
+    "up to --max-results of them). Adds llm_* columns to samples.tsv and a diagnosis breakdown "
+    "to the report. Off by default -- no ANTHROPIC_API_KEY needed, no LLM calls made, results "
+    "come back with those columns empty rather than classified.",
 )
 @click.option(
     "--llm-escalate",
     is_flag=True,
-    help="With --llm-annotate: re-run fields the model marked unknown/ambiguous through "
-    "the escalation model (GEOTOOL_LLM_ESCALATION_MODEL, default claude-sonnet-5).",
+    help="With --llm-annotate: re-run fields the model marked unknown/ambiguous through the "
+    "escalation model (GEOTOOL_LLM_ESCALATION_MODEL, default claude-sonnet-5).",
 )
 @click.option("--max-results", default=100, show_default=True, help="Max series from the Entrez search")
 @click.option("--out", "out_name", default="report", show_default=True, help="Output basename under data/reports/")
 def search(
     title, description, organism, sample_properties, llm_annotate_flag, llm_escalate, max_results, out_name
 ):
-    """Search GEO by title/description/organism and optional sample properties."""
+    """Search GEO by title/description/organism and optional sample properties.
+
+    No LLM calls, no ANTHROPIC_API_KEY needed, by default. Pass --llm-annotate
+    to additionally classify every candidate with Claude (tissue/diagnosis/
+    sample source/therapy) -- needs ANTHROPIC_API_KEY, one call per candidate.
+    """
     if not title and not description and not organism:
         raise click.UsageError("Provide at least one of --title / --description / --organism")
 
@@ -148,14 +156,29 @@ def query(text, llm_escalate, max_results, out_name, quiet):
     is_flag=True,
     help="Redo a cohort even if it's already been downloaded (by default, an already-downloaded "
     "cohort -- annotation.tsv already on disk -- is reused as-is rather than re-fetched and "
-    "re-processed, which would otherwise repeat the clinical_annotate LLM call and any RMA run "
+    "re-processed, which would otherwise repeat any --clinical-annotate LLM call and RMA run "
     "for no reason). Adding --rma to a cohort previously downloaded without it still computes "
     "just the missing RMA output, without needing --force.",
 )
-def download(gse_ids, from_report, rma_flag, force_flag):
+@click.option(
+    "--clinical-annotate/--no-clinical-annotate",
+    "clinical_annotate_flag",
+    default=False,
+    show_default=True,
+    help="Use Claude to identify redundant/treatment/response/survival columns in each cohort's "
+    "own annotation table and unify them (geotool.clinical_annotate.plan_column_mapping) -- "
+    "needs ANTHROPIC_API_KEY, one call per cohort. Off by default: annotation.tsv still gets "
+    "the LLM-independent cleanup (constant-column drop, 'Label: ' prefix strip), just not "
+    "treatment/response/RECIST/survival unification.",
+)
+def download(gse_ids, from_report, rma_flag, force_flag, clinical_annotate_flag):
     """Download expression data + a cleaned annotation table for one or more cohorts, e.g.
 
     geotool download GSE10846 GSE339488
+
+    No LLM calls, no ANTHROPIC_API_KEY needed, by default. Pass
+    --clinical-annotate to additionally use Claude for treatment/response/
+    RECIST/survival column unification (see --clinical-annotate's own help).
 
     RNA-seq series get their supplementary expression file(s) downloaded as-is
     -- when there's more than one, the one that looks like the actual
@@ -177,17 +200,18 @@ def download(gse_ids, from_report, rma_flag, force_flag):
     channel_signal_expression.tsv.gz / channel_reference_expression.tsv.gz;
     otherwise only the neutral channel1/channel2 files are written. Add
     --rma to also RMA-renormalize Affymetrix series from raw CEL files.
-    Every cohort also gets a cleaned, semantically-unified
-    annotation.tsv (redundant columns dropped; treatment/response/RECIST/
-    survival unified where possible), plus an expression_status column
-    (clinical_annotate.classify_expression_status) flagging, in every row,
-    the same cohort-level QC verdict as a word-enum: "ok", "no_expression_
-    matrix" (e.g. a series that only ever published differential-expression/
+    Every cohort also gets a cleaned annotation.tsv (constant columns
+    dropped, "Label: " prefixes stripped -- plus, with --clinical-annotate,
+    redundant columns dropped and treatment/response/RECIST/survival unified
+    via Claude), plus an expression_status column (clinical_annotate.
+    classify_expression_status) flagging, in every row, the same
+    cohort-level QC verdict as a word-enum: "ok", "no_expression_matrix"
+    (e.g. a series that only ever published differential-expression/
     splicing-analysis output, never a raw or normalized matrix -- see
     GSE108651), "unparseable", or "not_log2_transformed"/"negative_values"
     (joined with ";" if both apply). A cohort that's already been downloaded
-    is reused rather than redone -- pass --force to redo it anyway. Needs
-    ANTHROPIC_API_KEY. Writes into data/series/<GSE_ID>/.
+    is reused rather than redone -- pass --force to redo it anyway. Writes
+    into data/series/<GSE_ID>/.
 
     A SuperSeries is automatically expanded into its subseries (recursively),
     each downloaded independently into its own data/series/<subseries_id>/.
@@ -217,7 +241,9 @@ def download(gse_ids, from_report, rma_flag, force_flag):
         for target_id in target_ids:
             click.echo(f"{target_id}:")
             try:
-                result = download_mod.download_cohort(target_id, rma=rma_flag, force=force_flag)
+                result = download_mod.download_cohort(
+                    target_id, rma=rma_flag, force=force_flag, clinical_annotate_flag=clinical_annotate_flag,
+                )
             except Exception as exc:
                 click.echo(f"  FAILED: {exc}")
                 continue
