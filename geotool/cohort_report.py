@@ -23,6 +23,14 @@ pipeline on top of geotool.gene_symbol_mapping) for a
 <collection_root>/<gse_id>/<final_matrix_filename> file -- readiness then
 means "this specific analysis-ready file exists on disk", a stronger claim
 than "geotool resolved *some* raw expression file for this cohort".
+
+sample_id_match_status/sample_id_match_detail likewise only mean something
+when collection_root is given: whether geotool.rnaseq_finalize's own
+<collection_root>/<gse_id>/sample_id_map.tsv (geotool.sample_id_matching --
+expression matrix column -> gsm_id) resolved every sample by name/order
+("matched") or left at least one unresolved ("needs_review" -- a human
+needs to look at that cohort's sample_id_map.tsv and either supply a
+manual mapping or accept the gap).
 """
 from __future__ import annotations
 
@@ -35,6 +43,7 @@ from geotool import config
 from geotool import download as download_mod
 
 DEFAULT_FINAL_MATRIX_FILENAME = "expression_final.tsv.gz"
+DEFAULT_SAMPLE_ID_MAP_FILENAME = "sample_id_map.tsv"
 
 
 def _load_superseries_marker(gse_id: str, series_dir: Path) -> dict | None:
@@ -100,6 +109,32 @@ def _orphan_note(marker: dict | None) -> str:
     return "SuperSeries carries data not covered by any subseries -- " + "; ".join(parts)
 
 
+def _sample_id_match_status(collection_root: Path | str | None, gse_id: str, sample_id_map_filename: str) -> tuple[str, str]:
+    """(status, detail) for <collection_root>/<gse_id>/<sample_id_map_filename>:
+    status is "" if collection_root wasn't given (not checked), "not_available"
+    if that cohort has no id map file at all, "matched" if every expression
+    column resolved to a gsm_id, or "needs_review" if at least one didn't --
+    meaning a human should look at that cohort's own sample_id_map.tsv rather
+    than assume expression columns and gsm_ids line up.
+    """
+    if collection_root is None:
+        return "", ""
+    map_path = Path(collection_root) / gse_id / sample_id_map_filename
+    if not map_path.exists():
+        return "not_available", f"no {sample_id_map_filename} in {collection_root}/{gse_id}/"
+
+    id_map = pd.read_csv(map_path, sep="\t")
+    if "gsm_id" not in id_map.columns or id_map.empty:
+        return "not_available", f"{sample_id_map_filename} has no gsm_id column or is empty"
+
+    n_total = len(id_map)
+    n_matched = int(id_map["gsm_id"].notna().sum())
+    detail = f"{n_matched}/{n_total} matched"
+    if n_matched == n_total:
+        return "matched", detail
+    return "needs_review", f"{detail} -- see {sample_id_map_filename} for unresolved samples"
+
+
 def cohort_report_row(
     gse_id: str,
     series_dir: Path,
@@ -107,6 +142,7 @@ def cohort_report_row(
     requested_ids: set[str],
     collection_root: Path | str | None = None,
     final_matrix_filename: str = DEFAULT_FINAL_MATRIX_FILENAME,
+    sample_id_map_filename: str = DEFAULT_SAMPLE_ID_MAP_FILENAME,
 ) -> dict:
     series_row_dir = series_dir / gse_id
     series_path = series_row_dir / "series.tsv"
@@ -126,6 +162,8 @@ def cohort_report_row(
         "readiness": "not_ready",
         "expression_file": "",
         "reason_if_not_ready": "",
+        "sample_id_match_status": "",
+        "sample_id_match_detail": "",
     }
 
     if not series_row_dir.exists():
@@ -168,6 +206,9 @@ def cohort_report_row(
             row["expression_file"] = str(candidate.relative_to(collection_root)).replace("\\", "/")
         else:
             row["reason_if_not_ready"] = f"no {final_matrix_filename} in {collection_root}/{gse_id}/"
+        row["sample_id_match_status"], row["sample_id_match_detail"] = _sample_id_match_status(
+            collection_root, gse_id, sample_id_map_filename,
+        )
     elif row["expression_status"] == "ok":
         row["readiness"] = "ready"
     else:
@@ -186,12 +227,16 @@ def build_cohort_report(
     series_dir: Path | None = None,
     collection_root: Path | str | None = None,
     final_matrix_filename: str = DEFAULT_FINAL_MATRIX_FILENAME,
+    sample_id_map_filename: str = DEFAULT_SAMPLE_ID_MAP_FILENAME,
 ) -> pd.DataFrame:
     """One row per cohort across gse_ids plus every SuperSeries-subseries it
     expands to (see resolve_effective_cohort_ids) -- title/organism/assay/
     platforms/n_samples/expression_status from each cohort's own series.tsv/
     annotation.tsv, readiness/expression_file from collection_root's final
-    matrix file if given, else from expression_status alone.
+    matrix file if given (else from expression_status alone), and
+    sample_id_match_status/sample_id_match_detail from collection_root's
+    sample_id_map.tsv if given (else left blank -- "" is not the same as
+    "needs_review": it means this wasn't checked at all).
     """
     series_dir = series_dir or config.SERIES_DIR
     all_ids, parent_of = resolve_effective_cohort_ids(gse_ids, series_dir=series_dir)
@@ -200,6 +245,7 @@ def build_cohort_report(
         cohort_report_row(
             gid, series_dir, parent_of, requested_ids,
             collection_root=collection_root, final_matrix_filename=final_matrix_filename,
+            sample_id_map_filename=sample_id_map_filename,
         )
         for gid in all_ids
     ]
