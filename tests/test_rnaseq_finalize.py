@@ -183,6 +183,61 @@ def test_finalize_cohort_local_file_missing_skipped(tmp_path):
     assert "not found locally" in row["reason"]
 
 
+# --- sample id map integration ----------------------------------------------------
+
+def test_write_sample_id_map_none_without_local_annotation(tmp_path):
+    assert finalize.write_sample_id_map(tmp_path, ["DMSO_1"]) is None
+    assert not (tmp_path / "sample_id_map.tsv").exists()
+
+
+def test_write_sample_id_map_matches_and_writes_file(tmp_path):
+    pd.DataFrame({
+        "gsm_id": ["GSM1", "GSM2"], "title": ["DMSO_1", "DMSO_2"],
+    }).to_csv(tmp_path / "annotation.tsv", sep="\t", index=False)
+
+    result = finalize.write_sample_id_map(tmp_path, ["DMSO_1", "DMSO_2"])
+    assert dict(zip(result["expression_id"], result["gsm_id"])) == {"DMSO_1": "GSM1", "DMSO_2": "GSM2"}
+
+    out_path = tmp_path / "sample_id_map.tsv"
+    assert out_path.exists()
+    written = pd.read_csv(out_path, sep="\t")
+    assert set(written["expression_id"]) == {"DMSO_1", "DMSO_2"}
+
+
+def test_finalize_cohort_writes_sample_id_map_alongside_expression_final(tmp_path):
+    pd.DataFrame({
+        "gsm_id": ["GSM1", "GSM2"], "title": ["TSPAN6", "TNMD"],
+    }).to_csv(tmp_path / "annotation.tsv", sep="\t", index=False)
+    df = pd.DataFrame({"TSPAN6": [10.0, 20.0], "TNMD": [15.0, 25.0]}, index=["TSPAN6", "TNMD"])
+    df.index.name = "gene_id"
+    path = _write_matrix(tmp_path, "tpm.tsv.gz", df)
+    _write_qc(tmp_path, path, "tpm")
+
+    row = finalize.finalize_cohort(tmp_path, _REF, _CLEAN_SYMBOLS)
+    assert row["status"] == "processed"
+    assert row["n_samples_matched_to_gsm"] == 2
+    assert (tmp_path / "sample_id_map.tsv").exists()
+
+
+def test_finalize_cohort_writes_sample_id_map_even_when_finalization_later_skips(tmp_path):
+    """The id map is diagnostic information independent of whether the
+    matrix itself makes it through gene-symbol conversion / clean-gene-set
+    filtering -- write it as soon as the sample columns are known."""
+    pd.DataFrame({
+        "gsm_id": ["GSM1", "GSM2"], "title": ["col_a", "col_b"],
+    }).to_csv(tmp_path / "annotation.tsv", sep="\t", index=False)
+    df = pd.DataFrame({"col_a": [10.0, 20.0], "col_b": [15.0, 25.0]}, index=["XLOC_1", "XLOC_2"])
+    df.index.name = "gene_id"
+    path = _write_matrix(tmp_path, "counts.tsv.gz", df)
+    _write_qc(tmp_path, path, "count")
+
+    row = finalize.finalize_cohort(tmp_path, _REF, _CLEAN_SYMBOLS)
+    assert row["status"] == "failed"  # unrecoverable gene identifiers
+    assert (tmp_path / "sample_id_map.tsv").exists()
+    id_map = pd.read_csv(tmp_path / "sample_id_map.tsv", sep="\t")
+    assert dict(zip(id_map["expression_id"], id_map["gsm_id"])) == {"col_a": "GSM1", "col_b": "GSM2"}
+
+
 # --- build_final_matrices -------------------------------------------------------
 
 def _write_clean_genes_reference(references_dir, version, symbols):
