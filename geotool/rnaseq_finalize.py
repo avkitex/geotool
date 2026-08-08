@@ -217,11 +217,54 @@ def find_local_expression_file(cohort_dir: Path, qc: dict) -> Path | None:
     return matches[0] if matches else None
 
 
-def write_sample_id_map(cohort_dir: Path, expression_columns: list[str]) -> pd.DataFrame | None:
+SAMPLE_ID_MAP_ANNOTATION_COLUMNS = ["expression_id", "sample_id_match_method", "sample_id_match_confidence"]
+
+
+def merge_sample_id_map_into_series_annotation(
+    gse_id: str, id_map: pd.DataFrame, series_dir: Path | None = None,
+) -> None:
+    """Write sample_id_matching's per-sample match (expression_id,
+    match_method, confidence -- renamed sample_id_match_method/
+    sample_id_match_confidence here to read unambiguously once merged)
+    onto this cohort's own *canonical* data/series/<gse_id>/annotation.tsv,
+    joined on gsm_id. Not the project-specific collection-root copy
+    write_sample_id_map read from -- geotool.harmonize's reuse tier always
+    reads a cohort's annotation.tsv from data/series/<gse_id>/, so writing
+    there is what actually makes these columns show up the next time
+    cohorts get merged, with no changes needed in harmonize.py itself
+    (outer-concat already NaN-fills a column a given cohort doesn't have).
+
+    A no-op if data/series/<gse_id>/annotation.tsv doesn't exist or has no
+    gsm_id column. Idempotent: re-running replaces any previous run's
+    columns rather than duplicating them. An id_map row with no gsm_id
+    (unmatched expression column) has nothing to join onto, so contributes
+    nothing here -- not an error, just nothing added for that row.
+    """
+    series_dir = series_dir or config.SERIES_DIR
+    annotation_path = series_dir / gse_id / "annotation.tsv"
+    if not annotation_path.exists():
+        return
+    annotation = pd.read_csv(annotation_path, sep="\t", low_memory=False)
+    if "gsm_id" not in annotation.columns:
+        return
+
+    to_merge = id_map.dropna(subset=["gsm_id"])[["gsm_id", "expression_id", "match_method", "confidence"]].rename(
+        columns={"match_method": "sample_id_match_method", "confidence": "sample_id_match_confidence"}
+    )
+    annotation = annotation.drop(columns=[c for c in SAMPLE_ID_MAP_ANNOTATION_COLUMNS if c in annotation.columns])
+    merged = annotation.merge(to_merge, on="gsm_id", how="left")
+    merged.to_csv(annotation_path, sep="\t", index=False)
+
+
+def write_sample_id_map(
+    cohort_dir: Path, expression_columns: list[str], series_dir: Path | None = None,
+) -> pd.DataFrame | None:
     """Match expression_columns (an expression matrix's sample columns, in
     their original submitter-chosen labels) back to this cohort's own
-    annotation.tsv gsm_ids (see geotool.sample_id_matching), and write the
-    result to <cohort_dir>/sample_id_map.tsv. None (nothing written) if
+    annotation.tsv gsm_ids (see geotool.sample_id_matching), write the
+    result to <cohort_dir>/sample_id_map.tsv, and merge it onto this
+    cohort's canonical data/series/<gse_id>/annotation.tsv too (see
+    merge_sample_id_map_into_series_annotation). None (nothing written) if
     there's no local annotation.tsv or it has no gsm_id column to match
     against.
 
@@ -241,10 +284,13 @@ def write_sample_id_map(cohort_dir: Path, expression_columns: list[str]) -> pd.D
         return None
     id_map = sample_id_matching.match_expression_columns(expression_columns, annotation)
     id_map.to_csv(cohort_dir / "sample_id_map.tsv", sep="\t", index=False)
+    merge_sample_id_map_into_series_annotation(cohort_dir.name, id_map, series_dir=series_dir)
     return id_map
 
 
-def finalize_cohort(cohort_dir: Path, ref: gsm.GencodeReference, clean_symbols: set[str]) -> dict:
+def finalize_cohort(
+    cohort_dir: Path, ref: gsm.GencodeReference, clean_symbols: set[str], series_dir: Path | None = None,
+) -> dict:
     """Finalize one cohort's expression matrix, writing
     <cohort_dir>/expression_final.tsv.gz on success. Returns a report row
     dict: status is "processed" (file written -- unit "unknown" gets a
@@ -253,11 +299,14 @@ def finalize_cohort(cohort_dir: Path, ref: gsm.GencodeReference, clean_symbols: 
     sample after filtering, ...), or "failed" (an unrecoverable gene-identity
     problem for this cohort's data).
 
-    Also writes <cohort_dir>/sample_id_map.tsv (see write_sample_id_map)
-    as soon as the matrix's sample columns are known -- independent of
-    whether gene-symbol conversion below ultimately succeeds, since the
-    column<->gsm_id correspondence is useful diagnostic information on its
-    own even for a cohort that ends up skipped/failed here.
+    Also writes <cohort_dir>/sample_id_map.tsv and merges it onto this
+    cohort's canonical data/series/<gse_id>/annotation.tsv (see
+    write_sample_id_map) as soon as the matrix's sample columns are known --
+    independent of whether gene-symbol conversion below ultimately
+    succeeds, since the column<->gsm_id correspondence is useful diagnostic
+    information on its own even for a cohort that ends up skipped/failed
+    here. series_dir overrides where that canonical annotation.tsv lives
+    (default data/series/, see config.SERIES_DIR) -- mainly for tests.
     """
     gse_id = cohort_dir.name
     qc_path = cohort_dir / "expression_qc.json"
@@ -282,7 +331,7 @@ def finalize_cohort(cohort_dir: Path, ref: gsm.GencodeReference, clean_symbols: 
     if numeric.empty:
         return {"gse_id": gse_id, "status": "skipped", "reason": f"{path.name}: no numeric sample columns"}
 
-    id_map = write_sample_id_map(cohort_dir, list(numeric.columns))
+    id_map = write_sample_id_map(cohort_dir, list(numeric.columns), series_dir=series_dir)
 
     linear, was_log2 = to_linear_scale(numeric)
     if float(linear.min().min()) < -1e-3:
@@ -357,11 +406,14 @@ def finalize_cohort(cohort_dir: Path, ref: gsm.GencodeReference, clean_symbols: 
 
 def build_final_matrices(
     cohort_roots: list[Path], gencode_version: str = "50", references_dir: Path | None = None,
+    series_dir: Path | None = None,
 ) -> pd.DataFrame:
     """Finalize every cohort under each root in cohort_roots (a root's
     immediate GSE* subdirectories), writing expression_final.tsv.gz per
     cohort as a side effect. Returns a one-row-per-cohort report DataFrame
-    (status/reason plus finalize_cohort's other fields).
+    (status/reason plus finalize_cohort's other fields). series_dir
+    overrides where each cohort's canonical annotation.tsv lives for the
+    sample-id-map merge (default data/series/, see config.SERIES_DIR).
     """
     ref = gsm.load_gencode_reference(gencode_version, references_dir=references_dir)
     clean_genes_path = (references_dir or config.REFERENCES_DIR) / f"gencode{gencode_version}" / f"clean_transcript_gene_symbol_v{gencode_version}.tsv.gz"
@@ -371,6 +423,6 @@ def build_final_matrices(
     for root in cohort_roots:
         root = Path(root)
         for cohort_dir in sorted(p for p in root.glob("GSE*") if p.is_dir()):
-            report.append(finalize_cohort(cohort_dir, ref, clean_symbols))
+            report.append(finalize_cohort(cohort_dir, ref, clean_symbols, series_dir=series_dir))
 
     return pd.DataFrame(report)

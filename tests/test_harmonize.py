@@ -517,3 +517,41 @@ def test_harmonize_cohorts_self_heals_stale_master_duplication(tmp_path):
     )
     assert set(result["gse_id"]) == {"GSE_SUB"}
     assert len(result) == 1
+
+
+# --- sample-id-map columns flow through harmonize_cohorts -----------------------
+# geotool.rnaseq_finalize.merge_sample_id_map_into_series_annotation writes
+# expression_id/sample_id_match_method/sample_id_match_confidence straight
+# onto a cohort's own annotation.tsv -- harmonize_cohort's plain reuse-tier
+# read picks them up with no special-casing needed (tested end-to-end via
+# finalize_cohort in test_rnaseq_finalize.py); this file only needs the
+# NaN-fill-across-cohorts and column-protection behavior below.
+
+def test_harmonize_cohorts_nan_fills_sample_id_map_columns_for_cohort_without_them(tmp_path):
+    annotation_with = pd.DataFrame({
+        "gsm_id": ["GSM1"], "gse_id": ["GSE_A"],
+        "expression_id": ["DMSO_1"], "sample_id_match_method": ["exact"], "sample_id_match_confidence": [0.95],
+    })
+    annotation_without = pd.DataFrame({"gsm_id": ["GSM2"], "gse_id": ["GSE_B"]})
+    _write_cohort(tmp_path, "GSE_A", annotation_with)
+    _write_cohort(tmp_path, "GSE_B", annotation_without)
+
+    master = harmonize.harmonize_cohorts(["GSE_A", "GSE_B"], series_dir=tmp_path, match_columns=False)
+
+    row_a = master[master["gsm_id"] == "GSM1"].iloc[0]
+    row_b = master[master["gsm_id"] == "GSM2"].iloc[0]
+    assert row_a["expression_id"] == "DMSO_1"
+    assert row_a["sample_id_match_confidence"] == 0.95
+    assert pd.isna(row_b["expression_id"])
+    assert pd.isna(row_b["sample_id_match_method"])
+    assert pd.isna(row_b["sample_id_match_confidence"])
+
+
+def test_harmonize_cohorts_protects_sample_id_map_columns_from_column_matching():
+    """The cross-cohort LLM column-matching pass must never see
+    expression_id/sample_id_match_* as clusterable -- they're structural
+    bookkeeping, not a clinical characteristic that could plausibly need
+    unifying across cohorts."""
+    protected = harmonize._protected_columns(pd.DataFrame(columns=["gsm_id"]))
+    for col in ["expression_id", "sample_id_match_method", "sample_id_match_confidence"]:
+        assert col in protected
