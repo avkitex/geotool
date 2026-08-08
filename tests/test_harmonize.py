@@ -451,3 +451,69 @@ def test_harmonize_and_report_respects_collection_root_for_readiness(tmp_path):
         ["GSE_A"], out_dir, series_dir=series_dir, collection_root=collection_root, match_columns=False,
     )
     assert cohort_df.iloc[0]["readiness"] == "not_ready"
+
+
+# --- _drop_superseries_parent_rows / SuperSeries duplication -------------------
+
+def _write_superseries_marker(series_dir, gse_id, subseries):
+    out_dir = series_dir / gse_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"subseries": subseries, "orphaned_gsm_ids": [], "orphaned_supplementary_files": []}
+    with open(out_dir / "superseries.json", "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+
+
+def test_drop_superseries_parent_rows_removes_parent_gse_id(tmp_path):
+    _write_superseries_marker(tmp_path, "GSE_PARENT", ["GSE_SUB"])
+    df = pd.DataFrame({
+        "gsm_id": ["GSM1", "GSM2"], "gse_id": ["GSE_PARENT", "GSE_SUB"],
+    })
+    result = harmonize._drop_superseries_parent_rows(df, tmp_path)
+    assert set(result["gse_id"]) == {"GSE_SUB"}
+
+
+def test_drop_superseries_parent_rows_leaves_non_superseries_untouched(tmp_path):
+    df = pd.DataFrame({"gsm_id": ["GSM1", "GSM2"], "gse_id": ["GSE_A", "GSE_B"]})
+    result = harmonize._drop_superseries_parent_rows(df, tmp_path)
+    pd.testing.assert_frame_equal(result, df)
+
+
+def test_drop_superseries_parent_rows_empty_df(tmp_path):
+    df = pd.DataFrame(columns=["gsm_id", "gse_id"])
+    result = harmonize._drop_superseries_parent_rows(df, tmp_path)
+    assert result.empty
+
+
+def test_harmonize_cohorts_excludes_superseries_parent_from_fresh_reads(tmp_path):
+    """Live incident shape: GSE240726 (SuperSeries) has no annotation.tsv of
+    its own (download_cohort never called on it) -- harmonize_cohort already
+    returns None for it and it gets skipped with a warning, so this is a
+    belt-and-suspenders check that a *fresh* run never picks up parent rows
+    even if something upstream ever changes that."""
+    _write_superseries_marker(tmp_path, "GSE_PARENT", ["GSE_SUB"])
+    annotation_sub = pd.DataFrame({"gsm_id": ["GSM1"], "gse_id": ["GSE_SUB"]})
+    _write_cohort(tmp_path, "GSE_SUB", annotation_sub)
+
+    master = harmonize.harmonize_cohorts(["GSE_PARENT", "GSE_SUB"], series_dir=tmp_path, match_columns=False)
+    assert set(master["gse_id"]) == {"GSE_SUB"}
+
+
+def test_harmonize_cohorts_self_heals_stale_master_duplication(tmp_path):
+    """Real bug: a --master built before SuperSeries detection existed can
+    carry stale rows attributed to the SuperSeries parent's own gse_id,
+    duplicating its subseries' samples. Since the parent is already "in
+    master", it's never reprocessed by name -- the fix must apply to the
+    master's own rows too, not just freshly-read ones."""
+    _write_superseries_marker(tmp_path, "GSE_PARENT", ["GSE_SUB"])
+    _write_cohort(tmp_path, "GSE_SUB", pd.DataFrame({"gsm_id": ["GSM1"], "gse_id": ["GSE_SUB"]}))
+
+    master_path = tmp_path / "master.tsv"
+    pd.DataFrame({
+        "gsm_id": ["GSM1", "GSM1"], "gse_id": ["GSE_PARENT", "GSE_SUB"],
+    }).to_csv(master_path, sep="\t", index=False)
+
+    result = harmonize.harmonize_cohorts(
+        ["GSE_PARENT", "GSE_SUB"], series_dir=tmp_path, master_path=master_path, match_columns=False,
+    )
+    assert set(result["gse_id"]) == {"GSE_SUB"}
+    assert len(result) == 1
