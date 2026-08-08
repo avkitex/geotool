@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import click
 import pandas as pd
 
 from geotool import cohort_report as cohort_report_mod
 from geotool import config, download as download_mod, harmonize as harmonize_mod, report, search as search_mod
+from geotool import rnaseq_finalize as rnaseq_finalize_mod
 
 
 def _ensure_utf8_streams() -> None:
@@ -349,6 +351,39 @@ def harmonize(gse_ids, from_report, llm_annotate_flag, out_name, master_path, ma
     cohort_df.to_csv(cohort_out_path, sep="\t", index=False)
     n_ready = int((cohort_df["readiness"] == "ready").sum())
     click.echo(f"{len(cohort_df)} cohort(s) ({n_ready} ready) written to {cohort_out_path}")
+
+
+@main.command("finalize-rnaseq")
+@click.argument("cohort_roots", nargs=-1, required=True, type=click.Path(file_okay=False))
+@click.option("--gencode-version", default="50", show_default=True, help="GENCODE reference release under data/references/gencode<version>.")
+@click.option("--out", "out_name", default="rnaseq_finalize", show_default=True, help="Output basename under data/reports/")
+def finalize_rnaseq(cohort_roots, gencode_version, out_name):
+    """Finalize every RNA-seq cohort's expression matrix under one or more
+    collection roots, e.g.
+
+    geotool finalize-rnaseq data/pdac_cohorts data/mtap_prmt5_cohorts
+
+    For each root's immediate GSE* subdirectories with a resolved primary
+    expression matrix (geotool.download's own expression_qc.json), converts
+    row identifiers to HUGO gene symbols (geotool.gene_symbol_mapping),
+    restricts to the clean GENCODE reference gene set, and renormalizes each
+    sample to a 1,000,000 composition (TPM-style) -- writing
+    <root>/<GSE>/expression_final.tsv.gz, the actual analysis-ready matrix.
+
+    Writes data/reports/<name>.tsv (one row per cohort: processed/skipped/failed).
+    """
+    report_df = rnaseq_finalize_mod.build_final_matrices(
+        [Path(r) for r in cohort_roots], gencode_version=gencode_version,
+    )
+    config.ensure_dirs()
+    out_path = config.REPORTS_DIR / f"{out_name}.tsv"
+    report_df.to_csv(out_path, sep="\t", index=False)
+
+    n_processed = int((report_df["status"] == "processed").sum())
+    n_skipped = int((report_df["status"] == "skipped").sum())
+    n_failed = int((report_df["status"] == "failed").sum())
+    click.echo(f"{len(report_df)} cohort(s) written to {out_path}")
+    click.echo(f"processed: {n_processed}, skipped: {n_skipped}, failed: {n_failed}")
 
 
 if __name__ == "__main__":

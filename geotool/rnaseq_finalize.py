@@ -1,68 +1,62 @@
-"""Filter RNA-seq cohorts' gene-level expression matrices down to the clean
-GENCODE reference gene set (data/references/gencode50), then renormalize
-each sample to a 1,000,000 composition (TPM-style), for every bulk_rnaseq
-cohort in data/pdac_cohorts and data/mtap_prmt5_cohorts that has a resolved
-primary expression matrix (geotool.download's own expression_qc.json,
-written for every RNA-seq cohort it successfully resolved a file for).
+"""Finalize RNA-seq cohorts' gene-level expression matrices: convert to HUGO
+gene symbols (via gene_symbol_mapping), restrict to the clean GENCODE
+reference gene set (data/references/gencode<version>), then renormalize each
+sample to a 1,000,000 composition (TPM-style) -- for every cohort under one
+or more collection roots (e.g. data/pdac_cohorts, data/mtap_prmt5_cohorts)
+that has a resolved primary expression matrix (geotool.download's own
+expression_qc.json, written for every RNA-seq cohort it successfully
+resolved a file for).
 
-Writes data/<pdac_cohorts|mtap_prmt5_cohorts>/<GSE>/expression_final.tsv.gz --
-the actual analysis-ready matrix for this pipeline (HUGO gene symbols, clean
-GENCODE gene set only, TPM-renormalized, log2(x+1)). Some cohort collections
-also carry an expression_ensg_log2.tsv.gz (e.g. from
-data/reports/build_prmt5_final_matrices.py) -- that one is still indexed by
-raw Ensembl gene ID and isn't restricted to the clean gene set or
-TPM-renormalized; prefer this script's expression_final.tsv.gz unless you
-specifically need Ensembl IDs.
+Writes <collection_root>/<GSE>/expression_final.tsv.gz -- the actual
+analysis-ready matrix (HUGO gene symbols, clean GENCODE gene set only,
+TPM-renormalized, log2(x+1)).
 
 Row-identifier detection, ENST/ENSG->gene-symbol mapping, and duplicate-row
 aggregation are all delegated to geotool.gene_symbol_mapping (built on this
 same reference), not reimplemented here -- it already handles the ENST/
 ENSG/symbol cascade robustly (including submitter oddities like Kallisto/
-Salmon pipe-delimited composite headers). This script adds only what that
-shared module doesn't do: restricting the *result* to the clean,
-protein-coding/CCDS-filtered gene set regardless of which ID scheme the
-input used (gene_symbol_mapping's ENSG/symbol paths intentionally map
-against its *full* gene_to_symbol/known_symbols -- broader than this
-reference's clean set -- since it's meant as a general-purpose converter,
-not this pipeline's specific inclusion policy), the raw-count-vs-already-
-normalized branch (compute_tpm vs a plain sum-to-1e6 rescale -- rescaling
-already-length-normalized TPM/FPKM/RPKM to sum 1e6 *is* the standard
-FPKM/RPKM->TPM conversion), and the per-cohort file resolution / skip
-reporting.
+Salmon pipe-delimited composite headers, and RSEM's doubled-symbol ids).
+This module adds only what that shared, general-purpose converter
+deliberately doesn't do: restricting the *result* to the clean, protein-
+coding/CCDS-filtered gene set regardless of which ID scheme the input used
+(gene_symbol_mapping's ENSG/symbol paths intentionally map against its
+*full* gene_to_symbol/known_symbols -- broader than this reference's clean
+set -- since it's meant as a general-purpose converter, not a fixed
+inclusion policy), the raw-count-vs-already-normalized branch (compute_tpm
+vs a plain sum-to-1e6 rescale -- rescaling already-length-normalized TPM/
+FPKM/RPKM to sum 1e6 *is* the standard FPKM/RPKM->TPM conversion), and the
+per-cohort file resolution / skip reporting.
 
 Quantification unit comes from expression_qc.json's primary_expression_unit
 (tpm/fpkm/rpkm need no length step; count/cpm do, via compute_tpm's
 per-gene median included-transcript length). Cohorts whose unit is
 "unknown", missing entirely (no expression_qc.json), a multi-file cohort
 (unit present but null), or whose file's actual value scale doesn't match
-what this script can safely process are skipped and reported, never
-guessed at.
+what this module can safely process are skipped and reported, never guessed
+at. A matrix whose row identifiers can't be resolved to any gene at all
+(e.g. Cufflinks XLOC_ novel-locus ids with no stable cross-reference) is
+reported as failed, not skipped -- that's an unrecoverable gene-identity
+problem for the cohort, not a transient/parseable condition.
 
 Whether the matrix on disk is already log2(x+1)-scale or still linear is
 detected per file with the same heuristic the rest of this codebase uses
 (probe_mapping.needs_log2_transform: any value over 50 means still linear)
-rather than assumed from which collection it came from -- data/pdac_cohorts
-and data/mtap_prmt5_cohorts turn out to hold already-log2-transformed
-copies distinct from data/series' own (still-linear) resolved files for the
-same GSE, so trusting a fixed assumption per directory would silently
-mishandle one or the other. Output is re-log2(x+1)-transformed before
-writing, to match this codebase's storage convention for processed
-expression matrices.
-
-Usage: .venv/Scripts/python.exe data/reports/filter_renormalize_rnaseq_cohorts.py
+rather than assumed from which collection it came from -- different
+collections can hold a mix of already-log2 and still-linear copies for
+different cohorts. Output is re-log2(x+1)-transformed before writing, to
+match this codebase's storage convention for processed expression matrices.
 """
+from __future__ import annotations
+
 import json
 import re
 from pathlib import Path
 
 import pandas as pd
 
+from geotool import config
 from geotool import gene_symbol_mapping as gsm
 from geotool import probe_mapping
-
-COHORT_ROOTS = [Path("data/pdac_cohorts"), Path("data/mtap_prmt5_cohorts")]
-REPORT_PATH = Path("data/reports/rnaseq_clean_tpm_report.tsv")
-CLEAN_GENES_PATH = Path("data/references/gencode50/clean_transcript_gene_symbol_v50.tsv.gz")
 
 # fpkm/rpkm/tpm are already length-normalized -- rescaling them to sum to
 # 1e6 per sample *is* the standard FPKM/RPKM->TPM conversion. count/cpm are
@@ -71,12 +65,6 @@ CLEAN_GENES_PATH = Path("data/references/gencode50/clean_transcript_gene_symbol_
 # real TPM rather than just a filtered-and-rescaled CPM.
 _LENGTH_NORM_UNITS = {"count", "cpm"}
 
-
-def load_clean_symbols():
-    clean = pd.read_csv(CLEAN_GENES_PATH, sep="\t")
-    return set(clean["gene_symbol"].unique())
-
-
 # gene_symbol_mapping.canonical_id unwraps Kallisto/Salmon-style *pipe*-
 # delimited composite headers ("ENST...|ENSG...|..."), but not other
 # submitter-specific compound formats -- live example, GSE79668:
@@ -84,13 +72,18 @@ def load_clean_symbols():
 # the ENSG id+version). That row's identifier axis reads as "unknown" to
 # gene_symbol_mapping.detect_identifier_type as-is. This extracts an
 # embedded ENST/ENSG substring from anywhere in the index (not just a
-# leading pipe-delimited field) as a local preprocessing step, rather than
+# leading pipe-delimited field) as a preprocessing step, rather than
 # broadening the shared module's own composite-ID handling for one cohort's
 # one-off format.
 _EMBEDDED_ENS_ID_RE = re.compile(r"(ENS[TG]\d+(?:\.\d+)?)")
 
 
-def unwrap_embedded_ensembl_ids(matrix):
+def load_clean_symbols(clean_genes_path: Path) -> set[str]:
+    clean = pd.read_csv(clean_genes_path, sep="\t")
+    return set(clean["gene_symbol"].unique())
+
+
+def unwrap_embedded_ensembl_ids(matrix: pd.DataFrame) -> pd.DataFrame:
     """If >50% of the index contains an embedded ENST/ENSG id, replace the
     index with just that extracted substring; otherwise return unchanged.
     """
@@ -102,19 +95,19 @@ def unwrap_embedded_ensembl_ids(matrix):
     return matrix
 
 
-def to_linear_scale(matrix):
+def to_linear_scale(matrix: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
     """Return (linear_matrix, was_log2) -- inverse-transforms log2(x+1) back
     to linear scale only if the data actually looks log2-scale (same
-    >50-means-still-linear heuristic as the rest of this codebase), since
-    data/pdac_cohorts and data/mtap_prmt5_cohorts hold a mix of
-    already-log2 and still-linear files for different cohorts.
+    >50-means-still-linear heuristic as the rest of this codebase), since a
+    collection root can hold a mix of already-log2 and still-linear files
+    for different cohorts.
     """
     if probe_mapping.needs_log2_transform(matrix):
         return matrix.clip(lower=0), False
     return (2 ** matrix - 1).clip(lower=0), True
 
 
-def renormalize_to_1e6(gene_matrix):
+def renormalize_to_1e6(gene_matrix: pd.DataFrame) -> tuple[pd.DataFrame | None, str | None]:
     col_sums = gene_matrix.sum(axis=0)
     zero_cols = col_sums[col_sums <= 0].index.tolist()
     if zero_cols:
@@ -122,7 +115,7 @@ def renormalize_to_1e6(gene_matrix):
     return gene_matrix.div(col_sums, axis=1) * 1e6, None
 
 
-def restrict_to_clean_genes(gene_matrix, clean_symbols):
+def restrict_to_clean_genes(gene_matrix: pd.DataFrame, clean_symbols: set[str]) -> pd.DataFrame | None:
     kept = gene_matrix[gene_matrix.index.isin(clean_symbols)]
     if kept.empty:
         return None
@@ -133,7 +126,7 @@ def restrict_to_clean_genes(gene_matrix, clean_symbols):
     return kept.groupby(level=0).sum()
 
 
-def find_local_expression_file(cohort_dir, qc):
+def find_local_expression_file(cohort_dir: Path, qc: dict) -> Path | None:
     fname = qc.get("primary_expression_file")
     if not fname:
         return None
@@ -146,7 +139,13 @@ def find_local_expression_file(cohort_dir, qc):
     return matches[0] if matches else None
 
 
-def process_cohort(cohort_dir, ref, clean_symbols):
+def finalize_cohort(cohort_dir: Path, ref: gsm.GencodeReference, clean_symbols: set[str]) -> dict:
+    """Finalize one cohort's expression matrix, writing
+    <cohort_dir>/expression_final.tsv.gz on success. Returns a report row
+    dict: status is "processed" (file written), "skipped" (a transient/
+    expected condition -- unknown unit, multi-file cohort, ...), or "failed"
+    (an unrecoverable gene-identity problem for this cohort's data).
+    """
     gse_id = cohort_dir.name
     qc_path = cohort_dir / "expression_qc.json"
     if not qc_path.exists():
@@ -220,28 +219,22 @@ def process_cohort(cohort_dir, ref, clean_symbols):
     }
 
 
-def main():
-    ref = gsm.load_gencode_reference("50")
-    clean_symbols = load_clean_symbols()
+def build_final_matrices(
+    cohort_roots: list[Path], gencode_version: str = "50", references_dir: Path | None = None,
+) -> pd.DataFrame:
+    """Finalize every cohort under each root in cohort_roots (a root's
+    immediate GSE* subdirectories), writing expression_final.tsv.gz per
+    cohort as a side effect. Returns a one-row-per-cohort report DataFrame
+    (status/reason plus finalize_cohort's other fields).
+    """
+    ref = gsm.load_gencode_reference(gencode_version, references_dir=references_dir)
+    clean_genes_path = (references_dir or config.REFERENCES_DIR) / f"gencode{gencode_version}" / f"clean_transcript_gene_symbol_v{gencode_version}.tsv.gz"
+    clean_symbols = load_clean_symbols(clean_genes_path)
 
     report = []
-    for root in COHORT_ROOTS:
+    for root in cohort_roots:
+        root = Path(root)
         for cohort_dir in sorted(p for p in root.glob("GSE*") if p.is_dir()):
-            report.append(process_cohort(cohort_dir, ref, clean_symbols))
+            report.append(finalize_cohort(cohort_dir, ref, clean_symbols))
 
-    report_df = pd.DataFrame(report)
-    REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    report_df.to_csv(REPORT_PATH, sep="\t", index=False)
-
-    pd.set_option("display.width", 200)
-    pd.set_option("display.max_colwidth", 60)
-    print(report_df.to_string(index=False))
-    n_processed = (report_df["status"] == "processed").sum()
-    n_skipped = (report_df["status"] == "skipped").sum()
-    n_failed = (report_df["status"] == "failed").sum()
-    print(f"\nprocessed: {n_processed}, skipped: {n_skipped}, failed: {n_failed}")
-    print(f"wrote {REPORT_PATH}")
-
-
-if __name__ == "__main__":
-    main()
+    return pd.DataFrame(report)
