@@ -945,6 +945,73 @@ def test_download_cohort_includes_channel_expression_paths_for_agilent(monkeypat
     assert (tmp_path / "GSE_AGILENT" / "channel_roles.json").exists()
 
 
+def test_download_cohort_does_not_flag_negative_values_for_two_channel_ratio(monkeypatch, tmp_path):
+    """A two-channel sample's own VALUE column is routinely a log2(Cy5/Cy3)
+    ratio, negative by design for anything below the reference channel --
+    not evidence of a bad transform the way it would be for a single-channel
+    or RNA-seq matrix. Live examples that were wrongly excluded from
+    cohort_report.py's "ready" readiness before this fix: GSE77858
+    ("Log2 (Cy5/Cy3) ratio", ~48% negative values) and GSE21501."""
+    metadata = {"geo_accession": ["GSE_RATIO"], "title": ["A two-channel ratio series"], "summary": ["s"]}
+    gsms = {
+        "GSM1": FakeGSM(
+            {
+                "title": ["s1"], "geo_accession": ["GSM1"], "platform_id": ["GPL2011"],
+                "organism_ch1": ["Homo sapiens"], "characteristics_ch1": [], "channel_count": ["2"],
+            },
+            table=pd.DataFrame({"ID_REF": ["1007_s_at", "1053_at"], "VALUE": [-1.2, 0.5]}),
+        ),
+        "GSM2": FakeGSM(
+            {
+                "title": ["s2"], "geo_accession": ["GSM2"], "platform_id": ["GPL2011"],
+                "organism_ch1": ["Homo sapiens"], "characteristics_ch1": [], "channel_count": ["2"],
+            },
+            table=pd.DataFrame({"ID_REF": ["1007_s_at", "1053_at"], "VALUE": [-0.8, 0.3]}),
+        ),
+    }
+    gpls = {"GPL2011": FakeGPL({"title": ["Agilent two-color array"], "technology": ["in situ oligonucleotide"], "manufacturer": ["Agilent Technologies"]})}
+    gse = FakeGSE(metadata, gsms, gpls)
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)
+    monkeypatch.setattr(
+        download.clinical_annotate, "plan_column_mapping", lambda samples, model=None: clinical_annotate.ColumnMappingPlan()
+    )
+    fake_map = pd.DataFrame([
+        {"probe_id": "1007_s_at", "gene_symbol": "DDR1", "entrez_id": "780", "source": "direct_columns"},
+        {"probe_id": "1053_at", "gene_symbol": "RFC2", "entrez_id": "5982", "source": "direct_columns"},
+    ])
+    monkeypatch.setattr(download.probe_mapping, "get_or_build_probe_gene_map", lambda gpl_id: fake_map)
+
+    result = download.download_cohort("GSE_RATIO", series_dir=tmp_path)
+
+    assert "negative_values" not in result["expression_status"]
+    assert result["expression_status"] == clinical_annotate.EXPRESSION_STATUS_OK
+    # the raw QC note is still recorded, just not turned into a disqualifying status
+    assert any("negative value" in note for note in result.get("expression_qc_notes", []))
+
+
+def test_download_cohort_still_flags_negative_values_for_single_channel(monkeypatch, tmp_path):
+    """Control for the two-channel exemption above: a single-channel
+    (channel_count != 2) microarray cohort with negative values keeps
+    getting flagged -- the exemption is scoped to genuine two-channel
+    ratio data, not negative values in general."""
+    gse = make_microarray_gse()
+    for gsm in gse.gsms.values():
+        gsm.table["VALUE"] = [-5.0, 3.0]
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)
+    monkeypatch.setattr(
+        download.clinical_annotate, "plan_column_mapping", lambda samples, model=None: clinical_annotate.ColumnMappingPlan()
+    )
+    fake_map = pd.DataFrame([
+        {"probe_id": "1007_s_at", "gene_symbol": "DDR1", "entrez_id": "780", "source": "direct_columns"},
+        {"probe_id": "1053_at", "gene_symbol": "RFC2", "entrez_id": "5982", "source": "direct_columns"},
+    ])
+    monkeypatch.setattr(download.probe_mapping, "get_or_build_probe_gene_map", lambda gpl_id: fake_map)
+
+    result = download.download_cohort("GSE_ARRAY", series_dir=tmp_path)
+
+    assert "negative_values" in result["expression_status"]
+
+
 def test_download_cohort_persists_and_reuses_channel_roles(monkeypatch, tmp_path):
     gse = make_agilent_two_channel_gse_with_reference()
     monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)
