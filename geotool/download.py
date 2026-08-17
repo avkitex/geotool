@@ -1350,7 +1350,27 @@ def download_cohort(
             print(f"  {gse_id}: expression QC: {note}")
     _write_expression_qc(out_dir, primary_path, primary_unit, qc_notes)
 
-    expression_status = clinical_annotate.classify_expression_status(qc_notes, matrix_found)
+    # A two-channel (Cy3/Cy5 reference-design) sample's own VALUE column is,
+    # on many platforms, already a log2 ratio -- negative for anything
+    # below the reference channel, by design (see probe_mapping.
+    # maybe_log2_transform's own docstring). check_expression_qc's
+    # negative-value note can't tell that apart from a genuinely
+    # mis-transformed matrix (its docstring says as much), so it always
+    # flags it -- which then always demoted an otherwise-correct two-channel
+    # cohort's expression_status to "negative_values" and its
+    # cohort_report.py readiness to "not_ready" (live examples: GSE77858's
+    # "Log2 (Cy5/Cy3) ratio" and GSE21501, both confirmed correctly
+    # processed, both wrongly excluded). Dropping just that one note before
+    # classification -- only for a confirmed two-channel cohort, and only
+    # the negative-value note, every other QC concern still counts --
+    # leaves the full unfiltered qc_notes (this print above, and
+    # expression_qc.json) as the transparent, still-negative-values-flagged
+    # record either way.
+    is_two_channel = "channel_count" in samples.columns and (samples["channel_count"] == "2").any()
+    status_notes = qc_notes
+    if is_two_channel:
+        status_notes = [note for note in qc_notes if "negative value" not in note]
+    expression_status = clinical_annotate.classify_expression_status(status_notes, matrix_found)
     result["expression_status"] = expression_status
     print(f"  {gse_id}: expression status: {expression_status}")
 
