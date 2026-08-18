@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from geotool import harmonize, llm_annotate
-from geotool.llm_schema import SampleGroupAnnotation, SeriesLevelAnnotation, SeriesLLMResult
+from geotool.llm_schema import NumericColumnUnit, SampleGroupAnnotation, SeriesLevelAnnotation, SeriesLLMResult
 
 
 # --- apply_column_aliases ---------------------------------------------------
@@ -152,6 +152,55 @@ def test_get_llm_annotation_backfills_when_requested(tmp_path, monkeypatch):
     assert result is not None
     assert (tmp_path / "GSE_X" / "llm_annotations.json").exists()  # written for future free reuse
     assert set(result["gsm_id"]) == {"GSM1", "GSM2"}
+
+
+def test_get_llm_annotation_backfill_keeps_numeric_column_units_column(tmp_path, monkeypatch):
+    """get_llm_annotation only keeps llm_-prefixed columns from
+    llm_annotate.merge_annotations' output -- apply_numeric_column_units
+    must name its derived column accordingly (llm_<col>_days) or it gets
+    silently dropped right here, never reaching annotation.tsv."""
+    samples = make_samples()
+    samples["survival months"] = [12.0, 24.0]
+    fp_ids, groups = llm_annotate.group_fingerprints(samples)
+    fp_id = list(groups.keys())[0]
+
+    result = SeriesLLMResult(
+        series_level=SeriesLevelAnnotation(
+            assay_type="microarray", has_outcome_data=True,
+            numeric_column_units=[NumericColumnUnit(column_name="survival months", unit="months")],
+        ),
+        sample_groups=[
+            SampleGroupAnnotation(
+                fingerprint_id=fp_id, sample_source="biopsy", tissue_class="tissue",
+                tissue_detail="lymph node biopsy", selection_method="none",
+                diagnosis="DLBCL", diagnosis_source="sample_characteristics", prior_therapy="none",
+            ),
+        ],
+    )
+
+    class _FakeTextBlock:
+        def __init__(self, parsed_output):
+            self.type = "text"
+            self.parsed_output = parsed_output
+
+    class _FakeResponse:
+        def __init__(self, parsed_output):
+            self.content = [_FakeTextBlock(parsed_output)]
+
+    class _FakeMessages:
+        def parse(self, **kwargs):
+            return _FakeResponse(result)
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    monkeypatch.setattr(llm_annotate.anthropic, "Anthropic", lambda: _FakeClient())
+
+    series_row = {"gse_id": "GSE_X", "title": "t", "summary": "s", "overall_design": "d"}
+    merged = harmonize.get_llm_annotation("GSE_X", series_row, samples, series_dir=tmp_path, backfill=True)
+
+    assert "llm_survival_months_days" in merged.columns
+    assert merged["llm_survival_months_days"].tolist() == pytest.approx([12.0 * 30.4375, 24.0 * 30.4375])
 
 
 def test_get_llm_annotation_returns_none_and_does_not_raise_when_llm_call_fails(tmp_path, monkeypatch, capsys):

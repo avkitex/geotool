@@ -20,7 +20,7 @@ import pandas as pd
 from geotool import config, vocab
 from geotool.llm_schema import SeriesLevelAnnotation, SeriesLLMResult
 
-PROMPT_VERSION = "1"
+PROMPT_VERSION = "2"  # bumped: excluded-numeric-column / numeric_column_units section added to the prompt
 
 FIXED_SAMPLE_COLUMNS = {
     "gsm_id", "gse_id", "title", "source_name_ch1", "organism_ch1", "molecule_ch1",
@@ -42,11 +42,90 @@ For diagnosis, pick one of the following categories if it fits, otherwise use "o
 specifics in diagnosis_detail) or "unknown" if you cannot tell:
 {diagnosis_categories}
 
-Classify every sample group given below. Use each group's fingerprint_id exactly as shown."""
+Classify every sample group given below. Use each group's fingerprint_id exactly as shown.
+
+If an "excluded numeric column(s)" section is given below, each one has too many distinct values
+to group samples by, but is otherwise worth reading -- estimate its time unit (days/months/years)
+from its column name and the value range/examples given, and report it in numeric_column_units.
+GEO survival/follow-up columns are most often already in days, sometimes months, rarely years --
+use "unknown" rather than guessing when genuinely ambiguous."""
+
+
+# A characteristic column is only worth grouping samples by if it's
+# categorical (a handful of repeated values -- grade, stage, tissue). A
+# column with more distinct values than a real categorical trait would ever
+# have fragments what would otherwise be a handful of real groups into
+# nearly one group per sample -- regardless of whether it's a continuous
+# numeric measurement (survival time, age), a per-patient identifier
+# ("patient id", "sample id" -- a string, not numeric), or a real but
+# unusually diverse categorical field (many distinct free-text treatment
+# regimens). Cardinality alone, independent of the column's type or name,
+# catches all three: three live examples that each crashed a harmonize run
+# by overflowing _call_model's max_tokens (see harmonize.get_llm_annotation's
+# own try/except for the other half of that fix) --
+#   - GSE183795's "survival months" (128 distinct values / 244 samples)
+#   - GSE93326's "patient id" (129 distinct values / 204 samples -- removing
+#     it collapses 204 fingerprint groups down to 3)
+#   - GSE253260's "sample id"/"normpatient id" (397 distinct values each,
+#     one per sample) and, even after those, still-large "firsttreatment"
+#     (64 distinct regimens combining multiplicatively with several other
+#     modest-cardinality clinical columns -- 308 -> 64 groups once excluded)
+_MAX_CATEGORICAL_UNIQUE_VALUES = 12
+_MIN_NUMERIC_FRACTION = 0.9
+
+
+def _is_high_cardinality(series: pd.Series) -> bool:
+    non_null = series.dropna()
+    if non_null.empty:
+        return False
+    return non_null.nunique() > _MAX_CATEGORICAL_UNIQUE_VALUES
 
 
 def characteristic_columns(samples: pd.DataFrame) -> list[str]:
-    return [c for c in samples.columns if c not in FIXED_SAMPLE_COLUMNS]
+    return [
+        c for c in samples.columns
+        if c not in FIXED_SAMPLE_COLUMNS and not _is_high_cardinality(samples[c])
+    ]
+
+
+def _is_mostly_numeric(series: pd.Series) -> bool:
+    non_null = series.dropna()
+    if non_null.empty:
+        return False
+    numeric = pd.to_numeric(non_null, errors="coerce")
+    return numeric.notna().mean() >= _MIN_NUMERIC_FRACTION
+
+
+# The subset of characteristic_columns' exclusions worth asking the LLM to
+# estimate a time unit for -- something like "age", "firsttreatment", or
+# "patient id" is excluded from the fingerprint for the same cardinality
+# reason, but has no survival/follow-up time unit to estimate (and isn't
+# even numeric, for the latter two).
+_SURVIVAL_COLUMN_NAME_RE = re.compile(
+    r"\b(os|pfs|dfs|rfs|efs|dss|css)\b|surviv|follow.?up|time.to.(death|event|progression|relapse|recurrence)",
+    re.IGNORECASE,
+)
+
+
+def survival_like_numeric_columns(samples: pd.DataFrame) -> list[str]:
+    return [
+        c for c in samples.columns
+        if c not in FIXED_SAMPLE_COLUMNS
+        and _is_high_cardinality(samples[c])
+        and _is_mostly_numeric(samples[c])
+        and _SURVIVAL_COLUMN_NAME_RE.search(str(c))
+    ]
+
+
+def summarize_numeric_column(series: pd.Series) -> dict:
+    """Compact summary (not the ~200+ raw values) for the LLM to estimate a
+    survival column's time unit from -- name is given separately by the
+    caller, this is just the value-range evidence."""
+    numeric = pd.to_numeric(series, errors="coerce").dropna()
+    examples = series.dropna().astype(str).unique()[:5].tolist()
+    if numeric.empty:
+        return {"min": None, "max": None, "examples": examples}
+    return {"min": float(numeric.min()), "max": float(numeric.max()), "examples": examples}
 
 
 def fingerprint_key(characteristics: dict) -> str:
@@ -84,7 +163,9 @@ def _protocol_snippet(gse, gsm_id: str) -> str:
     return text if _SELECTION_HINT_RE.search(text) else ""
 
 
-def build_prompt(gse, series_row: dict, groups: dict[str, dict]) -> tuple[str, str]:
+def build_prompt(
+    gse, series_row: dict, groups: dict[str, dict], numeric_columns: dict[str, dict] | None = None
+) -> tuple[str, str]:
     categories = vocab.load_diagnosis_categories()
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
         diagnosis_categories="\n".join(f"- {c}" for c in categories)
@@ -109,6 +190,12 @@ def build_prompt(gse, series_row: dict, groups: dict[str, dict]) -> tuple[str, s
             lines.append(f"protocol notes: {snippet}")
         lines.append("")
 
+    if numeric_columns:
+        lines.append("Excluded numeric column(s) (too many distinct values to group by -- estimate each one's time unit instead, in numeric_column_units):")
+        for col, info in numeric_columns.items():
+            lines.append(f"- {col}: min={info['min']}, max={info['max']}, examples={info['examples']}")
+        lines.append("")
+
     return system_prompt, "\n".join(lines)
 
 
@@ -123,7 +210,22 @@ def _call_model(system_prompt: str, user_prompt: str, model: str) -> SeriesLLMRe
     client = anthropic.Anthropic()
     response = client.messages.parse(
         model=model,
-        max_tokens=16000,
+        # A genuinely diverse cohort (many clinical centers/treatment regimens,
+        # e.g. GSE253260's 64 distinct first-line therapies -- real signal for
+        # prior_therapy, not something characteristic_columns' fingerprint
+        # exclusions above should strip out) can still produce a large number
+        # of groups even after those exclusions. Doubled from the original
+        # 16000 as extra headroom; harmonize.get_llm_annotation's try/except
+        # is still the actual safety net for whatever cohort is large enough
+        # to blow past even this. Above ~21k, the SDK's own
+        # _calculate_nonstreaming_timeout refuses a plain synchronous call
+        # ("Streaming is required for operations that may take longer than
+        # 10 minutes") *unless* a timeout is given explicitly -- that
+        # calculation only runs "if not is_given(timeout)", so passing one
+        # here sidesteps it entirely rather than reshaping this whole
+        # function around a streamed response.
+        max_tokens=32000,
+        timeout=1200.0,
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
         output_format=SeriesLLMResult,
@@ -131,8 +233,15 @@ def _call_model(system_prompt: str, user_prompt: str, model: str) -> SeriesLLMRe
     return _extract_parsed(response)
 
 
-def annotate_series(gse, series_row: dict, groups: dict[str, dict], model: str | None = None) -> SeriesLLMResult:
-    system_prompt, user_prompt = build_prompt(gse, series_row, groups)
+def annotate_series(
+    gse, series_row: dict, groups: dict[str, dict], samples: pd.DataFrame | None = None, model: str | None = None
+) -> SeriesLLMResult:
+    numeric_columns = None
+    if samples is not None:
+        numeric_cols = survival_like_numeric_columns(samples)
+        if numeric_cols:
+            numeric_columns = {col: summarize_numeric_column(samples[col]) for col in numeric_cols}
+    system_prompt, user_prompt = build_prompt(gse, series_row, groups, numeric_columns)
     return _call_model(system_prompt, user_prompt, model or config.LLM_MODEL)
 
 
@@ -162,6 +271,51 @@ def _normalize_species(organism_ch1: str) -> str:
     return "unknown" if not value else "other"
 
 
+# Target unit is days, not clinical_annotate.py's months -- this module's
+# numeric_column_units estimate comes from a column name + value range, not
+# a definitive per-cohort column-mapping analysis, so days keeps the
+# conversion a simple, reversible unit change rather than implying the same
+# level of confidence as clinical_annotate.py's --clinical-annotate survival
+# unification (time_column + event_column, opt-in, one dedicated call).
+_TIME_UNIT_TO_DAYS = {"days": 1.0, "months": 30.4375, "years": 365.25}
+_NUMBER_RE = re.compile(r"-?\d+\.?\d*")
+
+
+def _extract_first_number(text) -> float:
+    if text is None or (isinstance(text, float) and pd.isna(text)):
+        return float("nan")
+    match = _NUMBER_RE.search(str(text))
+    return float(match.group()) if match else float("nan")
+
+
+def _sanitize_column_name(name: str) -> str:
+    return re.sub(r"[^0-9a-zA-Z]+", "_", str(name)).strip("_").lower()
+
+
+def apply_numeric_column_units(samples: pd.DataFrame, units: list) -> pd.DataFrame:
+    """Add an llm_<column>_days column for each numeric_column_units entry
+    with a resolved (non-"unknown") unit -- additive only, the original raw
+    column is left untouched (same "never destroy, only add" convention as
+    e.g. this codebase's RMA and two-channel outputs). Named with the same
+    "llm_" prefix every other column this module derives uses, since
+    harmonize.get_llm_annotation's non-backfill path only ever keeps
+    columns matching that prefix when joining back onto a cohort's
+    annotation.tsv -- anything else here would be silently dropped there.
+    """
+    out = samples.copy()
+    for unit_entry in units:
+        col = unit_entry.column_name
+        if col not in out.columns or unit_entry.unit == "unknown":
+            continue
+        factor = _TIME_UNIT_TO_DAYS[unit_entry.unit]
+        numeric = pd.to_numeric(out[col], errors="coerce")
+        needs_fallback = numeric.isna() & out[col].notna()
+        if needs_fallback.any():
+            numeric.loc[needs_fallback] = out[col][needs_fallback].map(_extract_first_number)
+        out[f"llm_{_sanitize_column_name(col)}_days"] = numeric * factor
+    return out
+
+
 def merge_annotations(samples: pd.DataFrame, fp_ids: pd.Series, result: SeriesLLMResult) -> pd.DataFrame:
     """Normalize diagnoses and join LLM sample-group annotations back onto `samples`."""
     categories = vocab.load_diagnosis_categories()
@@ -186,7 +340,7 @@ def merge_annotations(samples: pd.DataFrame, fp_ids: pd.Series, result: SeriesLL
         })
     annotations = pd.DataFrame(rows)
 
-    out = samples.copy()
+    out = apply_numeric_column_units(samples, result.series_level.numeric_column_units)
     out["fingerprint_id"] = fp_ids
     out["llm_species"] = (
         out["organism_ch1"].map(_normalize_species) if "organism_ch1" in out.columns else "unknown"
@@ -252,7 +406,7 @@ def annotate_and_cache(
     if cached is not None and cached.get("cache_key") == cache_key:
         result = SeriesLLMResult.model_validate(cached["result"])
     else:
-        result = annotate_series(gse, series_row, groups, model=model)
+        result = annotate_series(gse, series_row, groups, samples=samples, model=model)
         if escalate_ambiguous:
             result = _escalate_ambiguous(gse, series_row, groups, result)
         _save_cache(cache_file, cache_key, result)
