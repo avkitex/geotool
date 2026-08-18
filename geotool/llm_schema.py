@@ -26,12 +26,26 @@ class SampleGroupAnnotation(BaseModel):
     prior_therapy_detail: str = Field(default="", description="Regimen/timing specifics if prior_therapy is yes")
 
 
+class NumericColumnUnit(BaseModel):
+    column_name: str = Field(description="samples.tsv column name for a numeric survival/follow-up time column")
+    unit: Literal["days", "months", "years", "unknown"] = Field(
+        description="Best estimate of this column's time unit, from its name and the value range given -- "
+        "GEO survival columns are most often already in days, months less often, years rarely; use 'unknown' "
+        "rather than guessing when genuinely ambiguous"
+    )
+
+
 class SeriesLevelAnnotation(BaseModel):
     assay_type: Literal["bulk_rnaseq", "microarray", "scrnaseq", "other", "unknown"]
     assay_detail: str = Field(default="", description="e.g. library prep or single-cell platform specifics")
     treatment_context: str = Field(default="", description="e.g. 'front-line R-CHOP trial, OS/PFS tracked'")
     has_outcome_data: bool
     outcome_columns: list[str] = Field(default_factory=list, description="samples.tsv column names holding OS/PFS/response, if any")
+    numeric_column_units: list[NumericColumnUnit] = Field(
+        default_factory=list,
+        description="Unit estimate for each numeric survival/follow-up time column listed in the prompt's "
+        "'excluded numeric columns' section, if any were given",
+    )
     inconsistency_notes: str = Field(default="", description="Contradictions between the summary and per-sample characteristics, or ''")
 
 
