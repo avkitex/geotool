@@ -945,13 +945,18 @@ def test_download_cohort_includes_channel_expression_paths_for_agilent(monkeypat
     assert (tmp_path / "GSE_AGILENT" / "channel_roles.json").exists()
 
 
-def test_download_cohort_does_not_flag_negative_values_for_two_channel_ratio(monkeypatch, tmp_path):
+def test_download_cohort_ratio_only_two_channel_is_signal_unresolved_not_ok(monkeypatch, tmp_path):
     """A two-channel sample's own VALUE column is routinely a log2(Cy5/Cy3)
     ratio, negative by design for anything below the reference channel --
     not evidence of a bad transform the way it would be for a single-channel
-    or RNA-seq matrix. Live examples that were wrongly excluded from
-    cohort_report.py's "ready" readiness before this fix: GSE77858
-    ("Log2 (Cy5/Cy3) ratio", ~48% negative values) and GSE21501."""
+    or RNA-seq matrix (the negative-value note is correctly dropped, live
+    examples: GSE77858's "Log2 (Cy5/Cy3) ratio", GSE21501). But the ratio
+    itself is still the wrong thing to hand downstream analysis -- that's
+    the resolved signal/tumor channel, which needs per-channel columns this
+    fixture (like most real two-channel series) doesn't publish at all, so
+    expression_status must still land on two_channel_signal_unresolved, not
+    "ok" -- readiness is about whether the *right* file exists, not just
+    whether the ratio was processed without incident."""
     metadata = {"geo_accession": ["GSE_RATIO"], "title": ["A two-channel ratio series"], "summary": ["s"]}
     gsms = {
         "GSM1": FakeGSM(
@@ -983,10 +988,56 @@ def test_download_cohort_does_not_flag_negative_values_for_two_channel_ratio(mon
 
     result = download.download_cohort("GSE_RATIO", series_dir=tmp_path)
 
-    assert "negative_values" not in result["expression_status"]
-    assert result["expression_status"] == clinical_annotate.EXPRESSION_STATUS_OK
-    # the raw QC note is still recorded, just not turned into a disqualifying status
+    assert "negative_values" not in result["expression_status"]  # still correctly not flagged as a transform bug
+    assert result["expression_status"] == clinical_annotate.EXPRESSION_STATUS_TWO_CHANNEL_SIGNAL_UNRESOLVED
+    assert "channel_signal_expression_path" not in result
+    # the raw QC note is still recorded, just not turned into a disqualifying status on its own
     assert any("negative value" in note for note in result.get("expression_qc_notes", []))
+
+
+def test_download_cohort_two_channel_with_resolved_signal_channel_is_ok(monkeypatch, tmp_path):
+    """Counterpart to the ratio-only case above: a two-channel cohort that
+    *does* publish per-channel columns and resolves confidently (metadata +
+    variance, matching make_agilent_two_channel_gse_with_reference) gets the
+    signal channel geotool actually needs -- expression_status stays "ok"
+    despite the ratio's own negative values, same as before."""
+    gse_id = "GSE_AGILENT_REF_RATIO"
+    metadata = {"geo_accession": [gse_id], "title": ["A reference-design two-channel series"], "summary": ["s"]}
+    gsms = {}
+    for i in range(1, 7):
+        gsms[f"GSM{i}"] = FakeGSM(
+            {
+                "title": [f"s{i}"], "geo_accession": [f"GSM{i}"], "platform_id": ["GPL2011"],
+                "organism_ch1": ["Homo sapiens"], "channel_count": ["2"],
+                "source_name_ch1": ["Human Universal Reference"],
+                "characteristics_ch1": ["reference: Human Universal Reference"],
+                "source_name_ch2": [f"Tumor sample {i}"],
+                "characteristics_ch2": [f"tissue: Breast Cancer {i}"],
+            },
+            table=pd.DataFrame({
+                "ID_REF": ["1007_s_at", "1053_at"],
+                "ch1 Intensity": [100.0, 100.0],
+                "ch2 Intensity": [50.0 * i, 5.0 * i],
+                "VALUE": [-1.2 if i % 2 else 0.8, -0.6 if i % 2 else 0.4],  # a real, negative-containing ratio
+            }),
+        )
+    gpls = {"GPL2011": FakeGPL({"title": ["Agilent two-color array"], "technology": ["in situ oligonucleotide"], "manufacturer": ["Agilent Technologies"]})}
+    gse = FakeGSE(metadata, gsms, gpls)
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gid: gse)
+    monkeypatch.setattr(
+        download.clinical_annotate, "plan_column_mapping", lambda samples, model=None: clinical_annotate.ColumnMappingPlan()
+    )
+    fake_map = pd.DataFrame([
+        {"probe_id": "1007_s_at", "gene_symbol": "DDR1", "entrez_id": "780", "source": "direct_columns"},
+        {"probe_id": "1053_at", "gene_symbol": "RFC2", "entrez_id": "5982", "source": "direct_columns"},
+    ])
+    monkeypatch.setattr(download.probe_mapping, "get_or_build_probe_gene_map", lambda gpl_id: fake_map)
+
+    result = download.download_cohort(gse_id, series_dir=tmp_path)
+
+    assert result["channel_roles"]["method"] == "metadata+variance"
+    assert "channel_signal_expression_path" in result
+    assert result["expression_status"] == clinical_annotate.EXPRESSION_STATUS_OK
 
 
 def test_download_cohort_still_flags_negative_values_for_single_channel(monkeypatch, tmp_path):

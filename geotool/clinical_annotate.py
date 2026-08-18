@@ -36,9 +36,10 @@ EXPRESSION_STATUS_NOT_LOG2_TRANSFORMED = "not_log2_transformed"
 EXPRESSION_STATUS_NEGATIVE_VALUES = "negative_values"
 EXPRESSION_STATUS_LOOKS_TRANSPOSED = "looks_transposed"
 EXPRESSION_STATUS_LOW_GENE_COUNT = "low_gene_count"
+EXPRESSION_STATUS_TWO_CHANNEL_SIGNAL_UNRESOLVED = "two_channel_signal_unresolved"
 
 
-def classify_expression_status(qc_notes: list[str], has_matrix: bool) -> str:
+def classify_expression_status(qc_notes: list[str], has_matrix: bool, two_channel_signal_unresolved: bool = False) -> str:
     """Word-enum summary of download.py's expression-matrix QC findings
     (probe_mapping.check_expression_qc / check_rnaseq_expression_qc), for the
     expression_status column in annotation.tsv -- lets a human or downstream
@@ -52,6 +53,19 @@ def classify_expression_status(qc_notes: list[str], has_matrix: bool) -> str:
     no probe->gene mapping available (microarray), or an unhandled assay
     type -- in which case there's nothing left to check and the other
     qc_notes-derived tags don't apply.
+
+    two_channel_signal_unresolved is True for a two-channel (Cy3/Cy5
+    reference-design) cohort whose own expression.tsv.gz is a log-ratio,
+    not a per-sample tumor/signal-channel measurement -- correct downstream
+    use needs the actual signal channel (probe_mapping.
+    detect_reference_channel's channel_signal_expression.tsv.gz), not the
+    ratio. When that channel can't be resolved (most two-channel series
+    only ever publish the ratio, with no separate per-channel columns to
+    split at all; a rarer case has per-channel columns but an ambiguous
+    reference-channel call), the cohort is flagged not ready via this tag
+    even though the ratio itself was correctly, uneventfully processed --
+    "correctly computed" and "the right thing to hand downstream analysis"
+    are different claims.
     """
     if not has_matrix:
         return EXPRESSION_STATUS_NO_MATRIX
@@ -59,6 +73,8 @@ def classify_expression_status(qc_notes: list[str], has_matrix: bool) -> str:
         return EXPRESSION_STATUS_UNPARSEABLE
 
     tags = []
+    if two_channel_signal_unresolved:
+        tags.append(EXPRESSION_STATUS_TWO_CHANNEL_SIGNAL_UNRESOLVED)
     if any("not log2-transformed" in note for note in qc_notes):
         tags.append(EXPRESSION_STATUS_NOT_LOG2_TRANSFORMED)
     if any("negative value" in note for note in qc_notes):
