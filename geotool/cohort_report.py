@@ -118,7 +118,17 @@ def _resolve_own_expression_file(gse_id: str, series_row_dir: Path, series_dir: 
     cohort_report_row): without it, expression_file used to stay "" even
     for a "ready" (expression_status == "ok") cohort -- readiness said yes,
     but nothing pointed at the file that made it so.
+
+    channel_signal_expression.tsv.gz (the resolved tumor/signal channel,
+    not the Cy3/Cy5 ratio) takes priority for a two-channel cohort -- the
+    only kind of "ready" two-channel cohort there is, now that download.py
+    flags expression_status two_channel_signal_unresolved whenever that
+    file doesn't exist (see classify_expression_status), so its presence
+    here is guaranteed whenever this function is even reached for one.
     """
+    signal_path = series_row_dir / "channel_signal_expression.tsv.gz"
+    if signal_path.exists():
+        return str(signal_path.relative_to(series_dir)).replace("\\", "/")
     expr_path = series_row_dir / "expression.tsv.gz"
     if expr_path.exists():
         return str(expr_path.relative_to(series_dir)).replace("\\", "/")

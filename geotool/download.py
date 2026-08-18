@@ -1370,7 +1370,19 @@ def download_cohort(
     status_notes = qc_notes
     if is_two_channel:
         status_notes = [note for note in qc_notes if "negative value" not in note]
-    expression_status = clinical_annotate.classify_expression_status(status_notes, matrix_found)
+    # The ratio being correctly computed doesn't make it the right thing to
+    # hand downstream analysis -- that's the resolved signal/tumor channel
+    # (channel_signal_expression.tsv.gz), only present when this cohort
+    # published per-channel columns at all *and* detect_reference_channel
+    # was confident which one is signal vs reference. Most two-channel
+    # series only ever publish the ratio (live example: GSE77858) with no
+    # per-channel columns to split in the first place -- correctly
+    # processed, still not ready, since there's no way to recover which
+    # channel is the tumor sample from a ratio alone.
+    two_channel_signal_unresolved = is_two_channel and "channel_signal_expression_path" not in result
+    expression_status = clinical_annotate.classify_expression_status(
+        status_notes, matrix_found, two_channel_signal_unresolved=two_channel_signal_unresolved,
+    )
     result["expression_status"] = expression_status
     print(f"  {gse_id}: expression status: {expression_status}")
 

@@ -333,3 +333,20 @@ def test_classify_expression_status_looks_transposed():
 def test_classify_expression_status_low_gene_count():
     notes = ["expression.tsv.gz: only 7833 genes (< 16000) -- likely a filtered/truncated gene list, not the full transcriptome"]
     assert ca.classify_expression_status(notes, has_matrix=True) == ca.EXPRESSION_STATUS_LOW_GENE_COUNT
+
+
+def test_classify_expression_status_two_channel_signal_unresolved():
+    """A two-channel cohort whose signal/tumor channel couldn't be resolved
+    is flagged even with an otherwise clean matrix -- readiness is about
+    whether the right file exists, not just whether the ratio itself
+    processed without incident."""
+    assert (
+        ca.classify_expression_status([], has_matrix=True, two_channel_signal_unresolved=True)
+        == ca.EXPRESSION_STATUS_TWO_CHANNEL_SIGNAL_UNRESOLVED
+    )
+
+
+def test_classify_expression_status_two_channel_signal_unresolved_joins_with_other_tags():
+    notes = ["expression.tsv.gz: linear-scale, not log2-transformed (max value 99.0)"]
+    status = ca.classify_expression_status(notes, has_matrix=True, two_channel_signal_unresolved=True)
+    assert status == f"{ca.EXPRESSION_STATUS_TWO_CHANNEL_SIGNAL_UNRESOLVED};{ca.EXPRESSION_STATUS_NOT_LOG2_TRANSFORMED}"
