@@ -109,11 +109,29 @@ def get_llm_annotation(
     a missing/stale cache gets computed now via llm_annotate.annotate_and_cache
     (gse=None: the only thing that needs a live GEOparse object is an
     optional protocol-text prompt hint, not worth a full re-fetch here).
+
+    A cohort whose samples fingerprint into a very large number of distinct
+    groups (near-unique characteristics per sample -- live example:
+    GSE183795, 244 samples / 200 groups) can make the model's structured
+    per-group response overflow _call_model's max_tokens, which
+    client.messages.parse surfaces as a pydantic ValidationError on the
+    truncated JSON, not a clean "no result". Uncaught, that took down the
+    entire harmonize run over one cohort -- every other requested cohort's
+    LLM classification lost too, not just this one's. Caught here and
+    treated the same as "no cache yet" (None, logged) so the rest of the
+    batch still gets backfilled; this cohort just keeps whatever it already
+    had (constant-column-dropped annotation.tsv, alias-mapped columns) and
+    can be retried later, e.g. once a larger max_tokens or a group-batching
+    fix lands.
     """
     if backfill:
-        merged, _ = llm_annotate.annotate_and_cache(
-            None, series_row, samples, series_dir=series_dir, model=model, escalate_ambiguous=escalate_ambiguous
-        )
+        try:
+            merged, _ = llm_annotate.annotate_and_cache(
+                None, series_row, samples, series_dir=series_dir, model=model, escalate_ambiguous=escalate_ambiguous
+            )
+        except Exception as exc:
+            print(f"  {gse_id}: LLM annotation failed, skipping ({exc})")
+            return None
     else:
         result = _read_cached_llm_result(gse_id, series_dir)
         if result is None:

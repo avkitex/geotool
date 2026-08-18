@@ -154,6 +154,31 @@ def test_get_llm_annotation_backfills_when_requested(tmp_path, monkeypatch):
     assert set(result["gsm_id"]) == {"GSM1", "GSM2"}
 
 
+def test_get_llm_annotation_returns_none_and_does_not_raise_when_llm_call_fails(tmp_path, monkeypatch, capsys):
+    """A cohort with enough distinct fingerprint groups can overflow the
+    model call's max_tokens, which surfaces as a pydantic ValidationError on
+    the truncated JSON (live example: GSE183795, 244 samples / 200 groups).
+    That must not take down the whole harmonize run over one cohort -- this
+    mirrors the "no cache yet" None return, not a crash."""
+    samples = make_samples()
+
+    class _FakeMessages:
+        def parse(self, **kwargs):
+            raise ValueError("Invalid JSON: EOF while parsing a string")
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    monkeypatch.setattr(llm_annotate.anthropic, "Anthropic", lambda: _FakeClient())
+
+    series_row = {"gse_id": "GSE_X", "title": "t", "summary": "s", "overall_design": "d"}
+    result = harmonize.get_llm_annotation("GSE_X", series_row, samples, series_dir=tmp_path, backfill=True)
+
+    assert result is None
+    assert not (tmp_path / "GSE_X" / "llm_annotations.json").exists()
+    assert "GSE_X" in capsys.readouterr().out
+
+
 # --- harmonize_cohort / harmonize_cohorts -----------------------------------
 
 def _write_cohort(series_dir, gse_id, annotation_df, series_row=None, samples_df=None):
