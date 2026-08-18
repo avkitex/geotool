@@ -19,6 +19,32 @@ def test_chip_package_for_unknown_platform_raises():
         renormalize.chip_package_for("GPL999999")
 
 
+@pytest.mark.parametrize(
+    "gpl_id,expected_family,expected_package",
+    [
+        # Each live-verified (real oligo::read.celfiles + rma() run against
+        # that platform's own CEL files) after --rma initially shipped only
+        # knowing 9 platforms.
+        ("GPL17586", "gene_st", "pd.hta.2.0"),  # HTA-2.0 -- same hardware as GPL16686, different GEO platform record
+        ("GPL5175", "gene_st", "pd.huex.1.0.st.v2"),  # HuEx-1.0-st, gene-level annotation
+        ("GPL5188", "gene_st", "pd.huex.1.0.st.v2"),  # HuEx-1.0-st, exon-level annotation -- same physical array/CEL data as GPL5175
+        ("GPL13667", "gene_st", "pd.hg.u219"),  # HG-U219 -- newer CEL format despite the classic whole-probe design
+    ],
+)
+def test_chip_package_for_newly_added_platforms(gpl_id, expected_family, expected_package):
+    family, package = renormalize.chip_package_for(gpl_id)
+    assert family == expected_family
+    assert package == expected_package
+
+
+def test_chip_package_for_custom_rosetta_merck_platform_raises():
+    """GPL15048 (a one-off custom re-annotation, not a standard commercial
+    array) has no CDF/pd.* package anywhere in Bioconductor -- deliberately
+    left out of _CHIP_PACKAGES rather than guessed."""
+    with pytest.raises(renormalize.RmaUnavailable):
+        renormalize.chip_package_for("GPL15048")
+
+
 def test_run_rma_raises_when_no_cel_files():
     with pytest.raises(renormalize.RmaUnavailable):
         renormalize.run_rma({}, "GPL570")

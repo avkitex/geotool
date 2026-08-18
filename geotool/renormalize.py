@@ -37,6 +37,29 @@ import pandas as pd
 # package, where the value here *is* the installable package name as-is. An
 # unlisted GPL just skips RMA for that series -- extend this table as new
 # platforms come up rather than guessing a package name.
+#
+# GPL17586/GPL5175/GPL5188/GPL13667 added and each live-verified (a real
+# oligo::read.celfiles + rma() run against that platform's own CEL files,
+# not just "the package installs") after `--rma` first shipped only knowing
+# 9 platforms. GPL5175 and GPL5188 are the *same* physical HuEx-1.0-st array
+# and CEL data -- GEO just has two separate platform records for it (gene-
+# level vs exon-level probe-set annotation), so both map to the one pd.*
+# package that matches the actual chip, not the annotation choice. GPL17586
+# is likewise the same HTA-2.0 hardware as GPL16686 (a different GEO
+# platform record, same array), hence the same pd.hta.2.0. GPL13667 (HG-U219)
+# looks like a classic whole-probe "3prime" design but was released on
+# Affymetrix's newer GeneTitan/Command-Console CEL format -- verified it
+# needs the gene_st-style oligo::read.celfiles path (pd.hg.u219), not
+# affy::ReadAffy, despite not being a Gene/Exon ST array biologically.
+#
+# GPL15048 ("Rosetta/Merck Human RSTA Custom Affymetrix 2.0 microarray
+# [HuRSTA_2a520709.CDF]") was checked too and deliberately left out: it's a
+# one-off custom re-annotation of a chip, not a standard commercial array,
+# and has no CDF/pd.* package anywhere in Bioconductor's repository (checked
+# via available.packages(repos = BiocManager::repositories()) -- zero
+# matches for any hurst*/rsta*-shaped name). RMA support for it would need a
+# custom CDF from outside Bioconductor's normal install path, which this
+# lazy ensure_pkg()-based installer has no way to fetch.
 _CHIP_PACKAGES: dict[str, tuple[str, str]] = {
     "GPL96": ("3prime", "hgu133a"),
     "GPL97": ("3prime", "hgu133b"),
@@ -47,6 +70,10 @@ _CHIP_PACKAGES: dict[str, tuple[str, str]] = {
     "GPL6246": ("gene_st", "pd.mogene.1.0.st.v1"),
     "GPL11532": ("gene_st", "pd.hugene.2.0.st"),
     "GPL16686": ("gene_st", "pd.hta.2.0"),
+    "GPL17586": ("gene_st", "pd.hta.2.0"),
+    "GPL5175": ("gene_st", "pd.huex.1.0.st.v2"),
+    "GPL5188": ("gene_st", "pd.huex.1.0.st.v2"),
+    "GPL13667": ("gene_st", "pd.hg.u219"),
 }
 
 # Shared by both templates below. Uses R_LIBS_USER (a per-user library R
