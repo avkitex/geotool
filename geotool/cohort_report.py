@@ -109,6 +109,29 @@ def _orphan_note(marker: dict | None) -> str:
     return "SuperSeries carries data not covered by any subseries -- " + "; ".join(parts)
 
 
+def _resolve_own_expression_file(gse_id: str, series_row_dir: Path, series_dir: Path) -> str:
+    """Path (relative to series_dir, e.g. "GSE12345/expression.tsv.gz") to
+    whatever expression file this cohort's own `geotool download` run
+    resolved -- expression.tsv.gz for microarray, or download.py's own
+    expression_qc.json (its primary_expression_file field) for RNA-seq.
+    Only ever called when no collection_root was given (see
+    cohort_report_row): without it, expression_file used to stay "" even
+    for a "ready" (expression_status == "ok") cohort -- readiness said yes,
+    but nothing pointed at the file that made it so.
+    """
+    expr_path = series_row_dir / "expression.tsv.gz"
+    if expr_path.exists():
+        return str(expr_path.relative_to(series_dir)).replace("\\", "/")
+    expression_qc = download_mod._load_expression_qc(series_row_dir)
+    primary = expression_qc.get("primary_expression_file") if expression_qc else None
+    if primary:
+        try:
+            return str(Path(primary).relative_to(series_dir)).replace("\\", "/")
+        except ValueError:
+            return str(primary).replace("\\", "/")
+    return ""
+
+
 def _sample_id_match_status(collection_root: Path | str | None, gse_id: str, sample_id_map_filename: str) -> tuple[str, str]:
     """(status, detail) for <collection_root>/<gse_id>/<sample_id_map_filename>:
     status is "" if collection_root wasn't given (not checked), "not_available"
@@ -211,6 +234,7 @@ def cohort_report_row(
         )
     elif row["expression_status"] == "ok":
         row["readiness"] = "ready"
+        row["expression_file"] = _resolve_own_expression_file(gse_id, series_row_dir, series_dir)
     else:
         row["reason_if_not_ready"] = row["expression_status"] or "no expression_status recorded"
 
