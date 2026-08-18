@@ -100,6 +100,36 @@ def test_cohort_report_row_ready_from_expression_status(tmp_path):
     assert row["reason_if_not_ready"] == ""
 
 
+def test_cohort_report_row_ready_populates_expression_file_for_microarray(tmp_path):
+    """Without collection_root, expression_file used to stay "" even for a
+    "ready" cohort -- readiness said yes, but nothing pointed at the file
+    that made it so. Microarray's own expression.tsv.gz is resolved
+    directly, same as download._cached_result already does."""
+    out_dir = _write_series(tmp_path, "GSE1", platform_details=[{"assay_type": "microarray", "gpl_id": "GPL1"}])
+    _write_annotation(out_dir, expression_status="ok")
+    (out_dir / "expression.tsv.gz").write_bytes(b"")
+
+    row = cohort_report.cohort_report_row("GSE1", tmp_path, {}, {"GSE1"})
+    assert row["readiness"] == "ready"
+    assert row["expression_file"] == "GSE1/expression.tsv.gz"
+
+
+def test_cohort_report_row_ready_populates_expression_file_for_rnaseq(tmp_path):
+    """RNA-seq has no fixed expression.tsv.gz filename -- resolved from
+    download.py's own expression_qc.json (primary_expression_file) instead."""
+    out_dir = _write_series(tmp_path, "GSE1", platform_details=[{"assay_type": "bulk_rnaseq", "gpl_id": "GPL1"}])
+    _write_annotation(out_dir, expression_status="ok")
+    primary = out_dir / "expression" / "GSE1_counts.tsv.gz"
+    primary.parent.mkdir(parents=True, exist_ok=True)
+    primary.write_bytes(b"")
+    with open(out_dir / "expression_qc.json", "w", encoding="utf-8") as f:
+        json.dump({"primary_expression_file": str(primary), "primary_expression_unit": "count", "notes": []}, f)
+
+    row = cohort_report.cohort_report_row("GSE1", tmp_path, {}, {"GSE1"})
+    assert row["readiness"] == "ready"
+    assert row["expression_file"] == "GSE1/expression/GSE1_counts.tsv.gz"
+
+
 def test_cohort_report_row_not_ready_from_expression_status(tmp_path):
     out_dir = _write_series(tmp_path, "GSE1")
     _write_annotation(out_dir, expression_status="no_expression_matrix")
