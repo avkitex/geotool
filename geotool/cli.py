@@ -8,6 +8,7 @@ import click
 import pandas as pd
 
 from geotool import config, download as download_mod, harmonize as harmonize_mod, report, search as search_mod
+from geotool import microarray_finalize as microarray_finalize_mod
 from geotool import rnaseq_finalize as rnaseq_finalize_mod
 
 
@@ -404,6 +405,42 @@ def finalize_rnaseq(cohort_roots, gencode_version, out_name):
     n_failed = int((report_df["status"] == "failed").sum())
     click.echo(f"{len(report_df)} cohort(s) written to {out_path}")
     click.echo(f"processed: {n_processed}, skipped: {n_skipped}, failed: {n_failed}")
+
+
+@main.command("finalize-microarray")
+@click.argument("cohort_roots", nargs=-1, required=True, type=click.Path(file_okay=False))
+@click.option("--gencode-version", default="50", show_default=True, help="GENCODE reference release under data/references/gencode<version>.")
+@click.option("--out", "out_name", default="microarray_finalize", show_default=True, help="Output basename under data/reports/")
+def finalize_microarray(cohort_roots, gencode_version, out_name):
+    """Finalize every microarray cohort's expression matrix under one or more
+    collection roots, e.g.
+
+    geotool finalize-microarray data/pdac_cohorts data/mtap_prmt5_cohorts
+
+    For each root's immediate GSE* subdirectories with a resolved, ready
+    (expression_status == "ok") single-sample gene-level matrix
+    (expression.tsv.gz, or channel_signal_expression.tsv.gz for a
+    two-channel cohort with a resolved signal channel), restricts to the
+    clean GENCODE reference gene set -- the same clean-set policy
+    finalize-rnaseq applies to RNA-seq -- writing
+    <root>/<GSE>/expression_final.tsv.gz. No unit/TPM conversion: unlike
+    RNA-seq, geotool.download already maps probes to HUGO gene symbols and
+    log2-transforms at download time, and there's no TPM-equivalent
+    renormalization concept for hybridization-intensity data.
+
+    Writes data/reports/<name>.tsv (one row per cohort: processed/skipped).
+    """
+    report_df = microarray_finalize_mod.build_final_matrices(
+        [Path(r) for r in cohort_roots], gencode_version=gencode_version,
+    )
+    config.ensure_dirs()
+    out_path = config.REPORTS_DIR / f"{out_name}.tsv"
+    report_df.to_csv(out_path, sep="\t", index=False)
+
+    n_processed = int((report_df["status"] == "processed").sum())
+    n_skipped = int((report_df["status"] == "skipped").sum())
+    click.echo(f"{len(report_df)} cohort(s) written to {out_path}")
+    click.echo(f"processed: {n_processed}, skipped: {n_skipped}")
 
 
 if __name__ == "__main__":
