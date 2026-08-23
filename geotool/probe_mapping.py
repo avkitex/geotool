@@ -380,7 +380,15 @@ _METADATA_COLUMN_KEYWORDS = _ID_COLUMN_SUBSTRING_PRIORITY + [
 # just as much a non-sample column as any of them. Matched exactly (not as
 # a substring): unlike the keywords above, several of these are short
 # enough that a substring match risks colliding with a real column name.
-_METADATA_COLUMN_EXACT_KEYWORDS = ["#", "index", "no", "no.", "rownum", "row_number", "row_num"]
+# "id" specifically: live example, GSE243850's own bare "ID" column (raw
+# 1..N gene indices) once its real header is recovered from a misparsed
+# title row (see the Unnamed:-N-columns fixup in normalize_expression_matrix)
+# -- _pick_identifier_column already prefers a more specific match
+# ("Gene symbol" via the "symbol" substring) when one exists, so a bare "id"
+# reaching here at all means it lost that contest and is a redundant second
+# identifier column, not a sample, even though its dtype (sequential
+# integers) looks numeric like one.
+_METADATA_COLUMN_EXACT_KEYWORDS = ["#", "index", "no", "no.", "rownum", "row_number", "row_num", "id"]
 
 
 def _normalize_column_name(name) -> str:
@@ -555,6 +563,58 @@ def normalize_expression_matrix(matrix: pd.DataFrame) -> tuple[pd.DataFrame, lis
         matrix = matrix.reset_index()
         if matrix.columns[0] == "index":
             matrix = matrix.rename(columns={"index": "gene_id"})
+
+    # A spurious title/section-label row sitting above the real header --
+    # most of its cells blank, so pandas auto-names those columns
+    # "Unnamed: N" -- leaves the true header as the first *data* row
+    # instead. Live example: GSE243850's "Raw counts and normalized read
+    # count" file, whose literal first line is blank except for a lone
+    # "Raw count" section label, with the real header (["ID", "Gene
+    # symbol", "YS_2542338", ...]) one row below -- expression_status came
+    # out "ok" anyway, since check_expression_qc had no numeric columns
+    # left to check once every sample column's dtype got poisoned to
+    # object by that stray header-shaped row (see check_expression_qc's
+    # own no-numeric-columns note for the other half of that fix).
+    # Detected by column *names* (mostly pandas' own placeholder), not
+    # column count, so it can't collide with the pandas-index case above
+    # (real column labels there, just one too few). Only ever shifts once:
+    # if the row below still doesn't look like a real header, this isn't
+    # that case, and the extra-columns bail-out further down is the safety
+    # net for whatever's still wrong.
+    unnamed_fraction = sum(bool(re.fullmatch(r"Unnamed: \d+", str(c))) for c in matrix.columns) / len(matrix.columns)
+    if unnamed_fraction > 0.5 and len(matrix) > 1:
+        new_header = [str(v) for v in matrix.iloc[0].tolist()]
+        # Real column headers are unique; a repeated value (most obviously,
+        # every cell holding the same placeholder) means this row doesn't
+        # actually look like a header either -- skip the shift rather than
+        # produce a matrix with duplicate column labels (matrix[col] below,
+        # and every check downstream, assumes one Series per label, not a
+        # sub-DataFrame). Left for the ordinary extra-columns bail-out
+        # further down to refuse safely, same as before this fixup existed.
+        if len(set(new_header)) == len(new_header):
+            notes.append(
+                f"header row looks blank/misparsed ({unnamed_fraction:.0%} of columns unnamed) -- a title/section-label "
+                "row above the real header -- used the next row down as the real header instead"
+            )
+            matrix = matrix.iloc[1:].reset_index(drop=True)
+            matrix.columns = new_header
+            # Every column's dtype was already committed to `object` by
+            # pandas when it first parsed the file (that stray string-valued
+            # header row, mixed in with the numeric data rows below, forces
+            # the whole column to object) -- removing the row doesn't
+            # retroactively re-infer it, so a genuinely all-numeric sample
+            # column would otherwise still look non-numeric to every check
+            # below (starting with extra_cols' own is_numeric_dtype test)
+            # and get dropped as "extra" right along with the real metadata
+            # columns. Only ever promotes a column when *every* remaining
+            # value parses cleanly -- anything that doesn't (a real text
+            # column) is left alone.
+            for col in matrix.columns:
+                if not pd.api.types.is_numeric_dtype(matrix[col]):
+                    coerced = pd.to_numeric(matrix[col], errors="coerce")
+                    if coerced.notna().sum() == matrix[col].notna().sum():
+                        matrix[col] = coerced
+
     columns = list(matrix.columns)
     id_col = _pick_identifier_column(columns)
     normalized_names = {col: _normalize_column_name(col) for col in columns}
