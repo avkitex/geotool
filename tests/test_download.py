@@ -152,6 +152,84 @@ def test_download_rnaseq_files_skips_cel_supplementary_files(requests_mock, tmp_
     assert not any(name.endswith(".CEL.gz") for name in names)
 
 
+def _write_xlsx(path: Path, sheets: dict[str, pd.DataFrame]) -> None:
+    with pd.ExcelWriter(path) as writer:
+        for name, df in sheets.items():
+            df.to_excel(writer, sheet_name=name, index=False)
+
+
+def test_split_multisheet_excel_writes_one_tsv_per_sheet(tmp_path):
+    """Real GSE243850 shape: two sheets, "Raw count" and "Normalized read
+    count" -- pandas.read_excel with no sheet_name would only ever see the
+    first one."""
+    path = tmp_path / "GSE243850_Raw_counts_and_normalized_read_count.xlsx"
+    _write_xlsx(path, {
+        "Raw count": pd.DataFrame({"gene": ["DDX11L1", "WASH7P"], "GSM1": [0, 930]}),
+        "Normalized read count": pd.DataFrame({"gene": ["DDX11L1", "WASH7P"], "GSM1": [0.0, 603.78]}),
+    })
+
+    derived = download._split_multisheet_excel(path)
+
+    names = sorted(p.name for p in derived)
+    assert names == ["normalized_read_count.tsv.gz", "raw_count.tsv.gz"]
+    raw = pd.read_csv(path.parent / "raw_count.tsv.gz", sep="\t")
+    assert raw["GSM1"].tolist() == [0, 930]
+
+
+def test_split_multisheet_excel_returns_empty_for_single_sheet(tmp_path):
+    path = tmp_path / "GSE1_TPM.xlsx"
+    _write_xlsx(path, {"Sheet1": pd.DataFrame({"gene": ["A1BG"], "GSM1": [5.0]})})
+    assert download._split_multisheet_excel(path) == []
+
+
+def test_split_multisheet_excel_returns_empty_for_non_excel_file(tmp_path):
+    path = tmp_path / "GSE1_counts.tsv.gz"
+    path.write_bytes(b"gene\tGSM1\nA1BG\t5\n")
+    assert download._split_multisheet_excel(path) == []
+
+
+def test_download_rnaseq_files_splits_multisheet_excel_and_excludes_original(requests_mock, tmp_path):
+    gse = make_rnaseq_gse()
+    gse.metadata["supplementary_file"] = ["ftp://example.com/GSE_RNASEQ_raw_and_normalized.xlsx"]
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf) as writer:
+        pd.DataFrame({"gene": ["DDX11L1"], "GSM1": [0]}).to_excel(writer, sheet_name="Raw count", index=False)
+        pd.DataFrame({"gene": ["DDX11L1"], "GSM1": [0.0]}).to_excel(writer, sheet_name="Normalized read count", index=False)
+    requests_mock.get("https://example.com/GSE_RNASEQ_raw_and_normalized.xlsx", content=buf.getvalue())
+
+    downloaded = download.download_rnaseq_files(gse, tmp_path)
+
+    names = sorted(p.name for p in downloaded)
+    assert names == ["normalized_read_count.tsv.gz", "raw_count.tsv.gz"]
+    assert "GSE_RNASEQ_raw_and_normalized.xlsx" not in names  # split, not also kept as its own candidate
+    assert (tmp_path / "expression" / "GSE_RNASEQ_raw_and_normalized.xlsx").exists()  # still downloaded, just not a candidate
+
+
+def test_classify_candidate_prefers_raw_over_normalized_within_same_unit_rank():
+    """GSE243850's exact ambiguity: both filenames only carry the generic
+    "count" keyword (no tpm/fpkm/rpkm/cpm), so they'd otherwise tie."""
+    raw = download._classify_candidate("raw_count.tsv.gz")
+    normalized = download._classify_candidate("normalized_read_count.tsv.gz")
+    assert raw is not None and normalized is not None
+    assert raw[1] == normalized[1] == "count"  # same unit
+    assert raw[0] < normalized[0]  # raw ranks better
+
+
+def test_select_primary_expression_file_prefers_raw_counts_over_normalized_counts():
+    paths = [Path("GSE1_normalized_read_count.tsv.gz"), Path("GSE1_raw_count.tsv.gz")]
+    assert download.select_primary_expression_file(paths) == (Path("GSE1_raw_count.tsv.gz"), "count")
+    # order-independent -- not just "whichever came first"
+    assert download.select_primary_expression_file(list(reversed(paths))) == (Path("GSE1_raw_count.tsv.gz"), "count")
+
+
+def test_select_primary_expression_file_still_prefers_tpm_over_raw_counts():
+    """The raw-vs-normalized preference only ever breaks a tie within the
+    same unit rank -- an already length-normalized TPM file still wins
+    outright over a merely-unnormalized raw-counts one."""
+    paths = [Path("GSE1_raw_count.tsv.gz"), Path("GSE1_TPM.tsv.gz")]
+    assert download.select_primary_expression_file(paths) == (Path("GSE1_TPM.tsv.gz"), "tpm")
+
+
 def test_select_primary_expression_file_prioritizes_tpm_over_fpkm_and_cpm():
     paths = [Path("GSE1_counts.txt.gz"), Path("GSE1_CPM.txt.gz"), Path("GSE1_FPKM.csv.gz"), Path("GSE1_TPM.tsv.gz")]
     assert download.select_primary_expression_file(paths) == (Path("GSE1_TPM.tsv.gz"), "tpm")

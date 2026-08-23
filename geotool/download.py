@@ -265,9 +265,64 @@ def _download_file(url: str, out_dir: Path, retries: int = 3) -> Path | None:
     return None
 
 
+def _split_multisheet_excel(path: Path) -> list[Path]:
+    """If `path` is a multi-sheet Excel file, write one derived
+    <sheet_name>.tsv.gz per sheet into the same directory and return their
+    paths -- [] if `path` isn't Excel, has only one sheet, or can't even be
+    opened (nothing removed either way; the caller decides whether the
+    original stays a candidate on top of these).
+
+    Without this, a submitter workbook with more than one sheet was
+    silently reduced to just its *first* sheet: pandas.read_excel(path)
+    with no sheet_name (see _load_expression_file_for_qc) only ever reads
+    sheet 0, with no indication anything else was even there. Live
+    example: GSE243850's "Raw counts and normalized read count.xlsx" has
+    two sheets, "Raw count" and "Normalized read count" -- the second was
+    completely invisible to the rest of the pipeline before this.
+
+    Named from the *sheet* name alone, not "<original stem>.<sheet>.tsv.gz"
+    -- GSE243850's own filename already contains the word "normalized" (it
+    describes both sheets at once), so stitching it onto every derived file
+    would make _NORMALIZED_HINT_RE match all of them regardless of which
+    sheet they actually came from, defeating _classify_candidate's raw-vs-
+    normalized preference. A same-named sheet colliding across two
+    different workbooks in one cohort (rare) just overwrites -- like every
+    other derived file in this module, this is meant to be idempotent
+    across a --force redownload of the same source, not to preserve
+    multiple unrelated files that happen to share a sheet name.
+    """
+    if path.suffix.lower() not in (".xlsx", ".xls"):
+        return []
+    try:
+        workbook = pd.ExcelFile(path)
+    except Exception:
+        return []
+    if len(workbook.sheet_names) <= 1:
+        return []
+
+    derived = []
+    for sheet_name in workbook.sheet_names:
+        try:
+            sheet_df = workbook.parse(sheet_name)
+        except Exception:
+            continue
+        slug = re.sub(r"[^0-9a-zA-Z]+", "_", sheet_name).strip("_").lower() or "sheet"
+        dest = path.parent / f"{slug}.tsv.gz"
+        sheet_df.to_csv(dest, sep="\t", index=False, compression="gzip")
+        derived.append(dest)
+    return derived
+
+
 def download_rnaseq_files(gse, out_dir: Path) -> list[Path]:
     """Download the series'/samples' supplementary expression files verbatim --
     no parsing or reshaping. Raw-data extensions (FASTQ/BAM/CEL/...) are skipped.
+
+    A multi-sheet Excel file additionally gets split into one plain
+    <sheet_name>.tsv.gz per sheet (see _split_multisheet_excel) -- these,
+    not the ambiguous combined workbook, are what downstream primary-file
+    selection actually considers; the original .xlsx is still downloaded
+    and kept on disk (never deleted), just no longer a candidate once its
+    sheets are individually represented.
     """
     urls = geo_fetch.all_supplementary_file_urls(gse)
 
@@ -278,7 +333,12 @@ def download_rnaseq_files(gse, out_dir: Path) -> list[Path]:
             continue
         expr_dir.mkdir(parents=True, exist_ok=True)
         path = _download_file(url, expr_dir)
-        if path is not None:
+        if path is None:
+            continue
+        sheets = _split_multisheet_excel(path)
+        if sheets:
+            downloaded.extend(sheets)
+        else:
             downloaded.append(path)
     return downloaded
 
@@ -297,6 +357,19 @@ def download_rnaseq_files(gse, out_dir: Path) -> list[Path]:
 # positive for check_expression_qc below if it were treated as an
 # expression matrix.
 _QUANT_UNIT_PRIORITY = ["tpm", "fpkm", "rpkm", "cpm", "count"]
+
+# Within the same unit rank -- most often "count", since a plain raw-counts
+# file and an already-between-sample-normalized-but-still-count-shaped file
+# (quantile/median-of-ratios/DESeq2/EdgeR normalization, not gene-length
+# normalization) both just contain the generic word "count", with no tpm/
+# fpkm/rpkm/cpm keyword to tell them apart -- prefer whichever doesn't also
+# look normalized. geotool.rnaseq_finalize.compute_tpm needs genuine raw
+# counts (or CPM) to do its own correct gene-length normalization; an
+# already normalized count file fits neither of its two recognized paths
+# (not raw, not already length-normalized FPKM/RPKM/TPM), so a "TPM"
+# computed from it wouldn't be a real one. Live example: GSE243850's "Raw
+# count" vs "Normalized read count" sheets (see _split_multisheet_excel).
+_NORMALIZED_HINT_RE = re.compile(r"normali[sz]ed|quantile|median.?of.?ratios|deseq2?|edger", re.IGNORECASE)
 
 # A filename carrying its own GSM accession is inherently a per-sample
 # fragment, never a whole-cohort combined matrix, regardless of what
@@ -363,20 +436,29 @@ def _passes_basic_matrix_filters(name: str) -> bool:
     )
 
 
-def _classify_candidate(name: str) -> tuple[int, str] | None:
-    """(rank, unit) if `name` (a filename, or an archive member name -- it
-    doesn't need to exist on disk) looks like a plausible primary expression
-    matrix, honoring the same exclusions select_primary_expression_file
-    documents; None otherwise. Factored out so archive members can be
-    ranked by the exact same rules as plain downloaded files (see
-    resolve_primary_expression_matrix).
+def _classify_candidate(name: str) -> tuple[tuple[int, int], str] | None:
+    """((unit_rank, normalized_hint), unit) if `name` (a filename, or an
+    archive member name -- it doesn't need to exist on disk) looks like a
+    plausible primary expression matrix, honoring the same exclusions
+    select_primary_expression_file documents; None otherwise. Factored out
+    so archive members can be ranked by the exact same rules as plain
+    downloaded files (see resolve_primary_expression_matrix).
+
+    The rank is a (unit_rank, normalized_hint) pair, not a bare int --
+    normalized_hint (0 or 1, via _NORMALIZED_HINT_RE) only ever
+    distinguishes candidates that already tied on unit_rank, and plain
+    tuple comparison (used as-is by select_primary_expression_file's
+    `rank < best[0]`) already checks unit_rank first, falling through to
+    normalized_hint only when it's equal -- so this needs no comparison
+    logic of its own, just a richer rank shape.
     """
     if not _passes_basic_matrix_filters(name):
         return None
     lname = Path(name).name.lower()
-    for rank, unit in enumerate(_QUANT_UNIT_PRIORITY):
+    for unit_rank, unit in enumerate(_QUANT_UNIT_PRIORITY):
         if unit in lname:
-            return rank, unit
+            normalized_hint = 1 if _NORMALIZED_HINT_RE.search(lname) else 0
+            return (unit_rank, normalized_hint), unit
     return None
 
 
@@ -392,7 +474,7 @@ def select_primary_expression_file(paths: list[Path]) -> tuple[Path, str] | None
     (_NON_MATRIX_KEYWORDS) are never candidates. Doesn't look inside .zip/
     .tar archives -- see resolve_primary_expression_matrix for that.
     """
-    best: tuple[int, Path, str] | None = None
+    best: tuple[tuple[int, int], Path, str] | None = None
     for path in paths:
         classified = _classify_candidate(path.name)
         if classified is None:
