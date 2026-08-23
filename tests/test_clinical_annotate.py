@@ -75,6 +75,21 @@ def test_remap_event_column_maps_known_values_and_passes_through_unknown():
     assert list(remapped) == [1, 0, "Unknown"]
 
 
+def test_remap_event_column_maps_punctuation_only_placeholder_to_none():
+    """Regression test: GSE183795's "survival status" column ('1'/'0'/'?')
+    left '?' as a literal stray string in OS_event -- '1'/'0' matched the
+    numeric mapping, '?' didn't, and fell through to raw passthrough. A
+    punctuation-only value like '?' is GEO's own "not reported" marker, not
+    a real unmapped value worth surfacing like "Unknown" (still passed
+    through raw, see the test above) -- so it should become a real missing
+    value instead."""
+    series = pd.Series(["1", "0", "?"])
+    remapped = ca.remap_event_column(series, "1=death, 0=censored")
+    result = list(remapped)
+    assert result[:2] == [1, 0]
+    assert pd.isna(result[2])
+
+
 def test_remap_event_column_returns_raw_when_meaning_unparseable():
     series = pd.Series(["Dead", "Alive"])
     remapped = ca.remap_event_column(series, "")

@@ -200,7 +200,8 @@ def test_get_llm_annotation_backfill_keeps_numeric_column_units_column(tmp_path,
     merged = harmonize.get_llm_annotation("GSE_X", series_row, samples, series_dir=tmp_path, backfill=True)
 
     assert "llm_survival_months_days" in merged.columns
-    assert merged["llm_survival_months_days"].tolist() == pytest.approx([12.0 * 30.4375, 24.0 * 30.4375])
+    # Rounded to whole days (apply_numeric_column_units) -- 365.25, 730.5
+    assert merged["llm_survival_months_days"].tolist() == [365, 730]
 
 
 def test_get_llm_annotation_returns_none_and_does_not_raise_when_llm_call_fails(tmp_path, monkeypatch, capsys):
