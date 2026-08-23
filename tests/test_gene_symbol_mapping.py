@@ -50,6 +50,79 @@ def test_undouble_repeated_symbol_ids_non_doubled_values_pass_through():
     assert list(result) == ["ACCSL", "TSPAN6", "TNMD", "MI0000060_hsa-let-7a-1"]
 
 
+def test_unwrap_ensg_symbol_composite_ids_strips_majority_composite_shape():
+    """Real GSE131050 shape: "GSE131050_PurIST_Linehan_seq.tsv.gz"/
+    "..._Yeh_seq.tsv.gz" publish a composite "<ENSG id>;<symbol>" row id --
+    "ENSG00000239533;GOLGA2P3Y"."""
+    ids = ["ENSG00000239533;GOLGA2P3Y", "ENSG00000172288;CDY1", "ENSG00000121410;A1BG"]
+    result = gsm.unwrap_ensg_symbol_composite_ids(ids)
+    assert list(result) == ["GOLGA2P3Y", "CDY1", "A1BG"]
+
+
+@pytest.mark.parametrize("sep", [";", ":", ",", "-", "|", "#", " ", "/"])
+def test_unwrap_ensg_symbol_composite_ids_recognizes_any_punctuation_separator(sep):
+    """Genuinely generic, not an enumerated allowlist -- the fixed 11-digit
+    length of a real Ensembl gene ID pins exactly where it ends, so *any*
+    single non-alphanumeric character right after it is accepted as the
+    separator, whatever a given submitter's own pipeline happened to use
+    (";" is just the one GSE131050 uses; ":" is how this format was first
+    described)."""
+    ids = [f"ENSG00000239533{sep}GOLGA2P3Y", f"ENSG00000172288{sep}CDY1"]
+    result = gsm.unwrap_ensg_symbol_composite_ids(ids)
+    assert list(result) == ["GOLGA2P3Y", "CDY1"]
+
+
+def test_unwrap_ensg_symbol_composite_ids_leaves_minority_shape_unchanged():
+    ids = ["TSPAN6", "TNMD", "A1BG", "ENSG00000239533;GOLGA2P3Y"]
+    result = gsm.unwrap_ensg_symbol_composite_ids(ids)
+    assert list(result) == ids
+
+
+def test_unwrap_ensg_symbol_composite_ids_does_not_claim_underscore_separator():
+    """"_" already means something else here (undouble_repeated_symbol_ids's
+    own doubled-symbol shape, and deliberately-untouched embedded-ENSG
+    clone-style rows like GSE174615's "ENSG00000198695_MT-ND6") -- excluded
+    from the separator class even though it's otherwise non-alphanumeric."""
+    ids = ["ENSG00000239533_GOLGA2P3Y", "ENSG00000172288_CDY1"]
+    result = gsm.unwrap_ensg_symbol_composite_ids(ids)
+    assert list(result) == ids
+
+
+def test_unwrap_ensg_symbol_composite_ids_requires_exactly_11_digits():
+    """A real Ensembl gene ID is always ENSG + 11 digits -- a lookalike with
+    the wrong digit count is a different (or malformed) identifier, not this
+    shape, and must not be sliced at an arbitrary point regardless."""
+    ids = ["ENSG123;SYMBOL", "ENSG123456789012;SYMBOL"]  # too few / too many digits
+    result = gsm.unwrap_ensg_symbol_composite_ids(ids)
+    assert list(result) == ids
+
+
+def test_unwrap_ensg_symbol_composite_ids_does_not_mistake_version_suffix_for_separator():
+    """Regression: with the separator generalized to "any non-alphanumeric
+    character", the regex engine could backtrack the optional version-suffix
+    group (?:\\.\\d+)? away and match "." itself as the separator instead --
+    misreading an ordinary versioned id like "ENSG00000000003.18" as
+    id="ENSG00000000003" + symbol="18". "." must stay excluded from the
+    separator class specifically because it already means "version suffix"
+    right at that position."""
+    ids = ["ENSG00000000003.18", "ENSG00000000005.7"]
+    result = gsm.unwrap_ensg_symbol_composite_ids(ids)
+    assert list(result) == ids
+
+
+def test_unwrap_ensg_symbol_composite_ids_does_not_mangle_multifield_composite():
+    """Safety net for the generic separator: a hypothetical ENSG-leading,
+    many-field pipe-delimited header (the shape canonical_id's own Kallisto/
+    Salmon handling is built for, just starting with ENSG instead of ENST)
+    must not have every remaining field swallowed as one bogus "symbol" --
+    the captured half is required to contain no further ";:,|"-shaped
+    punctuation of its own, so this simply fails to match and passes
+    through unchanged instead."""
+    ids = ["ENSG00000223972.5|OTTHUMG00000000961.2|OTTHUMT00000362751.1|DDX11L1-202|DDX11L1|1657|processed_transcript"]
+    result = gsm.unwrap_ensg_symbol_composite_ids(ids)
+    assert list(result) == ids
+
+
 def make_reference(
     gene_to_symbol=None, transcript_to_symbol=None, gene_length=None,
 ) -> gsm.GencodeReference:
@@ -200,6 +273,20 @@ def test_locate_identifier_axis_recognizes_doubled_rsem_symbols():
     as unrecognizable and the cohort was skipped outright."""
     matrix = pd.DataFrame(
         {"GSM1": [1.0, 2.0]}, index=["TSPAN6_TSPAN6", "TNMD_TNMD"],
+    )
+    ids, id_type = gsm.locate_identifier_axis(matrix, _REF)
+    assert id_type == "symbol"
+    assert list(ids) == ["TSPAN6", "TNMD"]
+
+
+def test_locate_identifier_axis_recognizes_ensg_symbol_composite_ids():
+    """Real GSE131050 shape: without unwrapping, "ENSG00000239533;GOLGA2P3Y"
+    matches neither ^ENSG\\d+$ (trailing ";SYMBOL" text) nor any literal
+    known symbol, so the whole axis used to read as unrecognizable and the
+    cohort was skipped outright ("no recognizable transcript/gene/symbol
+    identifier found")."""
+    matrix = pd.DataFrame(
+        {"GSM1": [1.0, 2.0]}, index=["ENSG00000000003;TSPAN6", "ENSG00000000005;TNMD"],
     )
     ids, id_type = gsm.locate_identifier_axis(matrix, _REF)
     assert id_type == "symbol"

@@ -131,6 +131,59 @@ def undouble_repeated_symbol_ids(values) -> pd.Series:
     return series
 
 
+# Some quantification pipelines publish a composite "<ENSG id><sep><HUGO
+# symbol>" row identifier instead of a plain one -- live example, GSE131050's
+# "GSE131050_PurIST_Linehan_seq.tsv.gz"/"..._Yeh_seq.tsv.gz"
+# ("ENSG00000239533;GOLGA2P3Y"). Neither half classifies cleanly on its own:
+# the whole string doesn't match ^ENSG\d+$ (trailing "<sep>SYMBOL" text), and
+# it's obviously not a literal known symbol either -- detect_identifier_type
+# reads it as "unknown" and the whole cohort gets skipped ("no recognizable
+# transcript/gene/symbol identifier found") unless unwrapped first. The
+# embedded symbol is used directly (not the ENSG half + a GENCODE lookup)
+# since it's already exactly what the submitter's own pipeline called it --
+# no version-mismatch risk from a different GENCODE release doing the
+# ENSG->symbol translation instead.
+#
+# Ensembl gene IDs are a fixed-length "ENSG" + 11 digits by convention, so
+# rather than enumerate specific separator characters (";" is just the one
+# GSE131050 happens to use), the boundary is pinned by that fixed length and
+# *any* single non-alphanumeric character right after it is accepted as the
+# separator -- generic to whatever punctuation the next submitter's pipeline
+# used, with no allowlist to keep extending. Two characters are excluded
+# from the separator itself, both because they already mean something else
+# right at that exact position: "." is the optional version suffix
+# (?:\.\d+)? right before it -- without this exclusion, a plain, non-
+# composite "ENSG00000000003.18" wrongly parsed as id="ENSG00000000003" +
+# separator="." + "symbol"="18" (the regex engine backtracking the optional
+# version group away in favor of matching "." as the separator instead);
+# "_" is undouble_repeated_symbol_ids's own doubled-symbol shape, and real
+# submitter values this codebase already deliberately leaves untouched,
+# e.g. GSE174615's "ENSG00000198695_MT-ND6" embedded-ENSG clone-style rows.
+# The captured symbol half is separately required to contain no further
+# ";:,|"-shaped punctuation of its own -- not to privilege those specific
+# characters, but so a multi-field composite this isn't built to parse (e.g.
+# a hypothetical ENSG-leading, many-pipe-delimited-field Kallisto-style
+# header) fails the trailing $ anchor and safely doesn't match at all,
+# rather than swallowing every remaining field as one bogus "symbol".
+_ENSG_SYMBOL_COMPOSITE_RE = re.compile(r"^ENSG\d{11}(?:\.\d+)?[^A-Za-z0-9_.]([^;:,|]+)$")
+
+
+def unwrap_ensg_symbol_composite_ids(values) -> pd.Series:
+    """Strip a "<ENSG id><sep><symbol>" composite (see
+    _ENSG_SYMBOL_COMPOSITE_RE) down to just the symbol half, positionally
+    aligned. Only unwraps when a majority (>50%) of `values` actually match
+    that shape -- same majority-vote guard undouble_repeated_symbol_ids
+    uses, so a column with a handful of coincidentally separator-containing
+    values isn't corrupted. Values that don't match pass through unchanged
+    either way.
+    """
+    series = pd.Series([str(v) for v in values])
+    extracted = series.str.extract(_ENSG_SYMBOL_COMPOSITE_RE, expand=False)
+    if extracted.notna().mean() > 0.5:
+        return extracted.fillna(series)
+    return series
+
+
 class GencodeReference(NamedTuple):
     version: str
     transcript_to_symbol: dict[str, str]  # stripped ENST -> symbol (clean/filtered set only)
@@ -223,7 +276,7 @@ def locate_identifier_axis(matrix: pd.DataFrame, reference: GencodeReference) ->
     candidates: list[tuple[pd.Series, IdentifierType]] = []
 
     if not isinstance(matrix.index, pd.RangeIndex):
-        ids = undouble_repeated_symbol_ids(matrix.index)
+        ids = undouble_repeated_symbol_ids(unwrap_ensg_symbol_composite_ids(matrix.index))
         id_type = detect_identifier_type(ids, reference)
         if id_type != "unknown":
             candidates.append((ids, id_type))
@@ -231,7 +284,7 @@ def locate_identifier_axis(matrix: pd.DataFrame, reference: GencodeReference) ->
     for col in matrix.columns:
         if pd.api.types.is_numeric_dtype(matrix[col]):
             continue
-        ids = undouble_repeated_symbol_ids(matrix[col])
+        ids = undouble_repeated_symbol_ids(unwrap_ensg_symbol_composite_ids(matrix[col]))
         id_type = detect_identifier_type(ids, reference)
         if id_type != "unknown":
             candidates.append((ids, id_type))
