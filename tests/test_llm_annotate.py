@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from geotool import llm_annotate
-from geotool.llm_schema import SampleGroupAnnotation, SeriesLevelAnnotation, SeriesLLMResult
+from geotool.llm_schema import NumericColumnUnit, SampleGroupAnnotation, SeriesLevelAnnotation, SeriesLLMResult
 
 
 def make_samples():
@@ -130,16 +130,36 @@ def test_low_cardinality_id_named_column_is_not_excluded():
 
 
 def test_characteristic_columns_excludes_high_cardinality_categorical_column():
-    """Cardinality-only exclusion (no numeric or name-pattern requirement)
-    also catches a genuinely diverse *categorical* column -- live example:
-    GSE253260's "firsttreatment" (64 distinct free-text regimens, neither
-    numeric nor identifier-named), which combined multiplicatively with
-    several other modest-cardinality clinical columns to still leave 308
-    fingerprint groups even after the numeric/identifier-only exclusions."""
+    """Cardinality exclusion (no numeric or name-pattern requirement) also
+    catches a genuinely diverse *categorical* column once its distinct
+    values get close enough to unique-per-sample -- live example:
+    GSE253260's "firsttreatment" (64 distinct free-text regimens / 308
+    samples, ~21%, neither numeric nor identifier-named), which combined
+    multiplicatively with several other modest-cardinality clinical columns
+    to still leave 308 fingerprint groups even after the numeric/identifier-
+    only exclusions."""
     samples = make_samples_with_id_column()
-    samples["treatment"] = [f"REGIMEN_{i % 20}" for i in range(len(samples))]  # 20 distinct free-text values
+    samples["treatment"] = [f"REGIMEN_{i % 45}" for i in range(len(samples))]  # 45/204 = 22%, above the fraction cutoff
     cols = llm_annotate.characteristic_columns(samples)
-    assert cols == ["compartment"]  # both patient id and treatment excluded on cardinality alone
+    assert cols == ["compartment"]  # both patient id and treatment excluded
+
+
+def test_characteristic_columns_keeps_rich_but_repeated_categorical_column():
+    """A column with more than _MAX_CATEGORICAL_UNIQUE_VALUES distinct values
+    is NOT excluded just for that, when each value still repeats often
+    enough that it reads as a real (if unusually rich) category rather than
+    an identifier -- live example: GSE71729's source_name_ch2 (21 distinct
+    anatomical/metastasis sites + "CellLine", each repeated many times
+    across 357 samples, 21/357 = 6%). Before this, excluding it on raw
+    count alone dropped the only column identifying the cohort's cell-line
+    samples, which then fingerprinted into an uninformative catch-all group
+    and got classified tissue_class=unknown/sample_source=unknown."""
+    samples = make_samples_with_id_column(n=204, n_patients=129)
+    sites = [f"SITE_{i}" for i in range(20)] + ["CellLine"]  # 21 distinct, each repeated ~10x over 204 rows
+    samples["tissue_site"] = [sites[i % len(sites)] for i in range(len(samples))]
+    cols = llm_annotate.characteristic_columns(samples)
+    assert "tissue_site" in cols
+    assert "patient id" not in cols  # the near-unique-per-sample identifier is still excluded
 
 
 def test_survival_like_numeric_columns_matches_survival_names_only():
@@ -151,8 +171,6 @@ def test_survival_like_numeric_columns_matches_survival_names_only():
 
 
 def test_apply_numeric_column_units_converts_to_days_and_skips_unknown():
-    from geotool.llm_schema import NumericColumnUnit
-
     samples = pd.DataFrame({
         "gsm_id": ["GSM1", "GSM2", "GSM3"],
         "os_days": [10, 20, 30],
@@ -170,10 +188,12 @@ def test_apply_numeric_column_units_converts_to_days_and_skips_unknown():
     out = llm_annotate.apply_numeric_column_units(samples, units)
 
     # llm_ prefix: harmonize.get_llm_annotation only keeps llm_-prefixed
-    # columns when joining back onto a cohort's annotation.tsv
-    assert out["llm_os_days_days"].tolist() == [10.0, 20.0, 30.0]
-    assert out["llm_os_months_days"].tolist() == pytest.approx([30.4375, 60.875, 91.3125])
-    assert out["llm_os_years_days"].tolist() == pytest.approx([365.25, 730.5, 1095.75])
+    # columns when joining back onto a cohort's annotation.tsv. Rounded to
+    # whole days -- a fractional day count implies precision the underlying
+    # months/years value never had.
+    assert out["llm_os_days_days"].tolist() == [10, 20, 30]
+    assert out["llm_os_months_days"].tolist() == [30, 61, 91]  # 30.4375, 60.875, 91.3125 rounded
+    assert out["llm_os_years_days"].tolist() == [365, 730, 1096]  # 365.25, 730.5, 1095.75 rounded
     assert "llm_unclear_time_days" not in out.columns  # "unknown" unit -- left unconverted
     assert out["unclear_time"].tolist() == [5, 6, 7]  # raw column untouched either way
 
@@ -310,8 +330,6 @@ def test_build_prompt_includes_excluded_numeric_columns_section():
 
 
 def test_annotate_and_cache_estimates_and_applies_survival_column_units(monkeypatch, tmp_path):
-    from geotool.llm_schema import NumericColumnUnit
-
     samples = make_samples_with_survival_column()
     fp_ids, groups = llm_annotate.group_fingerprints(samples)
     assert len(groups) == 3  # small, thanks to the fingerprint fix -- the real point of this test
@@ -344,5 +362,18 @@ def test_annotate_and_cache_estimates_and_applies_survival_column_units(monkeypa
     assert len(fake_client.messages.calls) == 1
     assert series_level.numeric_column_units[0].unit == "months"
     assert "llm_survival_months_days" in merged.columns
-    expected = (samples["survival months"] * 30.4375).tolist()
-    assert merged["llm_survival_months_days"].tolist() == pytest.approx(expected)
+    # Rounded to whole days -- see apply_numeric_column_units's own docstring:
+    # a fractional day count from a months->days conversion is noise, not
+    # real precision.
+    expected = (samples["survival months"] * 30.4375).round().astype(int).tolist()
+    assert merged["llm_survival_months_days"].astype(int).tolist() == expected
+
+
+def test_apply_numeric_column_units_rounds_to_integer_days_and_keeps_missing_as_na():
+    """Regression test: GSE183795's llm_survival_months_days (56.02185641
+    months * 30.4375 = 1705.165...) surfaced fractional days, implying
+    sub-day precision the underlying data never had."""
+    samples = pd.DataFrame({"gsm_id": ["GSM1", "GSM2", "GSM3"], "survival months": [1.0, 2.5, None]})
+    units = [NumericColumnUnit(column_name="survival months", unit="months")]
+    out = llm_annotate.apply_numeric_column_units(samples, units)
+    assert out["llm_survival_months_days"].tolist() == [30, 76, pd.NA]  # 1*30.4375 -> 30, 2.5*30.4375=76.09 -> 76

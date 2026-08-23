@@ -178,6 +178,15 @@ def normalize_recist(value) -> str | None:
 _EVENT_LABEL_RE = re.compile(r"event|death|dead|deceased|progress|relapse|recur", re.IGNORECASE)
 _CENSORED_LABEL_RE = re.compile(r"censor|alive|surviv|no event|free", re.IGNORECASE)
 
+# GEO's own placeholder for "not reported" on this one sample -- pure
+# punctuation, no letters or digits (e.g. "?", "-", "--", ".", "N/A" does
+# NOT match, since it has letters and might be worth surfacing raw like any
+# other genuinely unrecognized value). Live example: GSE183795's "survival
+# status" column ('1'/'0'/'?'), where '?' passed through remap_event_column
+# unmapped and landed in OS_event as a literal stray "?" string mixed into
+# an otherwise 0/1-coded column, rather than the missing value it actually is.
+_PUNCTUATION_ONLY_RE = re.compile(r"^[^0-9a-zA-Z]+$")
+
 
 def parse_event_mapping(meaning: str) -> dict[str, int]:
     """Parse free text like 'X=event, Y=censored' or '1=death, 0=censored'
@@ -222,6 +231,8 @@ def remap_event_column(series: pd.Series, meaning: str) -> pd.Series:
         for key in keys_longest_first:
             if key in text:
                 return mapping[key]
+        if _PUNCTUATION_ONLY_RE.match(text):
+            return None  # GEO's own "not reported" marker, not a real unmapped value
         return value  # unmapped values pass through raw
 
     return series.map(_map)

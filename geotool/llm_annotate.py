@@ -59,18 +59,34 @@ use "unknown" rather than guessing when genuinely ambiguous."""
 # numeric measurement (survival time, age), a per-patient identifier
 # ("patient id", "sample id" -- a string, not numeric), or a real but
 # unusually diverse categorical field (many distinct free-text treatment
-# regimens). Cardinality alone, independent of the column's type or name,
-# catches all three: three live examples that each crashed a harmonize run
-# by overflowing _call_model's max_tokens (see harmonize.get_llm_annotation's
-# own try/except for the other half of that fix) --
-#   - GSE183795's "survival months" (128 distinct values / 244 samples)
-#   - GSE93326's "patient id" (129 distinct values / 204 samples -- removing
+# regimens). A raw count alone can't tell those apart from a column that's
+# still genuinely categorical (repeated values, just a lot of them) -- live
+# example: GSE71729's source_name_ch2 (21 distinct anatomical/metastasis
+# sites + "CellLine" across 357 samples, each value repeated many times).
+# Excluding it dropped the *only* signal identifying that cohort's 17
+# cell-line samples, which then fingerprinted into two catch-all groups
+# with nothing but constant/blank characteristics and got classified
+# tissue_class=unknown/sample_source=unknown -- not wrong given what the
+# LLM was shown, just never shown the column that mattered.
+#
+# So a column is only treated as high-cardinality when it's *both* over the
+# raw count AND close to unique-per-sample (nunique/n_samples) -- the actual
+# property that distinguishes an identifier/continuous measurement (values
+# essentially never repeat) from a rich-but-real categorical field (values
+# repeat constantly, there are just more distinct ones than a small trait
+# like sex/grade would have). Three live examples that each crashed a
+# harmonize run by overflowing _call_model's max_tokens before this
+# existed (see harmonize.get_llm_annotation's own try/except for the other
+# half of that fix), all comfortably above the fraction cutoff below --
+#   - GSE183795's "survival months" (128 distinct / 244 samples, 52%)
+#   - GSE93326's "patient id" (129 distinct / 204 samples, 63% -- removing
 #     it collapses 204 fingerprint groups down to 3)
-#   - GSE253260's "sample id"/"normpatient id" (397 distinct values each,
-#     one per sample) and, even after those, still-large "firsttreatment"
-#     (64 distinct regimens combining multiplicatively with several other
-#     modest-cardinality clinical columns -- 308 -> 64 groups once excluded)
+#   - GSE253260's "sample id"/"normpatient id" (397 distinct / 397 samples,
+#     100%) and, even after those, still-large "firsttreatment" (64 distinct
+#     regimens / 308 samples, 21%)
+# -- versus GSE71729's source_name_ch2 at 21/357 = 6%, safely under it.
 _MAX_CATEGORICAL_UNIQUE_VALUES = 12
+_MAX_CATEGORICAL_UNIQUE_FRACTION = 0.15
 _MIN_NUMERIC_FRACTION = 0.9
 
 
@@ -78,7 +94,10 @@ def _is_high_cardinality(series: pd.Series) -> bool:
     non_null = series.dropna()
     if non_null.empty:
         return False
-    return non_null.nunique() > _MAX_CATEGORICAL_UNIQUE_VALUES
+    n_unique = non_null.nunique()
+    if n_unique <= _MAX_CATEGORICAL_UNIQUE_VALUES:
+        return False
+    return (n_unique / len(non_null)) > _MAX_CATEGORICAL_UNIQUE_FRACTION
 
 
 def characteristic_columns(samples: pd.DataFrame) -> list[str]:
@@ -301,6 +320,13 @@ def apply_numeric_column_units(samples: pd.DataFrame, units: list) -> pd.DataFra
     harmonize.get_llm_annotation's non-backfill path only ever keeps
     columns matching that prefix when joining back onto a cohort's
     annotation.tsv -- anything else here would be silently dropped there.
+
+    Rounded to whole days (nullable Int64, so a still-missing value stays
+    missing rather than becoming 0/NaN-as-float) -- day-level granularity is
+    already finer than any submitter's own follow-up precision, so the
+    fractional remainder from a months/years->days conversion (e.g.
+    56.02185641 months * 30.4375 = 1705.165...) is noise, not real
+    precision, and a non-integer day count reads as if it were.
     """
     out = samples.copy()
     for unit_entry in units:
@@ -312,7 +338,7 @@ def apply_numeric_column_units(samples: pd.DataFrame, units: list) -> pd.DataFra
         needs_fallback = numeric.isna() & out[col].notna()
         if needs_fallback.any():
             numeric.loc[needs_fallback] = out[col][needs_fallback].map(_extract_first_number)
-        out[f"llm_{_sanitize_column_name(col)}_days"] = numeric * factor
+        out[f"llm_{_sanitize_column_name(col)}_days"] = (numeric * factor).round().astype("Int64")
     return out
 
 
