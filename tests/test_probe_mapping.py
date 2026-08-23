@@ -397,6 +397,34 @@ def test_check_expression_qc_empty_matrix():
     assert probe_mapping.check_expression_qc(pd.DataFrame()) == []
 
 
+def test_check_expression_qc_flags_no_numeric_columns_despite_multiple_columns():
+    """Live example: GSE243850's "Raw counts and normalized read count" file
+    -- pandas read a mostly-blank title row as the header, leaving the real
+    header ["ID", "Gene symbol", "YS_2542338", ...] as the first data row,
+    which poisons every sample column's dtype to object. Zero numeric
+    columns despite 127 real columns is the single worst sign possible for
+    an expression matrix, not "nothing to check" -- must not silently
+    return []."""
+    matrix = pd.DataFrame({
+        "Unnamed: 0": ["ID", "1", "2"],
+        "Unnamed: 1": ["Gene symbol", "DDX11L1", "WASH7P"],
+        "Unnamed: 2": ["YS_2542338", "0", "0"],
+    })
+    notes = probe_mapping.check_expression_qc(matrix)
+    assert len(notes) == 1
+    assert "no numeric column" in notes[0]
+    assert "3 column(s)" in notes[0]
+
+
+def test_check_expression_qc_single_identifier_only_column_still_returns_clean():
+    """Distinguishes the new check above from a matrix that's legitimately
+    just an identifier column with no samples at all -- shape[1] <= 1 is not
+    the multi-row-header signature (many columns, none numeric), so this
+    keeps returning [] rather than a false positive."""
+    matrix = pd.DataFrame({"gene_symbol": ["A1BG", "TP53"]})
+    assert probe_mapping.check_expression_qc(matrix) == []
+
+
 def test_check_gene_count_flags_real_gse197728_shape():
     """GSE197728's actual supplementary table: only genes with FPKM > 10
     were reported, 7833 rows."""

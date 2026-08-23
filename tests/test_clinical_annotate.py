@@ -365,3 +365,11 @@ def test_classify_expression_status_two_channel_signal_unresolved_joins_with_oth
     notes = ["expression.tsv.gz: linear-scale, not log2-transformed (max value 99.0)"]
     status = ca.classify_expression_status(notes, has_matrix=True, two_channel_signal_unresolved=True)
     assert status == f"{ca.EXPRESSION_STATUS_TWO_CHANNEL_SIGNAL_UNRESOLVED};{ca.EXPRESSION_STATUS_NOT_LOG2_TRANSFORMED}"
+
+
+def test_classify_expression_status_no_numeric_data():
+    """Live example: GSE243850's misparsed multi-row-header file -- must not
+    silently come out "ok" just because none of check_expression_qc's other
+    value-based checks had anything numeric to look at."""
+    notes = ["GSE243850_Raw_counts_and_normalized_read_count.tsv.gz: no numeric column(s) found among 127 column(s) -- likely a misparsed/shifted header row (e.g. a multi-row header), not a genuine identifier-only matrix"]
+    assert ca.classify_expression_status(notes, has_matrix=True) == ca.EXPRESSION_STATUS_NO_NUMERIC_DATA

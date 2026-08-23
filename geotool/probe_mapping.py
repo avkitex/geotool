@@ -432,12 +432,31 @@ def check_expression_qc(matrix: pd.DataFrame) -> list[str]:
        _MIN_ROWS_FOR_ORIENTATION_CHECK), i.e. probably samples-as-rows /
        features-as-columns instead of the expected genes-as-rows /
        samples-as-columns.
+    4. No numeric column(s) at all despite having more than one column --
+       for a real expression matrix this is the single worst sign possible,
+       not "nothing to check": it almost always means the file's real
+       header row got misparsed as data (a multi-row header, live example:
+       GSE243850's "Raw counts and normalized read count" file -- pandas
+       read a mostly-blank title row as the header, leaving the real header
+       ["ID", "Gene symbol", "YS_2542338", ...] as the first data row, which
+       poisons every sample column's dtype to object). check_rnaseq_expression
+       _qc calls this directly on the loaded matrix, never through
+       normalize_expression_matrix (whose own bail-out note for exactly this
+       shape only ever reaches the microarray path) -- without this check,
+       such a cohort's expression_status silently comes out "ok" even though
+       geotool.rnaseq_finalize's own parser later fails outright on the same
+       file ("list index out of range").
 
     Returns human-readable notes, empty if nothing stood out.
     """
     numeric = matrix.select_dtypes(include="number")
     if numeric.empty:
-        return []
+        if matrix.empty or matrix.shape[1] <= 1:
+            return []
+        return [
+            f"no numeric column(s) found among {matrix.shape[1]} column(s) -- likely a misparsed/shifted "
+            "header row (e.g. a multi-row header), not a genuine identifier-only matrix"
+        ]
 
     notes = []
     max_value = numeric.max(numeric_only=True).max()

@@ -37,6 +37,7 @@ EXPRESSION_STATUS_NEGATIVE_VALUES = "negative_values"
 EXPRESSION_STATUS_LOOKS_TRANSPOSED = "looks_transposed"
 EXPRESSION_STATUS_LOW_GENE_COUNT = "low_gene_count"
 EXPRESSION_STATUS_TWO_CHANNEL_SIGNAL_UNRESOLVED = "two_channel_signal_unresolved"
+EXPRESSION_STATUS_NO_NUMERIC_DATA = "no_numeric_data"
 
 
 def classify_expression_status(qc_notes: list[str], has_matrix: bool, two_channel_signal_unresolved: bool = False) -> str:
@@ -75,6 +76,8 @@ def classify_expression_status(qc_notes: list[str], has_matrix: bool, two_channe
     tags = []
     if two_channel_signal_unresolved:
         tags.append(EXPRESSION_STATUS_TWO_CHANNEL_SIGNAL_UNRESOLVED)
+    if any("no numeric column" in note for note in qc_notes):
+        tags.append(EXPRESSION_STATUS_NO_NUMERIC_DATA)
     if any("not log2-transformed" in note for note in qc_notes):
         tags.append(EXPRESSION_STATUS_NOT_LOG2_TRANSFORMED)
     if any("negative value" in note for note in qc_notes):
