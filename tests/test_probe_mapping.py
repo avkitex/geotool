@@ -397,6 +397,34 @@ def test_check_expression_qc_empty_matrix():
     assert probe_mapping.check_expression_qc(pd.DataFrame()) == []
 
 
+def test_check_expression_qc_flags_no_numeric_columns_despite_multiple_columns():
+    """Live example: GSE243850's "Raw counts and normalized read count" file
+    -- pandas read a mostly-blank title row as the header, leaving the real
+    header ["ID", "Gene symbol", "YS_2542338", ...] as the first data row,
+    which poisons every sample column's dtype to object. Zero numeric
+    columns despite 127 real columns is the single worst sign possible for
+    an expression matrix, not "nothing to check" -- must not silently
+    return []."""
+    matrix = pd.DataFrame({
+        "Unnamed: 0": ["ID", "1", "2"],
+        "Unnamed: 1": ["Gene symbol", "DDX11L1", "WASH7P"],
+        "Unnamed: 2": ["YS_2542338", "0", "0"],
+    })
+    notes = probe_mapping.check_expression_qc(matrix)
+    assert len(notes) == 1
+    assert "no numeric column" in notes[0]
+    assert "3 column(s)" in notes[0]
+
+
+def test_check_expression_qc_single_identifier_only_column_still_returns_clean():
+    """Distinguishes the new check above from a matrix that's legitimately
+    just an identifier column with no samples at all -- shape[1] <= 1 is not
+    the multi-row-header signature (many columns, none numeric), so this
+    keeps returning [] rather than a false positive."""
+    matrix = pd.DataFrame({"gene_symbol": ["A1BG", "TP53"]})
+    assert probe_mapping.check_expression_qc(matrix) == []
+
+
 def test_check_gene_count_flags_real_gse197728_shape():
     """GSE197728's actual supplementary table: only genes with FPKM > 10
     were reported, 7833 rows."""
@@ -534,15 +562,38 @@ def test_normalize_expression_matrix_drops_bare_row_number_column():
     assert len(notes) == 1 and "#" in notes[0]
 
 
-def test_normalize_expression_matrix_refuses_to_gut_a_badly_parsed_file():
-    """Real GSE243850 shape: a two-row-header file ("Raw counts and
-    normalized read count") where pandas' single-row header parse leaves
-    almost every column unrecognized. Dropping "everything unrecognized"
-    here would gut the file down to 1 near-empty column instead of
-    correctly refusing to guess."""
+def test_normalize_expression_matrix_recovers_header_shifted_by_a_title_row():
+    """Real GSE243850 shape: "Raw counts and normalized read count" file's
+    literal first line is a spurious title/section-label row, blank except
+    for one "Raw count" label -- pandas reads it as the header (almost
+    every column landing as "Unnamed: N"), leaving the real header (["ID",
+    "Gene symbol", sample ids...]) sitting as the first *data* row.
+    normalize_expression_matrix must recognize and correct this shift
+    rather than either guessing at the (unrecognizable) "Unnamed: N" names
+    or gutting the file down to nothing."""
+    columns = ["Unnamed: 0", "Unnamed: 1", "Raw count", "Unnamed: 3"]
+    header_row = ["ID", "Gene symbol", "YS_2542338", "YS_3774842"]
+    data_rows = [["1", "DDX11L1", 0, 1], ["2", "WASH7P", 0, 0]]
+    matrix = pd.DataFrame([header_row] + data_rows, columns=columns)
+
+    fixed, notes = probe_mapping.normalize_expression_matrix(matrix)
+
+    assert any("title/section-label row" in n for n in notes)
+    assert list(fixed.columns) == ["Gene symbol", "YS_2542338", "YS_3774842"]  # "ID" dropped as redundant metadata
+    assert list(fixed["Gene symbol"]) == ["DDX11L1", "WASH7P"]
+    assert fixed["YS_2542338"].tolist() == [0, 0]
+    assert fixed["YS_3774842"].tolist() == [1, 0]
+
+
+def test_normalize_expression_matrix_refuses_to_gut_a_badly_parsed_file_with_no_recognizable_header_row():
+    """Distinguishes the fixup above from a genuinely unrecoverable case:
+    here the row below the blank header doesn't look like a real header
+    either (every value the identical placeholder "x", so it can't even be
+    a set of unique column names) -- must skip the shift and let the
+    ordinary extra-columns bail-out refuse safely, same as before this
+    fixup existed, rather than crash on duplicate column labels or force a
+    bad "fix"."""
     columns = ["Unnamed: 0", "Unnamed: 1", "Raw count"] + [f"Unnamed: {i}" for i in range(3, 30)]
-    # object/string-typed, like the real file's mis-parsed header row landing
-    # as data (mixed with numeric rows below it, so pandas infers dtype=object)
     matrix = pd.DataFrame([["x"] * len(columns), [0] * len(columns)], columns=columns)
     fixed, notes = probe_mapping.normalize_expression_matrix(matrix)
     assert len(notes) == 1 and "left unchanged" in notes[0]
