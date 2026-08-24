@@ -303,6 +303,126 @@ def test_finalize_cohort_multi_file_skipped(tmp_path):
     assert "multi-file" in row["reason"]
 
 
+def _write_multi_file_qc(cohort_dir, candidate_paths):
+    cohort_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "primary_expression_file": None, "primary_expression_unit": None,
+        "multi_file_candidates": [str(p) for p in candidate_paths],
+    }
+    (cohort_dir / "expression_qc.json").write_text(json.dumps(payload))
+
+
+def test_finalize_cohort_multi_file_candidates_finalized_separately(tmp_path):
+    """No single combined matrix (GSE131050-shaped: two disjoint-sample
+    files) -- each candidate finalizes independently into its own indexed
+    expression_final_<n>.tsv.gz rather than being merged or skipped."""
+    df1 = pd.DataFrame({"a1": [10.5, 20.0], "a2": [15.5, 25.0]}, index=["TSPAN6", "TNMD"])
+    df1.index.name = "gene_id"
+    path1 = _write_matrix(tmp_path, "cohort_a.tsv.gz", df1)
+
+    df2 = pd.DataFrame({"b1": [30.5, 40.0], "b2": [35.5, 45.0], "b3": [50.5, 5.0]}, index=["TSPAN6", "TNMD"])
+    df2.index.name = "gene_id"
+    path2 = _write_matrix(tmp_path, "cohort_b.tsv.gz", df2)
+
+    _write_multi_file_qc(tmp_path, [path1, path2])
+
+    row = finalize.finalize_cohort(tmp_path, _REF, _CLEAN_SYMBOLS)
+    assert row["status"] == "processed"
+    assert row["multi_file"] is True
+    assert row["n_samples"] == 5
+
+    out1 = tmp_path / "expression_final_1.tsv.gz"
+    out2 = tmp_path / "expression_final_2.tsv.gz"
+    assert out1.exists() and out2.exists()
+    assert str(out1) in row["out_file"] and str(out2) in row["out_file"]
+
+    result1 = pd.read_csv(out1, sep="\t", index_col=0)
+    result2 = pd.read_csv(out2, sep="\t", index_col=0)
+    assert list(result1.columns) == ["a1", "a2"]
+    assert list(result2.columns) == ["b1", "b2", "b3"]
+
+
+def test_finalize_cohort_multi_file_partial_failure_still_processed(tmp_path):
+    """One candidate finalizes, the other has unrecoverable row identifiers
+    -- the cohort is still "processed" from the file(s) that did work, with
+    the failure recorded in reason rather than blocking the whole cohort."""
+    good_df = pd.DataFrame({"a1": [10.5, 20.0]}, index=["TSPAN6", "TNMD"])
+    good_df.index.name = "gene_id"
+    good_path = _write_matrix(tmp_path, "good.tsv.gz", good_df)
+
+    bad_df = pd.DataFrame({"b1": [10.5, 20.0]}, index=["XLOC_1", "XLOC_2"])
+    bad_df.index.name = "gene_id"
+    bad_path = _write_matrix(tmp_path, "bad.tsv.gz", bad_df)
+
+    _write_multi_file_qc(tmp_path, [good_path, bad_path])
+
+    row = finalize.finalize_cohort(tmp_path, _REF, _CLEAN_SYMBOLS)
+    assert row["status"] == "processed"
+    assert "1/2" in row["reason"]
+    assert "gene names unrecoverable" in row["reason"]
+    assert (tmp_path / "expression_final_1.tsv.gz").exists()
+    assert not (tmp_path / "expression_final_2.tsv.gz").exists()
+
+
+def test_finalize_cohort_multi_file_all_candidates_fail_skipped(tmp_path):
+    bad_df = pd.DataFrame({"b1": [10.0, 20.0]}, index=["XLOC_1", "XLOC_2"])
+    bad_df.index.name = "gene_id"
+    bad_path = _write_matrix(tmp_path, "bad.tsv.gz", bad_df)
+
+    _write_multi_file_qc(tmp_path, [bad_path])
+
+    row = finalize.finalize_cohort(tmp_path, _REF, _CLEAN_SYMBOLS)
+    assert row["status"] == "skipped"
+    assert "none of its candidate files could be finalized" in row["reason"]
+
+
+def test_finalize_cohort_multi_file_writes_sample_id_map_union(tmp_path):
+    pd.DataFrame({
+        "gsm_id": ["GSM1", "GSM2", "GSM3"], "title": ["a1", "a2", "b1"],
+    }).to_csv(tmp_path / "annotation.tsv", sep="\t", index=False)
+
+    df1 = pd.DataFrame({"a1": [10.5, 20.0], "a2": [15.5, 25.0]}, index=["TSPAN6", "TNMD"])
+    df1.index.name = "gene_id"
+    path1 = _write_matrix(tmp_path, "cohort_a.tsv.gz", df1)
+
+    df2 = pd.DataFrame({"b1": [30.5, 40.0]}, index=["TSPAN6", "TNMD"])
+    df2.index.name = "gene_id"
+    path2 = _write_matrix(tmp_path, "cohort_b.tsv.gz", df2)
+
+    _write_multi_file_qc(tmp_path, [path1, path2])
+
+    row = finalize.finalize_cohort(tmp_path, _REF, _CLEAN_SYMBOLS)
+    assert row["status"] == "processed"
+    assert row["n_samples_in_id_map"] == 3
+    assert row["n_samples_matched_to_gsm"] == 3
+
+    id_map = pd.read_csv(tmp_path / "sample_id_map.tsv", sep="\t")
+    assert set(id_map["expression_id"]) == {"a1", "a2", "b1"}
+
+
+def test_finalize_cohort_multi_file_writes_sample_id_map_even_when_that_file_fails(tmp_path):
+    """Same "diagnostic info regardless of downstream success" property the
+    single-file case has: a candidate whose finalize ultimately fails still
+    contributes its raw sample columns to sample_id_map.tsv, since it did
+    load successfully -- only a file that can't even be read/parsed is
+    excluded."""
+    pd.DataFrame({
+        "gsm_id": ["GSM1"], "title": ["b1"],
+    }).to_csv(tmp_path / "annotation.tsv", sep="\t", index=False)
+
+    bad_df = pd.DataFrame({"b1": [10.0, 20.0]}, index=["XLOC_1", "XLOC_2"])
+    bad_df.index.name = "gene_id"
+    bad_path = _write_matrix(tmp_path, "bad.tsv.gz", bad_df)
+
+    _write_multi_file_qc(tmp_path, [bad_path])
+
+    row = finalize.finalize_cohort(tmp_path, _REF, _CLEAN_SYMBOLS)
+    assert row["status"] == "skipped"
+    assert (tmp_path / "sample_id_map.tsv").exists()
+    id_map = pd.read_csv(tmp_path / "sample_id_map.tsv", sep="\t")
+    assert list(id_map["expression_id"]) == ["b1"]
+
+
 def test_finalize_cohort_unrecoverable_ids_failed(tmp_path):
     df = pd.DataFrame({"s1": [10.0, 20.0], "s2": [15.0, 25.0]}, index=["XLOC_1", "XLOC_2"])
     df.index.name = "gene_id"

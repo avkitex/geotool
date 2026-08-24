@@ -1297,6 +1297,64 @@ def test_download_cohort_reports_rnaseq_expression_qc_and_reuses_from_cache(monk
     assert cached["expression_status"] == result["expression_status"]
 
 
+def test_download_cohort_writes_multi_file_candidates_when_no_single_primary(monkeypatch, tmp_path):
+    """Real GSE131050 shape at the download_cohort level: two RNA-seq
+    supplementary files, neither individually covering the cohort's full
+    sample count but summing to it. check_rnaseq_expression_qc correctly
+    declines to pick either as "the" primary; download_cohort must then
+    re-derive the same candidate list (via select_primary_expression_file_by_
+    content) and record it as expression_qc.json's multi_file_candidates,
+    so rnaseq_finalize.finalize_cohort can finalize each file independently
+    later rather than the cohort being silently dropped."""
+    gse = make_rnaseq_gse()
+    gse.metadata["supplementary_file"] = [
+        "ftp://example.com/GSE_RNASEQ_cohort_a.tsv.gz",
+        "ftp://example.com/GSE_RNASEQ_cohort_b.tsv.gz",
+    ]
+    # 7 + 13 = 20 samples total, split so neither file's own column count
+    # individually lands within _matches_sample_count's tolerance of 20
+    # (max(5, 15%) = 5) -- only their sum does, same as GSE131050's real
+    # 66/125-of-191 split, just scaled down for a fast unit test.
+    gse.gsms = {
+        f"GSM{i}": FakeGSM({
+            "title": [f"s{i}"], "geo_accession": [f"GSM{i}"], "platform_id": ["GPL34284"],
+            "organism_ch1": ["Homo sapiens"], "supplementary_file_1": ["NONE"], "characteristics_ch1": [],
+        })
+        for i in range(1, 21)
+    }
+    monkeypatch.setattr(download.geo_fetch, "fetch_series", lambda gse_id: gse)
+    monkeypatch.setattr(
+        download.clinical_annotate, "plan_column_mapping", lambda samples, model=None: clinical_annotate.ColumnMappingPlan()
+    )
+
+    matrix_a = gzip.compress(_big_matrix_dataframe(1200, 7).to_csv().encode())
+    matrix_b = gzip.compress(_big_matrix_dataframe(1200, 13).to_csv().encode())
+
+    def fake_get(url, timeout=None):
+        class _Resp:
+            content = matrix_a if "cohort_a" in url else matrix_b
+
+            def raise_for_status(self):
+                pass
+
+        return _Resp()
+
+    monkeypatch.setattr(download.requests, "get", fake_get)
+
+    result = download.download_cohort("GSE_RNASEQ_MULTI", series_dir=tmp_path)
+
+    assert "primary_expression_file" not in result
+    expected_paths = {
+        str(tmp_path / "GSE_RNASEQ_MULTI" / "expression" / "GSE_RNASEQ_cohort_a.tsv.gz"),
+        str(tmp_path / "GSE_RNASEQ_MULTI" / "expression" / "GSE_RNASEQ_cohort_b.tsv.gz"),
+    }
+    assert set(result["multi_file_candidates"]) == expected_paths
+
+    qc = json.loads((tmp_path / "GSE_RNASEQ_MULTI" / "expression_qc.json").read_text())
+    assert qc["primary_expression_file"] is None
+    assert set(qc["multi_file_candidates"]) == expected_paths
+
+
 def test_download_cohort_flags_no_expression_matrix_when_only_non_matrix_files_published(monkeypatch, tmp_path):
     """Real GSE108651 shape: the only per-sample supplementary files are a
     Cuffdiff differential-expression table and an rMATS splicing-analysis
