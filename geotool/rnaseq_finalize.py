@@ -288,6 +288,188 @@ def write_sample_id_map(
     return id_map
 
 
+def _load_numeric_matrix(path: Path) -> tuple[pd.DataFrame | None, str | None]:
+    """Read path and select only its numeric (sample) columns. Returns
+    (numeric_df, None) on success or (None, reason) on failure -- split out
+    of _finalize_one_matrix so callers can get a matrix's raw sample-column
+    names (for write_sample_id_map) before running the rest of the pipeline,
+    which may fail independently of this step.
+    """
+    try:
+        matrix = pd.read_csv(path, sep="\t", index_col=0)
+    except Exception as e:
+        return None, f"could not parse {path.name}: {e}"
+
+    numeric = matrix.select_dtypes(include="number")
+    if numeric.empty:
+        return None, f"{path.name}: no numeric sample columns"
+    return numeric, None
+
+
+def _finalize_one_matrix(
+    numeric: pd.DataFrame, path: Path, unit: str, ref: gsm.GencodeReference, clean_symbols: set[str],
+) -> tuple[pd.DataFrame | None, dict]:
+    """The whole single-file finalize pipeline (linear-scale detection,
+    gene-symbol conversion, TPM-if-needed, clean-gene-set restriction,
+    sum-1e6 renormalization, log2(x+1)) on one already-loaded numeric matrix
+    (see _load_numeric_matrix) -- returns (final_matrix_or_None, detail).
+    detail always has "reason" explaining what happened; on success it also
+    has "unit"/"was_log2_on_disk"/"note"/"n_genes"/"n_samples".
+    detail["failed"] is True only for an unrecoverable gene-identity problem
+    (row identifiers that resolve to no gene at all), as opposed to every
+    other None-result case, which is a transient/skippable condition.
+
+    path is only used for messages and to locate a ".original.tsv.gz"
+    sibling (find_original_raw_file) -- numeric is what's actually read from.
+
+    Shared by both finalize_cohort's single-resolved-file case and
+    _finalize_multi_file_cohort's per-candidate loop -- each candidate run
+    through this independently in the latter, never merged with another.
+    """
+    linear, was_log2 = to_linear_scale(numeric)
+    if float(linear.min().min()) < -1e-3:
+        return None, {"reason": f"{path.name}: negative values remain after scale detection -- not a clean expression matrix"}
+
+    linear = unwrap_embedded_ensembl_ids(linear)
+
+    unit_note = ""
+    if unit == "unknown":
+        integer_check_matrix = None
+        original_path = find_original_raw_file(path)
+        if original_path is not None:
+            try:
+                integer_check_matrix = pd.read_csv(original_path, sep="\t", index_col=0).select_dtypes(include="number")
+            except Exception:
+                integer_check_matrix = None
+        unit, why = guess_unit(linear, ref, integer_check_matrix=integer_check_matrix)
+        unit_note = f"quantification unit unknown -- {why}"
+
+    converted, convert_note = gsm.convert_to_gene_symbols(linear, ref)
+    if converted is None:
+        # "no recognizable transcript/gene/symbol identifier found" (see
+        # gene_symbol_mapping.convert_to_gene_symbols) means the matrix's row
+        # index is neither ENSG/ENST nor a HUGO symbol and locate_identifier_axis
+        # couldn't resolve it to one either -- not a transient/skippable
+        # condition like an unknown quantification unit, but an unrecoverable
+        # gene-identity failure for this series. Live example: GSE163305, whose
+        # Cufflinks output is indexed by XLOC_ novel-locus ids with no stable
+        # cross-reference to any gene.
+        if "no recognizable" in convert_note:
+            return None, {"reason": "gene names unrecoverable", "failed": True}
+        reason = f"{path.name}: {convert_note}"
+        return None, {"reason": f"{unit_note}; {reason}" if unit_note else reason}
+
+    if unit in _LENGTH_NORM_UNITS:
+        tpm_df, tpm_note = gsm.compute_tpm(converted, ref)
+        if tpm_df is None:
+            reason = f"{path.name}: {tpm_note}"
+            return None, {"reason": f"{unit_note}; {reason}" if unit_note else reason}
+        gene_matrix = tpm_df.set_index("gene_symbol")
+        note = f"{convert_note}; {tpm_note}"
+    else:
+        gene_matrix = converted.set_index("gene_symbol")
+        note = convert_note
+
+    clean_matrix = restrict_to_clean_genes(gene_matrix, clean_symbols)
+    if clean_matrix is None:
+        reason = f"{path.name}: none of the mapped genes are in the clean reference gene set"
+        return None, {"reason": f"{unit_note}; {reason}" if unit_note else reason}
+
+    tpm, err = renormalize_to_1e6(clean_matrix)
+    if tpm is None:
+        reason = f"{path.name}: {err}"
+        return None, {"reason": f"{unit_note}; {reason}" if unit_note else reason}
+
+    out = probe_mapping.maybe_log2_transform(tpm)
+    if unit_note:
+        note = f"{unit_note}; {note}"
+    return out, {
+        "unit": unit, "was_log2_on_disk": was_log2, "note": note,
+        "n_genes": len(out), "n_samples": out.shape[1],
+    }
+
+
+def _finalize_multi_file_cohort(
+    cohort_dir: Path, gse_id: str, candidate_names: list[str],
+    ref: gsm.GencodeReference, clean_symbols: set[str], series_dir: Path | None,
+) -> dict:
+    """No single resolved primary file for this cohort -- an unclear-which-
+    one-is-canonical multi-file case (live example, GSE131050: two
+    sub-cohort files that together, not individually, cover its full
+    191-sample count). Rather than guess which one is "the" matrix, or
+    silently merge them (two files' gene lists can differ -- an outer join
+    risks quietly fabricating zero-expression rows for genes one half never
+    measured, and geotool has no basis to tell that apart from a genuine
+    zero-count gene), each candidate is instead run through the exact same
+    single-file pipeline (_finalize_one_matrix) independently and written
+    out as its own numbered expression_final_<n>.tsv.gz -- for a human to
+    pick from, or combine deliberately, with the actual per-file processing
+    notes attached to say what each one is. sample_id_map.tsv still covers
+    every sample across every file that at least *loaded* (has readable
+    numeric sample columns), same "diagnostic info regardless of whether
+    downstream processing succeeds" property finalize_cohort's single-file
+    case has (see write_sample_id_map note there) -- built from their union
+    rather than one file's columns.
+    """
+    expr_dir = cohort_dir / "expression"
+    notes: dict[str, str] = {}
+    loaded: dict[str, tuple[Path, pd.DataFrame]] = {}
+    all_columns: list[str] = []
+
+    for name in candidate_names:
+        path = expr_dir / Path(name).name
+        if not path.exists():
+            notes[name] = f"{name}: not found locally under {expr_dir}/"
+            continue
+        numeric, err = _load_numeric_matrix(path)
+        if numeric is None:
+            notes[name] = err
+            continue
+        loaded[name] = (path, numeric)
+        all_columns.extend(str(c) for c in numeric.columns)
+
+    # Written from every successfully *loaded* file's raw columns, before
+    # attempting the rest of the pipeline below -- so this mapping exists
+    # even for a file whose own finalize subsequently fails.
+    id_map = write_sample_id_map(cohort_dir, all_columns, series_dir=series_dir) if all_columns else None
+
+    out_files: list[str] = []
+    for i, name in enumerate(candidate_names, start=1):
+        if name not in loaded:
+            continue
+        path, numeric = loaded[name]
+        final_df, detail = _finalize_one_matrix(numeric, path, "unknown", ref, clean_symbols)
+        if final_df is None:
+            notes[name] = f"{name}: {detail['reason']}"
+            continue
+        out_path = cohort_dir / f"expression_final_{i}.tsv.gz"
+        final_df.round(3).to_csv(out_path, sep="\t")
+        out_files.append(str(out_path))
+        notes[name] = f"{name} -> {out_path.name} ({detail['unit']}, {detail['n_genes']} clean genes, {detail['n_samples']} samples)"
+
+    per_file_notes = [notes[name] for name in candidate_names if name in notes]
+
+    if not out_files:
+        return {
+            "gse_id": gse_id, "status": "skipped",
+            "reason": "multi-file cohort, none of its candidate files could be finalized: " + "; ".join(per_file_notes),
+        }
+
+    n_matched = int(id_map["gsm_id"].notna().sum()) if id_map is not None else None
+    n_id_map = len(id_map) if id_map is not None else None
+
+    return {
+        "gse_id": gse_id, "status": "processed", "multi_file": True,
+        "reason": (
+            f"multi-file cohort, {len(out_files)}/{len(candidate_names)} candidate file(s) finalized "
+            f"separately (no single combined matrix -- see each expression_final_<n>.tsv.gz): "
+            + "; ".join(per_file_notes)
+        ),
+        "n_samples": len(all_columns), "out_file": "; ".join(out_files),
+        "n_samples_matched_to_gsm": n_matched, "n_samples_in_id_map": n_id_map,
+    }
+
+
 def finalize_cohort(
     cohort_dir: Path, ref: gsm.GencodeReference, clean_symbols: set[str], series_dir: Path | None = None,
 ) -> dict:
@@ -295,9 +477,16 @@ def finalize_cohort(
     <cohort_dir>/expression_final.tsv.gz on success. Returns a report row
     dict: status is "processed" (file written -- unit "unknown" gets a
     best-effort default rather than blocking this, see guess_unit),
-    "skipped" (a transient/expected condition -- multi-file cohort, zero-sum
-    sample after filtering, ...), or "failed" (an unrecoverable gene-identity
-    problem for this cohort's data).
+    "skipped" (a transient/expected condition -- zero-sum sample after
+    filtering, none of a multi-file cohort's candidates finalized, ...), or
+    "failed" (an unrecoverable gene-identity problem for this cohort's data).
+
+    A cohort with no single resolved primary file, but whose remaining
+    files together (not individually) sum to its sample count (geotool.
+    download.download_cohort's own expression_qc.json multi_file_candidates
+    field), is delegated to _finalize_multi_file_cohort -- see there for why
+    that's "finalize each file separately", never "guess which one is
+    canonical" or "merge them into one".
 
     Also writes <cohort_dir>/sample_id_map.tsv and merges it onto this
     cohort's canonical data/series/<gse_id>/annotation.tsv (see
@@ -316,90 +505,36 @@ def finalize_cohort(
     qc = json.loads(qc_path.read_text())
     unit = qc.get("primary_expression_unit")
     if unit is None:
-        return {"gse_id": gse_id, "status": "skipped", "reason": "no single primary expression matrix for this cohort (multi-file case)"}
+        candidates = qc.get("multi_file_candidates") or []
+        if not candidates:
+            return {"gse_id": gse_id, "status": "skipped", "reason": "no single primary expression matrix for this cohort (multi-file case)"}
+        return _finalize_multi_file_cohort(cohort_dir, gse_id, candidates, ref, clean_symbols, series_dir)
 
     path = find_local_expression_file(cohort_dir, qc)
     if path is None:
         return {"gse_id": gse_id, "status": "skipped", "reason": f"resolved file {Path(qc.get('primary_expression_file', '')).name!r} not found locally under {cohort_dir}/expression/"}
 
-    try:
-        matrix = pd.read_csv(path, sep="\t", index_col=0)
-    except Exception as e:
-        return {"gse_id": gse_id, "status": "skipped", "reason": f"could not parse {path.name}: {e}"}
-
-    numeric = matrix.select_dtypes(include="number")
-    if numeric.empty:
-        return {"gse_id": gse_id, "status": "skipped", "reason": f"{path.name}: no numeric sample columns"}
+    numeric, err = _load_numeric_matrix(path)
+    if numeric is None:
+        return {"gse_id": gse_id, "status": "skipped", "reason": err}
 
     id_map = write_sample_id_map(cohort_dir, list(numeric.columns), series_dir=series_dir)
 
-    linear, was_log2 = to_linear_scale(numeric)
-    if float(linear.min().min()) < -1e-3:
-        return {"gse_id": gse_id, "status": "skipped", "reason": f"{path.name}: negative values remain after scale detection -- not a clean expression matrix"}
+    final_df, detail = _finalize_one_matrix(numeric, path, unit, ref, clean_symbols)
+    if final_df is None:
+        status = "failed" if detail.get("failed") else "skipped"
+        return {"gse_id": gse_id, "status": status, "reason": detail["reason"]}
 
-    linear = unwrap_embedded_ensembl_ids(linear)
-
-    unit_note = ""
-    if unit == "unknown":
-        integer_check_matrix = None
-        original_path = find_original_raw_file(path)
-        if original_path is not None:
-            try:
-                integer_check_matrix = pd.read_csv(original_path, sep="\t", index_col=0).select_dtypes(include="number")
-            except Exception:
-                integer_check_matrix = None
-        unit, why = guess_unit(linear, ref, integer_check_matrix=integer_check_matrix)
-        unit_note = f"quantification unit unknown in expression_qc.json -- {why}"
-
-    converted, convert_note = gsm.convert_to_gene_symbols(linear, ref)
-    if converted is None:
-        # "no recognizable transcript/gene/symbol identifier found" (see
-        # gene_symbol_mapping.convert_to_gene_symbols) means the matrix's row
-        # index is neither ENSG/ENST nor a HUGO symbol and locate_identifier_axis
-        # couldn't resolve it to one either -- not a transient/skippable
-        # condition like an unknown quantification unit, but an unrecoverable
-        # gene-identity failure for this series. Live example: GSE163305, whose
-        # Cufflinks output is indexed by XLOC_ novel-locus ids with no stable
-        # cross-reference to any gene.
-        if "no recognizable" in convert_note:
-            return {"gse_id": gse_id, "status": "failed", "reason": "gene names unrecoverable"}
-        reason = f"{path.name}: {convert_note}"
-        return {"gse_id": gse_id, "status": "skipped", "reason": f"{unit_note}; {reason}" if unit_note else reason}
-
-    if unit in _LENGTH_NORM_UNITS:
-        tpm_df, tpm_note = gsm.compute_tpm(converted, ref)
-        if tpm_df is None:
-            reason = f"{path.name}: {tpm_note}"
-            return {"gse_id": gse_id, "status": "skipped", "reason": f"{unit_note}; {reason}" if unit_note else reason}
-        gene_matrix = tpm_df.set_index("gene_symbol")
-        detail = f"{convert_note}; {tpm_note}"
-    else:
-        gene_matrix = converted.set_index("gene_symbol")
-        detail = convert_note
-
-    clean_matrix = restrict_to_clean_genes(gene_matrix, clean_symbols)
-    if clean_matrix is None:
-        reason = f"{path.name}: none of the mapped genes are in the clean reference gene set"
-        return {"gse_id": gse_id, "status": "skipped", "reason": f"{unit_note}; {reason}" if unit_note else reason}
-
-    tpm, err = renormalize_to_1e6(clean_matrix)
-    if tpm is None:
-        reason = f"{path.name}: {err}"
-        return {"gse_id": gse_id, "status": "skipped", "reason": f"{unit_note}; {reason}" if unit_note else reason}
-
-    out = probe_mapping.maybe_log2_transform(tpm)
     out_path = cohort_dir / "expression_final.tsv.gz"
-    out.round(3).to_csv(out_path, sep="\t")
+    final_df.round(3).to_csv(out_path, sep="\t")
 
     n_matched = int(id_map["gsm_id"].notna().sum()) if id_map is not None else None
     n_id_map = len(id_map) if id_map is not None else None
-    if unit_note:
-        detail = f"{unit_note}; {detail}"
 
     return {
-        "gse_id": gse_id, "status": "processed", "reason": f"{detail}; {len(tpm)} clean genes kept",
-        "unit": unit, "source_file": path.name, "was_log2_on_disk": was_log2,
-        "n_genes": len(tpm), "n_samples": tpm.shape[1], "out_file": str(out_path),
+        "gse_id": gse_id, "status": "processed", "reason": f"{detail['note']}; {detail['n_genes']} clean genes kept",
+        "unit": detail["unit"], "source_file": path.name, "was_log2_on_disk": detail["was_log2_on_disk"],
+        "n_genes": detail["n_genes"], "n_samples": detail["n_samples"], "out_file": str(out_path),
         "n_samples_matched_to_gsm": n_matched, "n_samples_in_id_map": n_id_map,
     }
 
