@@ -428,6 +428,13 @@ def finalize_microarray(cohort_roots, gencode_version, out_name):
     log2-transforms at download time, and there's no TPM-equivalent
     renormalization concept for hybridization-intensity data.
 
+    A cohort with an expression_rma.tsv.gz (download's own --rma, raw-CEL
+    RMA renormalization) uses that instead, regardless of what
+    expression_status says about the submitter's own expression.tsv.gz --
+    that field describes a different file and doesn't apply to the RMA
+    one, which the earlier --rma call deliberately requested as its
+    replacement.
+
     Writes data/reports/<name>.tsv (one row per cohort: processed/skipped).
     """
     report_df = microarray_finalize_mod.build_final_matrices(

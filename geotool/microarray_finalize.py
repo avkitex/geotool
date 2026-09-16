@@ -2,7 +2,8 @@
 the clean GENCODE reference gene set (data/references/gencode<version>) --
 the same clean-set policy geotool.rnaseq_finalize applies to RNA-seq -- for
 every cohort under one or more collection roots that has a resolved,
-ready (expression_status == "ok") single-sample gene-level matrix.
+ready (expression_status == "ok") single-sample gene-level matrix, or an
+expression_rma.tsv.gz (see below).
 
 Unlike RNA-seq, microarray never needs gene-ID conversion or unit/TPM
 handling here: geotool.download already maps each platform's own probes to
@@ -23,6 +24,15 @@ which channel is the actual tumor/signal measurement (see
 clinical_annotate.classify_expression_status) -- restricting that ratio's
 genes wouldn't make it any more usable, so there's nothing worth writing.
 
+The expression_status gate is skipped entirely when expression_rma.tsv.gz
+is present (geotool.download's --rma, raw-CEL RMA renormalization run
+independently of the submitter-value expression.tsv.gz QC): that field
+was computed against the submitter's own matrix and says nothing about
+the RMA one, which the caller deliberately requested as its replacement.
+RMA is a deterministic, well-vetted algorithm that always produces
+background-corrected, quantile-normalized log2 values, so there is no
+separate QC concept for it to fail here the way a submitter matrix can.
+
 Writes <collection_root>/<GSE>/expression_final.tsv.gz -- the same output
 filename/location convention geotool.rnaseq_finalize uses, so
 geotool.cohort_report's collection_root-based readiness check treats a
@@ -40,15 +50,25 @@ from geotool import rnaseq_finalize as rf
 
 
 def _source_matrix_path(cohort_dir: Path) -> tuple[Path | None, str]:
-    """Prefer channel_signal_expression.tsv.gz (resolved two-channel
-    signal) over the cohort's own expression.tsv.gz -- same priority
-    cohort_report._resolve_own_expression_file already uses, since a
-    two-channel cohort's expression.tsv.gz is the Cy3/Cy5 ratio, not a
-    per-sample measurement (see probe_mapping.detect_reference_channel).
-    Returns (None, "") if neither exists -- e.g. a platform with no gene
-    symbol/ID column at all, where only probe_matrix.tsv.gz was ever
-    written (see probe_mapping.py's five mapping-strategy docstring).
+    """Prefer expression_rma.tsv.gz (raw-CEL RMA renormalization, only
+    ever written when --rma was requested for an Affymetrix cohort) over
+    channel_signal_expression.tsv.gz (resolved two-channel signal) over
+    the cohort's own expression.tsv.gz -- the latter two in the same
+    priority cohort_report._resolve_own_expression_file already uses,
+    since a two-channel cohort's expression.tsv.gz is the Cy3/Cy5 ratio,
+    not a per-sample measurement (see probe_mapping.detect_reference_
+    channel). RMA and two-channel signal never actually coexist in
+    practice -- RMA is Affymetrix-only, two-channel is Agilent-only --
+    but RMA is ordered first as the more deliberately-requested,
+    already-QC'd source when both this and a resolved two-channel signal
+    somehow exist. Returns (None, "") if none exist -- e.g. a platform
+    with no gene symbol/ID column at all, where only probe_matrix.tsv.gz
+    was ever written (see probe_mapping.py's five mapping-strategy
+    docstring).
     """
+    rma_path = cohort_dir / "expression_rma.tsv.gz"
+    if rma_path.exists():
+        return rma_path, "expression_rma.tsv.gz"
     signal_path = cohort_dir / "channel_signal_expression.tsv.gz"
     if signal_path.exists():
         return signal_path, "channel_signal_expression.tsv.gz"
@@ -77,14 +97,16 @@ def finalize_cohort(cohort_dir: Path, clean_symbols: set[str], series_dir: Path 
     mapping already succeeded or didn't at download time).
     """
     gse_id = cohort_dir.name
-    expression_status = _read_expression_status(gse_id, series_dir)
-    if expression_status != "ok":
-        return {
-            "gse_id": gse_id, "status": "skipped",
-            "reason": f"expression_status is {expression_status!r}, not 'ok' -- no resolved single-sample matrix",
-        }
-
     path, source_name = _source_matrix_path(cohort_dir)
+
+    if source_name != "expression_rma.tsv.gz":
+        expression_status = _read_expression_status(gse_id, series_dir)
+        if expression_status != "ok":
+            return {
+                "gse_id": gse_id, "status": "skipped",
+                "reason": f"expression_status is {expression_status!r}, not 'ok' -- no resolved single-sample matrix",
+            }
+
     if path is None:
         return {
             "gse_id": gse_id, "status": "skipped",

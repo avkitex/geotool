@@ -37,6 +37,15 @@ def test_source_matrix_path_prefers_channel_signal_over_plain_expression(tmp_pat
     assert path == tmp_path / "channel_signal_expression.tsv.gz"
 
 
+def test_source_matrix_path_prefers_rma_over_everything(tmp_path):
+    (tmp_path / "expression.tsv.gz").write_bytes(b"")
+    (tmp_path / "channel_signal_expression.tsv.gz").write_bytes(b"")
+    (tmp_path / "expression_rma.tsv.gz").write_bytes(b"")
+    path, name = finalize._source_matrix_path(tmp_path)
+    assert name == "expression_rma.tsv.gz"
+    assert path == tmp_path / "expression_rma.tsv.gz"
+
+
 def test_source_matrix_path_falls_back_to_plain_expression(tmp_path):
     (tmp_path / "expression.tsv.gz").write_bytes(b"")
     path, name = finalize._source_matrix_path(tmp_path)
@@ -110,6 +119,28 @@ def test_finalize_cohort_uses_channel_signal_expression_when_present(tmp_path):
     assert row["status"] == "processed"
     assert row["source_file"] == "channel_signal_expression.tsv.gz"
     assert row["n_genes"] == 1
+
+
+def test_finalize_cohort_uses_rma_despite_bad_submitter_expression_status(tmp_path):
+    """A cohort whose submitter expression.tsv.gz tripped negative_values
+    QC (expression_status != "ok") must still be processed from
+    expression_rma.tsv.gz when --rma was run for it -- expression_status
+    describes the submitter file, not the RMA one."""
+    series_dir = tmp_path / "series"
+    cohort_dir = tmp_path / "cohorts" / "GSE1"
+    _write_annotation(series_dir, "GSE1", expression_status="negative_values")
+    _write_expression(cohort_dir, filename="expression.tsv.gz")  # the flagged submitter file
+    _write_expression(cohort_dir, filename="expression_rma.tsv.gz", index=("TSPAN6",))
+
+    row = finalize.finalize_cohort(cohort_dir, _CLEAN_SYMBOLS, series_dir=series_dir)
+    assert row["status"] == "processed"
+    assert row["source_file"] == "expression_rma.tsv.gz"
+    assert row["n_genes"] == 1
+
+    out_path = cohort_dir / "expression_final.tsv.gz"
+    assert out_path.exists()
+    written = pd.read_csv(out_path, sep="\t", index_col=0)
+    assert set(written.index) == {"TSPAN6"}
 
 
 def test_finalize_cohort_no_clean_genes_skipped(tmp_path):
