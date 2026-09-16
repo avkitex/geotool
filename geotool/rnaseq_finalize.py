@@ -220,28 +220,18 @@ def find_local_expression_file(cohort_dir: Path, qc: dict) -> Path | None:
 SAMPLE_ID_MAP_ANNOTATION_COLUMNS = ["expression_id", "sample_id_match_method", "sample_id_match_confidence"]
 
 
-def merge_sample_id_map_into_series_annotation(
-    gse_id: str, id_map: pd.DataFrame, series_dir: Path | None = None,
-) -> None:
-    """Write sample_id_matching's per-sample match (expression_id,
-    match_method, confidence -- renamed sample_id_match_method/
-    sample_id_match_confidence here to read unambiguously once merged)
-    onto this cohort's own *canonical* data/series/<gse_id>/annotation.tsv,
-    joined on gsm_id. Not the project-specific collection-root copy
-    write_sample_id_map read from -- geotool.harmonize's reuse tier always
-    reads a cohort's annotation.tsv from data/series/<gse_id>/, so writing
-    there is what actually makes these columns show up the next time
-    cohorts get merged, with no changes needed in harmonize.py itself
-    (outer-concat already NaN-fills a column a given cohort doesn't have).
+def _merge_sample_id_map_into_annotation_file(annotation_path: Path, id_map: pd.DataFrame) -> None:
+    """Shared body: merge sample_id_matching's per-sample match
+    (expression_id, match_method, confidence -- renamed
+    sample_id_match_method/sample_id_match_confidence here to read
+    unambiguously once merged) onto annotation_path, joined on gsm_id.
 
-    A no-op if data/series/<gse_id>/annotation.tsv doesn't exist or has no
-    gsm_id column. Idempotent: re-running replaces any previous run's
-    columns rather than duplicating them. An id_map row with no gsm_id
-    (unmatched expression column) has nothing to join onto, so contributes
-    nothing here -- not an error, just nothing added for that row.
+    A no-op if annotation_path doesn't exist or has no gsm_id column.
+    Idempotent: re-running replaces any previous run's columns rather than
+    duplicating them. An id_map row with no gsm_id (unmatched expression
+    column) has nothing to join onto, so contributes nothing here -- not
+    an error, just nothing added for that row.
     """
-    series_dir = series_dir or config.SERIES_DIR
-    annotation_path = series_dir / gse_id / "annotation.tsv"
     if not annotation_path.exists():
         return
     annotation = pd.read_csv(annotation_path, sep="\t", low_memory=False)
@@ -256,15 +246,42 @@ def merge_sample_id_map_into_series_annotation(
     merged.to_csv(annotation_path, sep="\t", index=False)
 
 
+def merge_sample_id_map_into_series_annotation(
+    gse_id: str, id_map: pd.DataFrame, series_dir: Path | None = None,
+) -> None:
+    """Write sample_id_matching's per-sample match onto this cohort's own
+    *canonical* data/series/<gse_id>/annotation.tsv (see
+    _merge_sample_id_map_into_annotation_file for the merge itself). Not
+    the project-specific collection-root copy write_sample_id_map read
+    from -- geotool.harmonize's reuse tier always reads a cohort's
+    annotation.tsv from data/series/<gse_id>/, so writing there is what
+    actually makes these columns show up the next time cohorts get merged,
+    with no changes needed in harmonize.py itself (outer-concat already
+    NaN-fills a column a given cohort doesn't have). write_sample_id_map
+    separately merges the same id_map onto the collection-root copy too,
+    so a project collection (data/pdac_cohorts, a custom Summit-style
+    root, ...) doesn't need to be cross-referenced against data/series/ to
+    see which gsm_id each of its own expression_final.tsv.gz columns is.
+    """
+    series_dir = series_dir or config.SERIES_DIR
+    _merge_sample_id_map_into_annotation_file(series_dir / gse_id / "annotation.tsv", id_map)
+
+
 def write_sample_id_map(
     cohort_dir: Path, expression_columns: list[str], series_dir: Path | None = None,
 ) -> pd.DataFrame | None:
     """Match expression_columns (an expression matrix's sample columns, in
     their original submitter-chosen labels) back to this cohort's own
     annotation.tsv gsm_ids (see geotool.sample_id_matching), write the
-    result to <cohort_dir>/sample_id_map.tsv, and merge it onto this
-    cohort's canonical data/series/<gse_id>/annotation.tsv too (see
-    merge_sample_id_map_into_series_annotation). None (nothing written) if
+    result to <cohort_dir>/sample_id_map.tsv, and merge it onto both this
+    cohort's canonical data/series/<gse_id>/annotation.tsv (see
+    merge_sample_id_map_into_series_annotation) and, if different, the
+    collection-root annotation.tsv this function read cohort_dir's
+    annotation from in the first place -- so a project collection
+    (data/pdac_cohorts, a custom Summit-style root, ...) is self-
+    consistent with its own expression_final.tsv.gz sitting right next to
+    it, without needing to cross-reference data/series/ to find which
+    gsm_id each expression column belongs to. None (nothing written) if
     there's no local annotation.tsv or it has no gsm_id column to match
     against.
 
@@ -285,6 +302,9 @@ def write_sample_id_map(
     id_map = sample_id_matching.match_expression_columns(expression_columns, annotation)
     id_map.to_csv(cohort_dir / "sample_id_map.tsv", sep="\t", index=False)
     merge_sample_id_map_into_series_annotation(cohort_dir.name, id_map, series_dir=series_dir)
+    series_annotation_path = (series_dir or config.SERIES_DIR) / cohort_dir.name / "annotation.tsv"
+    if annotation_path.resolve() != series_annotation_path.resolve():
+        _merge_sample_id_map_into_annotation_file(annotation_path, id_map)
     return id_map
 
 
@@ -299,14 +319,15 @@ def finalize_cohort(
     sample after filtering, ...), or "failed" (an unrecoverable gene-identity
     problem for this cohort's data).
 
-    Also writes <cohort_dir>/sample_id_map.tsv and merges it onto this
-    cohort's canonical data/series/<gse_id>/annotation.tsv (see
-    write_sample_id_map) as soon as the matrix's sample columns are known --
-    independent of whether gene-symbol conversion below ultimately
-    succeeds, since the column<->gsm_id correspondence is useful diagnostic
-    information on its own even for a cohort that ends up skipped/failed
-    here. series_dir overrides where that canonical annotation.tsv lives
-    (default data/series/, see config.SERIES_DIR) -- mainly for tests.
+    Also writes <cohort_dir>/sample_id_map.tsv and merges it onto both the
+    cohort's canonical data/series/<gse_id>/annotation.tsv and cohort_dir's
+    own annotation.tsv, if different (see write_sample_id_map) as soon as
+    the matrix's sample columns are known -- independent of whether
+    gene-symbol conversion below ultimately succeeds, since the
+    column<->gsm_id correspondence is useful diagnostic information on its
+    own even for a cohort that ends up skipped/failed here. series_dir
+    overrides where that canonical annotation.tsv lives (default
+    data/series/, see config.SERIES_DIR) -- mainly for tests.
     """
     gse_id = cohort_dir.name
     qc_path = cohort_dir / "expression_qc.json"

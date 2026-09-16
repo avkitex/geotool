@@ -158,10 +158,13 @@ reverse-substring match, and — only for whatever's left unresolved by name,
 and only when the remaining count exactly matches the count of unused
 `gsm_id`s — GEO submission order as a last resort. An ambiguous match is
 left unresolved (`None`) rather than guessed. Result is written to
-`sample_id_map.tsv` and merged onto the cohort's own
-`data/series/<GSE_ID>/annotation.tsv` as `expression_id`/
-`sample_id_match_method`/`sample_id_match_confidence` columns, which then
-flow into the harmonized sample table for free.
+`sample_id_map.tsv` and merged onto both the cohort's canonical
+`data/series/<GSE_ID>/annotation.tsv` (which then flows into the
+harmonized sample table for free) and, if different, the collection
+root's own copy of that cohort's `annotation.tsv` (e.g.
+`data/pdac_cohorts/<GSE_ID>/annotation.tsv`) — so a collection root stays
+self-consistent with its own `expression_final.tsv.gz` without needing to
+cross-reference `data/series/`.
 
 ## LLM (Claude) usage — opt-in by default everywhere
 

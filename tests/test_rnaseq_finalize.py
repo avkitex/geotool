@@ -496,6 +496,46 @@ def test_write_sample_id_map_merges_into_series_annotation(tmp_path):
     assert list(written["expression_id"]) == ["DMSO_1", "DMSO_2"]
 
 
+def test_write_sample_id_map_also_merges_into_collection_root_annotation(tmp_path):
+    """A collection root (data/pdac_cohorts, a custom Summit-style root,
+    ...) must end up with expression_id/sample_id_match_* columns in its
+    own annotation.tsv too -- not just the canonical data/series/ copy --
+    so it's usable standalone, without cross-referencing data/series/."""
+    cohort_dir = tmp_path / "collection" / "GSE1"
+    cohort_dir.mkdir(parents=True)
+    pd.DataFrame({
+        "gsm_id": ["GSM1", "GSM2"], "title": ["DMSO_1", "DMSO_2"], "some_clinical_col": ["a", "b"],
+    }).to_csv(cohort_dir / "annotation.tsv", sep="\t", index=False)
+    series_dir = tmp_path / "series"
+    _write_series_annotation(
+        series_dir, "GSE1", pd.DataFrame({"gsm_id": ["GSM1", "GSM2"], "title": ["DMSO_1", "DMSO_2"]}),
+    )
+
+    finalize.write_sample_id_map(cohort_dir, ["DMSO_1", "DMSO_2"], series_dir=series_dir)
+
+    written = pd.read_csv(cohort_dir / "annotation.tsv", sep="\t")
+    assert list(written["expression_id"]) == ["DMSO_1", "DMSO_2"]
+    assert list(written["sample_id_match_method"]) == ["exact", "exact"]
+    assert list(written["some_clinical_col"]) == ["a", "b"]  # project-specific columns preserved
+
+
+def test_write_sample_id_map_skips_duplicate_merge_when_cohort_dir_is_series_dir(tmp_path):
+    """finalize-rnaseq run directly against data/series/ itself (no
+    separate collection root) must not double-merge the same file."""
+    series_dir = tmp_path / "series"
+    cohort_dir = series_dir / "GSE1"
+    cohort_dir.mkdir(parents=True)
+    pd.DataFrame({"gsm_id": ["GSM1"], "title": ["DMSO_1"]}).to_csv(
+        cohort_dir / "annotation.tsv", sep="\t", index=False
+    )
+
+    finalize.write_sample_id_map(cohort_dir, ["DMSO_1"], series_dir=series_dir)
+
+    written = pd.read_csv(cohort_dir / "annotation.tsv", sep="\t")
+    assert list(written.columns).count("expression_id") == 1
+    assert list(written["expression_id"]) == ["DMSO_1"]
+
+
 def test_finalize_cohort_merges_sample_id_map_into_series_annotation(tmp_path):
     cohort_dir = tmp_path / "collection" / "GSE1"
     cohort_dir.mkdir(parents=True, exist_ok=True)
