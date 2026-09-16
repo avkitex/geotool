@@ -9,7 +9,15 @@ resolved a file for).
 
 Writes <collection_root>/<GSE>/expression_final.tsv.gz -- the actual
 analysis-ready matrix (HUGO gene symbols, clean GENCODE gene set only,
-TPM-renormalized, log2(x+1)).
+TPM-renormalized, log2(x+1)). Its sample columns keep the submitter's own
+labels (e.g. "DMSO_1") by default -- annotation.tsv's expression_id column
+is the join key back to gsm_id (see write_sample_id_map) -- except when
+every sample in the cohort matched to its gsm_id with high confidence (see
+sample_id_matching.all_high_confidence), in which case columns are
+relabeled to gsm_id directly so annotation.tsv and expression_final.tsv.gz
+share the same identifier with no join needed at all. Whole-cohort-or-
+nothing: a single low-confidence or unmatched sample anywhere disables
+this for every column, not just that one.
 
 Row-identifier detection, ENST/ENSG->gene-symbol mapping, and duplicate-row
 aggregation are all delegated to geotool.gene_symbol_mapping (built on this
@@ -220,28 +228,18 @@ def find_local_expression_file(cohort_dir: Path, qc: dict) -> Path | None:
 SAMPLE_ID_MAP_ANNOTATION_COLUMNS = ["expression_id", "sample_id_match_method", "sample_id_match_confidence"]
 
 
-def merge_sample_id_map_into_series_annotation(
-    gse_id: str, id_map: pd.DataFrame, series_dir: Path | None = None,
-) -> None:
-    """Write sample_id_matching's per-sample match (expression_id,
-    match_method, confidence -- renamed sample_id_match_method/
-    sample_id_match_confidence here to read unambiguously once merged)
-    onto this cohort's own *canonical* data/series/<gse_id>/annotation.tsv,
-    joined on gsm_id. Not the project-specific collection-root copy
-    write_sample_id_map read from -- geotool.harmonize's reuse tier always
-    reads a cohort's annotation.tsv from data/series/<gse_id>/, so writing
-    there is what actually makes these columns show up the next time
-    cohorts get merged, with no changes needed in harmonize.py itself
-    (outer-concat already NaN-fills a column a given cohort doesn't have).
+def _merge_sample_id_map_into_annotation_file(annotation_path: Path, id_map: pd.DataFrame) -> None:
+    """Shared body: merge sample_id_matching's per-sample match
+    (expression_id, match_method, confidence -- renamed
+    sample_id_match_method/sample_id_match_confidence here to read
+    unambiguously once merged) onto annotation_path, joined on gsm_id.
 
-    A no-op if data/series/<gse_id>/annotation.tsv doesn't exist or has no
-    gsm_id column. Idempotent: re-running replaces any previous run's
-    columns rather than duplicating them. An id_map row with no gsm_id
-    (unmatched expression column) has nothing to join onto, so contributes
-    nothing here -- not an error, just nothing added for that row.
+    A no-op if annotation_path doesn't exist or has no gsm_id column.
+    Idempotent: re-running replaces any previous run's columns rather than
+    duplicating them. An id_map row with no gsm_id (unmatched expression
+    column) has nothing to join onto, so contributes nothing here -- not
+    an error, just nothing added for that row.
     """
-    series_dir = series_dir or config.SERIES_DIR
-    annotation_path = series_dir / gse_id / "annotation.tsv"
     if not annotation_path.exists():
         return
     annotation = pd.read_csv(annotation_path, sep="\t", low_memory=False)
@@ -256,15 +254,42 @@ def merge_sample_id_map_into_series_annotation(
     merged.to_csv(annotation_path, sep="\t", index=False)
 
 
+def merge_sample_id_map_into_series_annotation(
+    gse_id: str, id_map: pd.DataFrame, series_dir: Path | None = None,
+) -> None:
+    """Write sample_id_matching's per-sample match onto this cohort's own
+    *canonical* data/series/<gse_id>/annotation.tsv (see
+    _merge_sample_id_map_into_annotation_file for the merge itself). Not
+    the project-specific collection-root copy write_sample_id_map read
+    from -- geotool.harmonize's reuse tier always reads a cohort's
+    annotation.tsv from data/series/<gse_id>/, so writing there is what
+    actually makes these columns show up the next time cohorts get merged,
+    with no changes needed in harmonize.py itself (outer-concat already
+    NaN-fills a column a given cohort doesn't have). write_sample_id_map
+    separately merges the same id_map onto the collection-root copy too,
+    so a project collection (data/pdac_cohorts, a custom Summit-style
+    root, ...) doesn't need to be cross-referenced against data/series/ to
+    see which gsm_id each of its own expression_final.tsv.gz columns is.
+    """
+    series_dir = series_dir or config.SERIES_DIR
+    _merge_sample_id_map_into_annotation_file(series_dir / gse_id / "annotation.tsv", id_map)
+
+
 def write_sample_id_map(
     cohort_dir: Path, expression_columns: list[str], series_dir: Path | None = None,
 ) -> pd.DataFrame | None:
     """Match expression_columns (an expression matrix's sample columns, in
     their original submitter-chosen labels) back to this cohort's own
     annotation.tsv gsm_ids (see geotool.sample_id_matching), write the
-    result to <cohort_dir>/sample_id_map.tsv, and merge it onto this
-    cohort's canonical data/series/<gse_id>/annotation.tsv too (see
-    merge_sample_id_map_into_series_annotation). None (nothing written) if
+    result to <cohort_dir>/sample_id_map.tsv, and merge it onto both this
+    cohort's canonical data/series/<gse_id>/annotation.tsv (see
+    merge_sample_id_map_into_series_annotation) and, if different, the
+    collection-root annotation.tsv this function read cohort_dir's
+    annotation from in the first place -- so a project collection
+    (data/pdac_cohorts, a custom Summit-style root, ...) is self-
+    consistent with its own expression_final.tsv.gz sitting right next to
+    it, without needing to cross-reference data/series/ to find which
+    gsm_id each expression column belongs to. None (nothing written) if
     there's no local annotation.tsv or it has no gsm_id column to match
     against.
 
@@ -285,6 +310,9 @@ def write_sample_id_map(
     id_map = sample_id_matching.match_expression_columns(expression_columns, annotation)
     id_map.to_csv(cohort_dir / "sample_id_map.tsv", sep="\t", index=False)
     merge_sample_id_map_into_series_annotation(cohort_dir.name, id_map, series_dir=series_dir)
+    series_annotation_path = (series_dir or config.SERIES_DIR) / cohort_dir.name / "annotation.tsv"
+    if annotation_path.resolve() != series_annotation_path.resolve():
+        _merge_sample_id_map_into_annotation_file(annotation_path, id_map)
     return id_map
 
 
@@ -308,19 +336,34 @@ def _load_numeric_matrix(path: Path) -> tuple[pd.DataFrame | None, str | None]:
 
 def _finalize_one_matrix(
     numeric: pd.DataFrame, path: Path, unit: str, ref: gsm.GencodeReference, clean_symbols: set[str],
+    id_map: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame | None, dict]:
     """The whole single-file finalize pipeline (linear-scale detection,
     gene-symbol conversion, TPM-if-needed, clean-gene-set restriction,
     sum-1e6 renormalization, log2(x+1)) on one already-loaded numeric matrix
     (see _load_numeric_matrix) -- returns (final_matrix_or_None, detail).
     detail always has "reason" explaining what happened; on success it also
-    has "unit"/"was_log2_on_disk"/"note"/"n_genes"/"n_samples".
+    has "unit"/"was_log2_on_disk"/"note"/"n_genes"/"n_samples"/
+    "columns_renamed_to_gsm_id".
     detail["failed"] is True only for an unrecoverable gene-identity problem
     (row identifiers that resolve to no gene at all), as opposed to every
     other None-result case, which is a transient/skippable condition.
 
     path is only used for messages and to locate a ".original.tsv.gz"
     sibling (find_original_raw_file) -- numeric is what's actually read from.
+
+    id_map (write_sample_id_map's own return value, scoped to whichever
+    columns numeric actually has -- the caller's job, not this function's)
+    gates one more thing on success: when every column present here matched
+    its gsm_id at high confidence (sample_id_matching.all_high_confidence),
+    the result's columns are relabeled straight to gsm_id, so
+    annotation.tsv and the output share the same identifier with no join
+    needed at all. Whole-cohort-or-nothing per call: a single low-confidence
+    or unmatched column here disables this for every column in *this*
+    matrix, not just that one -- for _finalize_multi_file_cohort, "cohort"
+    for this purpose is each candidate file's own columns, since each is
+    written out as its own independent expression_final_<n>.tsv.gz. None
+    (the default) never renames -- the caller didn't ask.
 
     Shared by both finalize_cohort's single-resolved-file case and
     _finalize_multi_file_cohort's per-candidate loop -- each candidate run
@@ -381,11 +424,20 @@ def _finalize_one_matrix(
         return None, {"reason": f"{unit_note}; {reason}" if unit_note else reason}
 
     out = probe_mapping.maybe_log2_transform(tpm)
+
+    renamed_to_gsm_id = False
+    if id_map is not None:
+        present = id_map[id_map["expression_id"].isin(out.columns)]
+        if sample_id_matching.all_high_confidence(present):
+            out = out.rename(columns=dict(zip(present["expression_id"], present["gsm_id"])))
+            renamed_to_gsm_id = True
+
     if unit_note:
         note = f"{unit_note}; {note}"
     return out, {
         "unit": unit, "was_log2_on_disk": was_log2, "note": note,
         "n_genes": len(out), "n_samples": out.shape[1],
+        "columns_renamed_to_gsm_id": renamed_to_gsm_id,
     }
 
 
@@ -438,14 +490,15 @@ def _finalize_multi_file_cohort(
         if name not in loaded:
             continue
         path, numeric = loaded[name]
-        final_df, detail = _finalize_one_matrix(numeric, path, "unknown", ref, clean_symbols)
+        final_df, detail = _finalize_one_matrix(numeric, path, "unknown", ref, clean_symbols, id_map=id_map)
         if final_df is None:
             notes[name] = f"{name}: {detail['reason']}"
             continue
         out_path = cohort_dir / f"expression_final_{i}.tsv.gz"
         final_df.round(3).to_csv(out_path, sep="\t")
         out_files.append(str(out_path))
-        notes[name] = f"{name} -> {out_path.name} ({detail['unit']}, {detail['n_genes']} clean genes, {detail['n_samples']} samples)"
+        renamed_note = ", renamed to gsm_id" if detail["columns_renamed_to_gsm_id"] else ""
+        notes[name] = f"{name} -> {out_path.name} ({detail['unit']}, {detail['n_genes']} clean genes, {detail['n_samples']} samples{renamed_note})"
 
     per_file_notes = [notes[name] for name in candidate_names if name in notes]
 
@@ -480,6 +533,10 @@ def finalize_cohort(
     "skipped" (a transient/expected condition -- zero-sum sample after
     filtering, none of a multi-file cohort's candidates finalized, ...), or
     "failed" (an unrecoverable gene-identity problem for this cohort's data).
+    A "processed" row's columns_renamed_to_gsm_id says whether the output's
+    columns are the submitter's own sample labels (the default) or gsm_id
+    (only when every sample matched with high confidence, see
+    sample_id_matching.all_high_confidence).
 
     A cohort with no single resolved primary file, but whose remaining
     files together (not individually) sum to its sample count (geotool.
@@ -488,14 +545,15 @@ def finalize_cohort(
     that's "finalize each file separately", never "guess which one is
     canonical" or "merge them into one".
 
-    Also writes <cohort_dir>/sample_id_map.tsv and merges it onto this
-    cohort's canonical data/series/<gse_id>/annotation.tsv (see
-    write_sample_id_map) as soon as the matrix's sample columns are known --
-    independent of whether gene-symbol conversion below ultimately
-    succeeds, since the column<->gsm_id correspondence is useful diagnostic
-    information on its own even for a cohort that ends up skipped/failed
-    here. series_dir overrides where that canonical annotation.tsv lives
-    (default data/series/, see config.SERIES_DIR) -- mainly for tests.
+    Also writes <cohort_dir>/sample_id_map.tsv and merges it onto both the
+    cohort's canonical data/series/<gse_id>/annotation.tsv and cohort_dir's
+    own annotation.tsv, if different (see write_sample_id_map) as soon as
+    the matrix's sample columns are known -- independent of whether
+    gene-symbol conversion below ultimately succeeds, since the
+    column<->gsm_id correspondence is useful diagnostic information on its
+    own even for a cohort that ends up skipped/failed here. series_dir
+    overrides where that canonical annotation.tsv lives (default
+    data/series/, see config.SERIES_DIR) -- mainly for tests.
     """
     gse_id = cohort_dir.name
     qc_path = cohort_dir / "expression_qc.json"
@@ -520,7 +578,7 @@ def finalize_cohort(
 
     id_map = write_sample_id_map(cohort_dir, list(numeric.columns), series_dir=series_dir)
 
-    final_df, detail = _finalize_one_matrix(numeric, path, unit, ref, clean_symbols)
+    final_df, detail = _finalize_one_matrix(numeric, path, unit, ref, clean_symbols, id_map=id_map)
     if final_df is None:
         status = "failed" if detail.get("failed") else "skipped"
         return {"gse_id": gse_id, "status": status, "reason": detail["reason"]}
@@ -536,6 +594,7 @@ def finalize_cohort(
         "unit": detail["unit"], "source_file": path.name, "was_log2_on_disk": detail["was_log2_on_disk"],
         "n_genes": detail["n_genes"], "n_samples": detail["n_samples"], "out_file": str(out_path),
         "n_samples_matched_to_gsm": n_matched, "n_samples_in_id_map": n_id_map,
+        "columns_renamed_to_gsm_id": detail["columns_renamed_to_gsm_id"],
     }
 
 

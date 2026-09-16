@@ -99,6 +99,33 @@ def match_expression_columns(
     return pd.DataFrame(rows, columns=["expression_id", "gsm_id", "match_method", "confidence"])
 
 
+# Only exact_gsm_id/exact/normalized_exact clear this bar -- substring
+# (0.75), reverse_substring (0.6) and positional_fallback (0.5) are still
+# useful for annotation.tsv's own expression_id column (a human can weigh
+# match_method/confidence there themselves), but relabeling an expression
+# matrix's columns to gsm_id outright needs a match that isn't a guess.
+HIGH_CONFIDENCE_THRESHOLD = 0.9
+
+
+def all_high_confidence(id_map: pd.DataFrame, threshold: float = HIGH_CONFIDENCE_THRESHOLD) -> bool:
+    """True if every row of id_map (as returned by match_expression_columns)
+    resolved to a gsm_id at or above `threshold` confidence, and no two rows
+    resolved to the same gsm_id. False for an empty/None id_map.
+
+    Intended as the gate for relabeling an expression matrix's columns from
+    their original submitter labels to gsm_id outright (see
+    rnaseq_finalize.finalize_cohort): a single low-confidence or unmatched
+    sample anywhere in the cohort means False -- renaming only some columns
+    to gsm_id while leaving others as their original label would be actively
+    misleading, not partially helpful, so this is whole-cohort or nothing.
+    """
+    if id_map is None or id_map.empty:
+        return False
+    if not (id_map["gsm_id"].notna() & (id_map["confidence"] >= threshold)).all():
+        return False
+    return id_map["gsm_id"].is_unique
+
+
 def _match_one(expr_col, annotation, text_columns, normalized_cache):
     if "gsm_id" in annotation.columns:
         mask = annotation["gsm_id"] == expr_col
