@@ -127,12 +127,21 @@ def _load_channel_roles(out_dir: Path) -> dict | None:
         return json.load(f)
 
 
-def _write_expression_qc(out_dir: Path, primary_path: Path | None, primary_unit: str | None, qc_notes: list[str]) -> None:
+def _write_expression_qc(
+    out_dir: Path, primary_path: Path | None, primary_unit: str | None, qc_notes: list[str],
+    multi_file_candidates: list[Path] | None = None,
+) -> None:
     """Sidecar for check_rnaseq_expression_qc/check_expression_qc's findings --
     same reasoning as _write_channel_roles: only written when there's
     actually something to say (a primary file was picked, and/or QC notes
     exist), so both the fresh-download and cache-reuse paths can tell "was
     this checked at all" from the file's mere existence.
+
+    multi_file_candidates is only ever non-empty for a cohort with no
+    single resolved primary matrix, whose remaining files together (not
+    individually) sum to its sample count -- rnaseq_finalize.finalize_cohort
+    reads this back to finalize each one independently (never merged/
+    guessed at) rather than skipping the cohort outright.
     """
     if primary_path is None and not qc_notes:
         return
@@ -140,6 +149,7 @@ def _write_expression_qc(out_dir: Path, primary_path: Path | None, primary_unit:
         "primary_expression_file": str(primary_path) if primary_path else None,
         "primary_expression_unit": primary_unit,
         "notes": qc_notes,
+        "multi_file_candidates": [str(p) for p in multi_file_candidates] if multi_file_candidates else [],
     }
     with open(out_dir / "expression_qc.json", "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
@@ -1389,6 +1399,7 @@ def download_cohort(
     primary_path: Path | None = None
     primary_unit: str | None = None
     matrix_found = False
+    multi_file_candidates: list[Path] = []
 
     if assay_types & {"bulk_rnaseq", "scrnaseq"}:
         files = download_rnaseq_files(gse, out_dir)
@@ -1403,6 +1414,20 @@ def download_cohort(
                 result["primary_expression_file"] = str(primary_path)
                 result["primary_expression_unit"] = primary_unit
                 matrix_found = True
+            else:
+                # No single resolved primary -- check_rnaseq_expression_qc's
+                # own multi-file note (if any) is free text meant for a
+                # human reading expression_qc.json, not something callers
+                # should parse back out of. Re-deriving the actual candidate
+                # list here (same call select_primary_expression_file_by_
+                # content already made internally) is cheap and gives
+                # rnaseq_finalize.finalize_cohort a real, structured list to
+                # finalize each of independently later -- see
+                # _write_expression_qc's multi_file_candidates field.
+                by_content = select_primary_expression_file_by_content(files, len(gse.gsms))
+                if by_content is not None and len(by_content[0]) > 1:
+                    multi_file_candidates = by_content[0]
+                    result["multi_file_candidates"] = [str(p) for p in multi_file_candidates]
             qc_notes.extend(rnaseq_qc_notes)
     elif "microarray" in assay_types:
         expr_path, expr_qc_notes = build_and_map_expression_matrix(gse, out_dir)
@@ -1430,7 +1455,7 @@ def download_cohort(
         result["expression_qc_notes"] = qc_notes
         for note in qc_notes:
             print(f"  {gse_id}: expression QC: {note}")
-    _write_expression_qc(out_dir, primary_path, primary_unit, qc_notes)
+    _write_expression_qc(out_dir, primary_path, primary_unit, qc_notes, multi_file_candidates)
 
     # A two-channel (Cy3/Cy5 reference-design) sample's own VALUE column is,
     # on many platforms, already a log2 ratio -- negative for anything
