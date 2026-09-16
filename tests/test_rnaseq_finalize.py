@@ -398,6 +398,45 @@ def test_finalize_cohort_writes_sample_id_map_even_when_finalization_later_skips
     assert dict(zip(id_map["expression_id"], id_map["gsm_id"])) == {"col_a": "GSM1", "col_b": "GSM2"}
 
 
+# --- columns_renamed_to_gsm_id ----------------------------------------------------
+
+def test_finalize_cohort_renames_columns_to_gsm_id_when_every_sample_high_confidence(tmp_path):
+    pd.DataFrame({
+        "gsm_id": ["GSM1", "GSM2"], "title": ["DMSO_1", "DMSO_2"],
+    }).to_csv(tmp_path / "annotation.tsv", sep="\t", index=False)
+    df = pd.DataFrame({"DMSO_1": [10.0, 20.0], "DMSO_2": [15.0, 25.0]}, index=["TSPAN6", "TNMD"])
+    df.index.name = "gene_id"
+    path = _write_matrix(tmp_path, "tpm.tsv.gz", df)
+    _write_qc(tmp_path, path, "tpm")
+
+    row = finalize.finalize_cohort(tmp_path, _REF, _CLEAN_SYMBOLS)
+    assert row["status"] == "processed"
+    assert row["columns_renamed_to_gsm_id"] is True
+
+    written = pd.read_csv(tmp_path / "expression_final.tsv.gz", sep="\t", index_col=0)
+    assert set(written.columns) == {"GSM1", "GSM2"}
+
+
+def test_finalize_cohort_keeps_original_columns_when_one_sample_low_confidence(tmp_path):
+    """Ambiguous for DMSO_2 (its label doesn't appear verbatim, resolved by
+    positional fallback instead) -- must disable renaming for the whole
+    cohort, not just leave that one column unrenamed."""
+    pd.DataFrame({
+        "gsm_id": ["GSM1", "GSM2"], "title": ["DMSO_1", "condition B"],
+    }).to_csv(tmp_path / "annotation.tsv", sep="\t", index=False)
+    df = pd.DataFrame({"DMSO_1": [10.0, 20.0], "DMSO_2": [15.0, 25.0]}, index=["TSPAN6", "TNMD"])
+    df.index.name = "gene_id"
+    path = _write_matrix(tmp_path, "tpm.tsv.gz", df)
+    _write_qc(tmp_path, path, "tpm")
+
+    row = finalize.finalize_cohort(tmp_path, _REF, _CLEAN_SYMBOLS)
+    assert row["status"] == "processed"
+    assert row["columns_renamed_to_gsm_id"] is False
+
+    written = pd.read_csv(tmp_path / "expression_final.tsv.gz", sep="\t", index_col=0)
+    assert set(written.columns) == {"DMSO_1", "DMSO_2"}
+
+
 # --- merge_sample_id_map_into_series_annotation ----------------------------------
 
 def _write_series_annotation(series_dir, gse_id, df):

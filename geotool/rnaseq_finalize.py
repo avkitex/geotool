@@ -9,7 +9,15 @@ resolved a file for).
 
 Writes <collection_root>/<GSE>/expression_final.tsv.gz -- the actual
 analysis-ready matrix (HUGO gene symbols, clean GENCODE gene set only,
-TPM-renormalized, log2(x+1)).
+TPM-renormalized, log2(x+1)). Its sample columns keep the submitter's own
+labels (e.g. "DMSO_1") by default -- annotation.tsv's expression_id column
+is the join key back to gsm_id (see write_sample_id_map) -- except when
+every sample in the cohort matched to its gsm_id with high confidence (see
+sample_id_matching.all_high_confidence), in which case columns are
+relabeled to gsm_id directly so annotation.tsv and expression_final.tsv.gz
+share the same identifier with no join needed at all. Whole-cohort-or-
+nothing: a single low-confidence or unmatched sample anywhere disables
+this for every column, not just that one.
 
 Row-identifier detection, ENST/ENSG->gene-symbol mapping, and duplicate-row
 aggregation are all delegated to geotool.gene_symbol_mapping (built on this
@@ -317,7 +325,11 @@ def finalize_cohort(
     best-effort default rather than blocking this, see guess_unit),
     "skipped" (a transient/expected condition -- multi-file cohort, zero-sum
     sample after filtering, ...), or "failed" (an unrecoverable gene-identity
-    problem for this cohort's data).
+    problem for this cohort's data). A "processed" row's
+    columns_renamed_to_gsm_id says whether the output's columns are the
+    submitter's own sample labels (the default) or gsm_id (only when every
+    sample matched with high confidence, see sample_id_matching.
+    all_high_confidence).
 
     Also writes <cohort_dir>/sample_id_map.tsv and merges it onto both the
     cohort's canonical data/series/<gse_id>/annotation.tsv and cohort_dir's
@@ -409,6 +421,14 @@ def finalize_cohort(
         return {"gse_id": gse_id, "status": "skipped", "reason": f"{unit_note}; {reason}" if unit_note else reason}
 
     out = probe_mapping.maybe_log2_transform(tpm)
+
+    renamed_to_gsm_id = False
+    if id_map is not None:
+        present = id_map[id_map["expression_id"].isin(out.columns)]
+        if sample_id_matching.all_high_confidence(present):
+            out = out.rename(columns=dict(zip(present["expression_id"], present["gsm_id"])))
+            renamed_to_gsm_id = True
+
     out_path = cohort_dir / "expression_final.tsv.gz"
     out.round(3).to_csv(out_path, sep="\t")
 
@@ -422,6 +442,7 @@ def finalize_cohort(
         "unit": unit, "source_file": path.name, "was_log2_on_disk": was_log2,
         "n_genes": len(tpm), "n_samples": tpm.shape[1], "out_file": str(out_path),
         "n_samples_matched_to_gsm": n_matched, "n_samples_in_id_map": n_id_map,
+        "columns_renamed_to_gsm_id": renamed_to_gsm_id,
     }
 
 

@@ -188,3 +188,52 @@ def test_custom_text_columns_restricts_search():
     row = result[result["expression_id"] == "DMSO_1"].iloc[0]
     assert row["match_method"] == "positional_fallback"  # falls back to order, not a name match
     assert row["gsm_id"] == "GSM1"
+
+
+# --- all_high_confidence ----------------------------------------------------------
+
+def test_all_high_confidence_true_when_every_row_exact():
+    annotation = make_annotation([{"gsm_id": "GSM1", "title": "DMSO_1"}, {"gsm_id": "GSM2", "title": "DMSO_2"}])
+    id_map = sim.match_expression_columns(["DMSO_1", "DMSO_2"], annotation)
+    assert sim.all_high_confidence(id_map) is True
+
+
+def test_all_high_confidence_false_with_one_low_confidence_row():
+    """A single substring/positional-fallback match anywhere in the cohort
+    disables it for every row, not just that one -- whole-cohort-or-nothing."""
+    annotation = make_annotation([
+        {"gsm_id": "GSM1", "title": "DMSO_1"}, {"gsm_id": "GSM2", "title": "sample containing DMSO_2 text"},
+    ])
+    id_map = sim.match_expression_columns(["DMSO_1", "DMSO_2"], annotation)
+    assert dict(zip(id_map["expression_id"], id_map["match_method"])) == {"DMSO_1": "exact", "DMSO_2": "substring"}
+    assert sim.all_high_confidence(id_map) is False
+
+
+def test_all_high_confidence_false_with_unmatched_row():
+    annotation = make_annotation([{"gsm_id": "GSM1", "title": "condition A"}, {"gsm_id": "GSM2", "title": "condition B"}])
+    id_map = sim.match_expression_columns(["DMSO_1", "col2"], annotation, text_columns=[])
+    assert sim.all_high_confidence(id_map) is False
+
+
+def test_all_high_confidence_false_for_duplicate_gsm_id():
+    """Defensive: two expression columns resolving to the same gsm_id would
+    silently collide if used to rename matrix columns -- never "high
+    confidence" even if each individual row's own confidence looks high."""
+    id_map = pd.DataFrame({
+        "expression_id": ["a", "b"], "gsm_id": ["GSM1", "GSM1"],
+        "match_method": ["exact", "exact"], "confidence": [0.95, 0.95],
+    })
+    assert sim.all_high_confidence(id_map) is False
+
+
+def test_all_high_confidence_false_for_empty_or_none():
+    assert sim.all_high_confidence(None) is False
+    assert sim.all_high_confidence(pd.DataFrame(columns=["expression_id", "gsm_id", "match_method", "confidence"])) is False
+
+
+def test_all_high_confidence_respects_custom_threshold():
+    id_map = pd.DataFrame({
+        "expression_id": ["a"], "gsm_id": ["GSM1"], "match_method": ["substring"], "confidence": [0.75],
+    })
+    assert sim.all_high_confidence(id_map) is False
+    assert sim.all_high_confidence(id_map, threshold=0.7) is True
