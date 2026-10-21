@@ -3,6 +3,7 @@ name = "geotool"
 version = "0.1.0"
 description = "Search, download, and harmonize GEO expression cohorts"
 requires-python = ">=3.9"
+license = { file = "LICENSE" }
 dependencies = [
     "GEOparse>=2.0.3",
     "requests>=2.28",
