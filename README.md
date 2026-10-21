@@ -151,3 +151,13 @@ Phase 3 (cross-cohort annotation harmonization) are all implemented — see
 `geotool/download.py`, `geotool/probe_mapping.py`, `geotool/renormalize.py`,
 and `geotool/harmonize.py`. Cross-cohort *expression matrix* harmonization
 remains unimplemented (see the Harmonize section above).
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
+
+Exception: `geotool/_vendor/inmoose/` is a vendored subset of
+[InMoose](https://github.com/epigenelabs/inmoose) and remains under its
+upstream GPL-3.0-or-later license (see `geotool/_vendor/inmoose/LICENSE` and
+`README.md` there). `geotool/diffexp.py` imports it, so a distribution that
+includes the differential-expression code is a GPL-3.0 combination.
